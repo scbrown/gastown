@@ -31,13 +31,20 @@ var handoffCmd = &cobra.Command{
 
 This command initiates graceful retirement:
 1. Verifies git state is clean
-2. Sends handoff mail to yourself (for cycle)
-3. Sends lifecycle request to your manager
-4. Sets requesting state and waits for retirement
+2. For polecats (shutdown): auto-submits MR to merge queue
+3. Sends handoff mail to yourself (for cycle)
+4. Sends lifecycle request to your manager
+5. Sets requesting state and waits for retirement
 
 Your manager (daemon for Mayor/Witness, witness for polecats) will
 verify the request and terminate your session. For cycle/restart,
 a new session starts and reads your handoff mail to continue work.
+
+Polecat auto-MR:
+When a polecat runs 'gt handoff' (default: shutdown), the current branch
+is automatically submitted to the merge queue if it follows the
+polecat/<name>/<issue> naming convention. The Refinery will process
+the merge request.
 
 Flags:
   --cycle     Restart with handoff mail (default for Mayor/Witness)
@@ -93,6 +100,17 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 	if !handoffForce {
 		if err := preFlightChecks(); err != nil {
 			return fmt.Errorf("pre-flight check failed: %w\n\nUse --force to skip checks", err)
+		}
+	}
+
+	// For polecats shutting down with work complete, auto-submit MR to merge queue
+	if role == RolePolecat && action == HandoffShutdown {
+		if err := submitMRForPolecat(); err != nil {
+			// Non-fatal: warn but continue with handoff
+			fmt.Printf("%s Could not auto-submit MR: %v\n", style.Warning.Render("Warning:"), err)
+			fmt.Println(style.Dim.Render("  You may need to run 'gt mq submit' manually"))
+		} else {
+			fmt.Printf("%s Auto-submitted work to merge queue\n", style.Bold.Render("✓"))
 		}
 	}
 
@@ -329,6 +347,47 @@ Please verify state and execute lifecycle action.
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, string(out))
+	}
+
+	return nil
+}
+
+// submitMRForPolecat submits the current branch to the merge queue.
+// This is called automatically when a polecat shuts down with completed work.
+func submitMRForPolecat() error {
+	// Check if we're on a polecat branch with work to submit
+	cmd := exec.Command("git", "branch", "--show-current")
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("getting current branch: %w", err)
+	}
+	branch := strings.TrimSpace(string(out))
+
+	// Skip if on main/master (no work to submit)
+	if branch == "main" || branch == "master" || branch == "" {
+		return nil // Nothing to submit, that's OK
+	}
+
+	// Check if branch follows polecat/<name>/<issue> pattern
+	parts := strings.Split(branch, "/")
+	if len(parts) < 3 || parts[0] != "polecat" {
+		// Not a polecat work branch, skip
+		return nil
+	}
+
+	// Run gt mq submit
+	submitCmd := exec.Command("gt", "mq", "submit")
+	submitOutput, err := submitCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(submitOutput)))
+	}
+
+	// Print the submit output (trimmed)
+	output := strings.TrimSpace(string(submitOutput))
+	if output != "" {
+		for _, line := range strings.Split(output, "\n") {
+			fmt.Printf("  %s\n", line)
+		}
 	}
 
 	return nil
