@@ -97,11 +97,15 @@ func runWorkerStatusLine(rigName, polecat, crew, issue string) error {
 		parts = append(parts, issue)
 	}
 
-	// Mail count
+	// Mail preview
 	if identity != "" {
-		unread := getUnreadMailCount(identity)
+		unread, subject := getMailPreview(identity, 25)
 		if unread > 0 {
-			parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+			if subject != "" {
+				parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
+			} else {
+				parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+			}
 		}
 	}
 
@@ -141,15 +145,19 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 	}
 	rigCount := len(rigs)
 
-	// Get mayor mail
-	unread := getUnreadMailCount("mayor/")
+	// Get mayor mail with preview
+	unread, subject := getMailPreview("mayor/", 20)
 
 	// Build status
 	var parts []string
 	parts = append(parts, fmt.Sprintf("%s %d polecats", AgentTypeIcons[AgentMayor], polecatCount))
 	parts = append(parts, fmt.Sprintf("%d rigs", rigCount))
 	if unread > 0 {
-		parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		if subject != "" {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
+		} else {
+			parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
+		}
 	}
 
 	fmt.Print(strings.Join(parts, " | ") + " |")
@@ -319,4 +327,29 @@ func getUnreadMailCount(identity string) int {
 	}
 
 	return unread
+}
+
+// getMailPreview returns unread count and a truncated subject of the first unread message.
+// Returns (count, subject) where subject is empty if no unread mail.
+func getMailPreview(identity string, maxLen int) (int, string) {
+	workDir, err := findMailWorkDir()
+	if err != nil {
+		return 0, ""
+	}
+
+	mailbox := mail.NewMailboxBeads(identity, workDir)
+
+	// Get unread messages
+	messages, err := mailbox.ListUnread()
+	if err != nil || len(messages) == 0 {
+		return 0, ""
+	}
+
+	// Get first message subject, truncated
+	subject := messages[0].Subject
+	if len(subject) > maxLen {
+		subject = subject[:maxLen-1] + "…"
+	}
+
+	return len(messages), subject
 }
