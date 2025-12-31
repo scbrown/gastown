@@ -19,19 +19,29 @@ Level 3: Work Unit - Issues, tasks, molecules on chains
 
 ### URI Scheme
 
-Full work unit reference:
+Full work unit reference (HOP protocol):
 
 ```
-gt://entity/chain/rig/issue-id
-gt://steve@example.com/main-town/gastown/gt-xyz
+hop://entity/chain/rig/issue-id
+hop://steve@example.com/main-town/gastown/gt-xyz
 ```
 
-Within a workspace, short form works:
+Cross-repo reference (same platform):
 
 ```
-gt-xyz           # Local
+beads://platform/org/repo/issue-id
+beads://github/acme/backend/ac-123
+```
+
+Within a workspace, short forms are preferred:
+
+```
+gt-xyz           # Local (prefix routes via routes.jsonl)
 gastown/gt-xyz   # Different rig, same chain
+./gt-xyz         # Explicit current-rig ref
 ```
+
+See `~/gt/docs/hop/GRAPH-ARCHITECTURE.md` for full URI specification.
 
 ## Relationship Types
 
@@ -56,7 +66,7 @@ Reference work in another workspace:
   "references": [
     {
       "type": "depends_on",
-      "target": "gt://other-entity/chain/rig/issue-id"
+      "target": "hop://other-entity/chain/rig/issue-id"
     }
   ]
 }
@@ -69,8 +79,8 @@ Distribute work across workspaces:
 ```json
 {
   "type": "delegation",
-  "parent": "gt://acme.com/projects/proj-123",
-  "child": "gt://alice@example.com/town/gastown/gt-xyz",
+  "parent": "hop://acme.com/projects/proj-123",
+  "child": "hop://alice@example.com/town/gastown/gt-xyz",
   "terms": { "portion": "backend", "deadline": "2025-02-01" }
 }
 ```
@@ -127,15 +137,15 @@ Each workspace has identity metadata:
 ### Remote Registration
 
 ```bash
-gt remote add acme gt://acme.com/engineering
+gt remote add acme hop://acme.com/engineering
 gt remote list
 ```
 
 ### Cross-Workspace Queries
 
 ```bash
-bd show gt://acme.com/eng/ac-123    # Fetch remote issue
-bd list --remote=acme               # List remote issues
+bd show hop://acme.com/eng/ac-123    # Fetch remote issue
+bd list --remote=acme                # List remote issues
 ```
 
 ## Aggregation
@@ -156,9 +166,9 @@ bd audit --actor=gastown/crew/joe
 ## Implementation Status
 
 - [x] Agent identity in git commits
-- [ ] BD_ACTOR default in beads create
-- [ ] Workspace metadata file
-- [ ] Cross-workspace URI scheme
+- [x] BD_ACTOR default in beads create
+- [x] Workspace metadata file (.town.json)
+- [x] Cross-workspace URI scheme (hop://, beads://, local forms)
 - [ ] Remote registration
 - [ ] Cross-workspace queries
 - [ ] Delegation primitives
@@ -171,9 +181,9 @@ Track work spanning multiple repositories:
 
 ```
 Project X
-├── gt://team/frontend/fe-123
-├── gt://team/backend/be-456
-└── gt://team/infra/inf-789
+├── hop://team/frontend/fe-123
+├── hop://team/backend/be-456
+└── hop://team/infra/inf-789
 ```
 
 ### Distributed Teams
