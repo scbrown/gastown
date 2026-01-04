@@ -1169,11 +1169,19 @@ func AgentBeadID(rig, role, name string) string {
 }
 
 // MayorBeadID returns the Mayor agent bead ID.
+//
+// Deprecated: Use MayorBeadIDTown() for town-level beads (hq- prefix).
+// This function returns "gt-mayor" which is for rig-level storage.
+// Town-level agents like Mayor should use the hq- prefix.
 func MayorBeadID() string {
 	return "gt-mayor"
 }
 
 // DeaconBeadID returns the Deacon agent bead ID.
+//
+// Deprecated: Use DeaconBeadIDTown() for town-level beads (hq- prefix).
+// This function returns "gt-deacon" which is for rig-level storage.
+// Town-level agents like Deacon should use the hq- prefix.
 func DeaconBeadID() string {
 	return "gt-deacon"
 }
@@ -1187,36 +1195,6 @@ func DogBeadID(name string) string {
 // DogRoleBeadID returns the Dog role bead ID.
 func DogRoleBeadID() string {
 	return RoleBeadID("dog")
-}
-
-// Town-level agent bead ID helpers (hq- prefix, stored in town beads).
-// These are the canonical IDs for the two-level beads architecture:
-// - Town-level agents (Mayor, Deacon, Dogs) → ~/gt/.beads/ with hq- prefix
-// - Rig-level agents (Witness, Refinery, Polecats) → <rig>/.beads/ with rig prefix
-
-// MayorBeadIDTown returns the town-level Mayor agent bead ID.
-// Deprecated: Use MayorBeadID() which still returns gt-mayor for compatibility.
-// After migration to two-level architecture, this will become the canonical ID.
-func MayorBeadIDTown() string {
-	return "hq-mayor"
-}
-
-// DeaconBeadIDTown returns the town-level Deacon agent bead ID.
-// Deprecated: Use DeaconBeadID() which still returns gt-deacon for compatibility.
-// After migration to two-level architecture, this will become the canonical ID.
-func DeaconBeadIDTown() string {
-	return "hq-deacon"
-}
-
-// DogBeadIDTown returns a town-level Dog agent bead ID.
-func DogBeadIDTown(name string) string {
-	return "hq-dog-" + name
-}
-
-// RoleBeadIDTown returns a town-level role definition bead ID.
-// Role beads are global templates stored in town beads.
-func RoleBeadIDTown(role string) string {
-	return "hq-" + role + "-role"
 }
 
 // CreateDogAgentBead creates an agent bead for a dog.
