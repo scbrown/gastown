@@ -110,6 +110,47 @@ func resolveBeadsDirWithDepth(beadsDir string, maxDepth int) string {
 	return resolveBeadsDirWithDepth(resolved, maxDepth-1)
 }
 
+// cleanBeadsRuntimeFiles removes gitignored runtime files from a .beads directory
+// while preserving tracked files (formulas/, README.md, config.yaml, .gitignore).
+// This is safe to call even if the directory doesn't exist.
+func cleanBeadsRuntimeFiles(beadsDir string) error {
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		return nil // Nothing to clean
+	}
+
+	// Runtime files/patterns that are gitignored and safe to remove
+	runtimePatterns := []string{
+		// SQLite databases
+		"*.db", "*.db-*", "*.db?*",
+		// Daemon runtime
+		"daemon.lock", "daemon.log", "daemon.pid", "bd.sock",
+		// Sync state
+		"sync-state.json", "last-touched", "metadata.json",
+		// Version tracking
+		".local_version",
+		// Redirect file (we're about to recreate it)
+		"redirect",
+		// Merge artifacts
+		"beads.base.*", "beads.left.*", "beads.right.*",
+		// JSONL files (tracked but will be redirected, safe to remove in worktrees)
+		"issues.jsonl", "interactions.jsonl",
+		// Runtime directories
+		"mq",
+	}
+
+	for _, pattern := range runtimePatterns {
+		matches, err := filepath.Glob(filepath.Join(beadsDir, pattern))
+		if err != nil {
+			continue // Invalid pattern, skip
+		}
+		for _, match := range matches {
+			os.RemoveAll(match) // Best effort, ignore errors
+		}
+	}
+
+	return nil
+}
+
 // SetupRedirect creates a .beads/redirect file for a worktree to point to the rig's shared beads.
 // This is used by crew, polecats, and refinery worktrees to share the rig's beads database.
 //
@@ -119,7 +160,7 @@ func resolveBeadsDirWithDepth(beadsDir string, maxDepth int) string {
 //
 // The function:
 //  1. Computes the relative path from worktree to rig-level .beads
-//  2. Cleans up any existing .beads/ contents (from tracked branches)
+//  2. Cleans up runtime files (preserving tracked files like formulas/)
 //  3. Creates the redirect file
 //
 // Safety: This function refuses to create redirects in the canonical beads location
@@ -149,15 +190,13 @@ func SetupRedirect(townRoot, worktreePath string) error {
 		return fmt.Errorf("no rig .beads found at %s", rigBeadsPath)
 	}
 
-	// Clean up any existing .beads/ contents from the branch
+	// Clean up runtime files in .beads/ but preserve tracked files (formulas/, README.md, etc.)
 	worktreeBeadsDir := filepath.Join(worktreePath, ".beads")
-	if _, err := os.Stat(worktreeBeadsDir); err == nil {
-		if err := os.RemoveAll(worktreeBeadsDir); err != nil {
-			return fmt.Errorf("cleaning existing .beads dir: %w", err)
-		}
+	if err := cleanBeadsRuntimeFiles(worktreeBeadsDir); err != nil {
+		return fmt.Errorf("cleaning runtime files: %w", err)
 	}
 
-	// Create .beads directory
+	// Create .beads directory if it doesn't exist
 	if err := os.MkdirAll(worktreeBeadsDir, 0755); err != nil {
 		return fmt.Errorf("creating .beads dir: %w", err)
 	}

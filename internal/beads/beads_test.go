@@ -1644,7 +1644,7 @@ func TestSetupRedirect(t *testing.T) {
 		}
 	})
 
-	t.Run("cleans existing tracked beads from worktree", func(t *testing.T) {
+	t.Run("cleans runtime files but preserves tracked files", func(t *testing.T) {
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
 		rigBeads := filepath.Join(rigRoot, ".beads")
@@ -1654,27 +1654,43 @@ func TestSetupRedirect(t *testing.T) {
 		if err := os.MkdirAll(rigBeads, 0755); err != nil {
 			t.Fatalf("mkdir rig beads: %v", err)
 		}
-		// Simulate worktree with tracked .beads (has database files)
+		// Simulate worktree with both runtime and tracked files
 		if err := os.MkdirAll(crewBeads, 0755); err != nil {
 			t.Fatalf("mkdir crew beads: %v", err)
 		}
+		// Runtime files (should be removed)
 		if err := os.WriteFile(filepath.Join(crewBeads, "beads.db"), []byte("fake db"), 0644); err != nil {
 			t.Fatalf("write fake db: %v", err)
 		}
+		if err := os.WriteFile(filepath.Join(crewBeads, "issues.jsonl"), []byte("{}"), 0644); err != nil {
+			t.Fatalf("write issues.jsonl: %v", err)
+		}
+		// Tracked files (should be preserved)
 		if err := os.WriteFile(filepath.Join(crewBeads, "config.yaml"), []byte("prefix: test"), 0644); err != nil {
 			t.Fatalf("write config: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(crewBeads, "README.md"), []byte("# Beads"), 0644); err != nil {
+			t.Fatalf("write README: %v", err)
 		}
 
 		if err := SetupRedirect(townRoot, crewPath); err != nil {
 			t.Fatalf("SetupRedirect failed: %v", err)
 		}
 
-		// Verify old files were cleaned up
+		// Verify runtime files were cleaned up
 		if _, err := os.Stat(filepath.Join(crewBeads, "beads.db")); !os.IsNotExist(err) {
 			t.Error("beads.db should have been removed")
 		}
-		if _, err := os.Stat(filepath.Join(crewBeads, "config.yaml")); !os.IsNotExist(err) {
-			t.Error("config.yaml should have been removed")
+		if _, err := os.Stat(filepath.Join(crewBeads, "issues.jsonl")); !os.IsNotExist(err) {
+			t.Error("issues.jsonl should have been removed")
+		}
+
+		// Verify tracked files were preserved
+		if _, err := os.Stat(filepath.Join(crewBeads, "config.yaml")); err != nil {
+			t.Errorf("config.yaml should have been preserved: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(crewBeads, "README.md")); err != nil {
+			t.Errorf("README.md should have been preserved: %v", err)
 		}
 
 		// Verify redirect was created
