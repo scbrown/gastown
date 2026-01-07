@@ -138,10 +138,14 @@ func cleanBeadsRuntimeFiles(beadsDir string) {
 		"mq",
 	}
 
+	var firstErr error
 	for _, pattern := range runtimePatterns {
 		matches, err := filepath.Glob(filepath.Join(beadsDir, pattern))
 		if err != nil {
-			continue // Invalid pattern, skip
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		for _, match := range matches {
 			_ = os.RemoveAll(match) // Best effort, ignore errors
