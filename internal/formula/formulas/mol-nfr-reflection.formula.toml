@@ -1,0 +1,516 @@
+# NFR Reflection Formula
+#
+# A convoy-style formula that spawns multiple polecats in parallel,
+# each analyzing a different non-functional requirement dimension.
+# Results are synthesized into improvement beads organized in a convoy.
+#
+# Usage:
+#   gt sling mol-nfr-reflection <rig>/polecats --var scope="src" --var phase_name="Phase D"
+#   gt sling mol-nfr-reflection gastown/polecats --var scope="internal/cmd" --var time_range="14d"
+
+description = """
+Non-Functional Requirements reflection phase.
+
+A convoy-style formula that spawns parallel polecats to analyze different NFR
+dimensions of recently completed work. Results are synthesized into improvement
+beads organized in a tracking convoy.
+
+## Legs (parallel execution)
+- **testability**: Test coverage, testability patterns, mocking boundaries
+- **modifiability**: Coupling, cohesion, change impact, extension points
+- **observability**: Logging, metrics, tracing, debugging capabilities
+- **reliability**: Error handling, retry logic, fault tolerance, graceful degradation
+- **performance**: Bottlenecks, caching opportunities, resource usage patterns
+- **security**: Input validation, auth boundaries, secrets handling, attack surface
+- **documentation**: Consistency, completeness, accuracy, discoverability
+
+## Trigger Context
+This formula runs after phase completion, receiving:
+- scope: The phase or module that completed
+- phase_name: Human-readable name for the phase
+- source_convoy: The convoy that landed (if triggered by convoy completion)
+- time_range: Date range of commits to analyze
+
+## Output
+Creates improvement beads for each finding, organized in a reflection convoy.
+The convoy enables tracking and prioritization of NFR improvements.
+
+## Polecat Contract
+Each leg polecat:
+1. Analyzes assigned NFR dimension
+2. Writes findings to output directory
+3. Does NOT fix issues - files beads for others to fix
+4. Completes via gt done when analysis is finished
+"""
+formula = "mol-nfr-reflection"
+type = "convoy"
+version = 1
+
+# Input variables - provided at runtime
+[inputs]
+[inputs.scope]
+description = "Scope to analyze (directory path, module name, or 'recent' for recent changes)"
+type = "string"
+required = true
+
+[inputs.phase_name]
+description = "Name of the completed phase (e.g., 'Phase D: Game Engine')"
+type = "string"
+required = false
+default = "Recent Work"
+
+[inputs.source_convoy]
+description = "Source convoy ID if triggered by convoy completion"
+type = "string"
+required = false
+
+[inputs.time_range]
+description = "Time range for git history analysis (e.g., '7d', '2w', '30d')"
+type = "string"
+default = "7d"
+
+# Base prompt template - injected into all leg prompts
+[prompts]
+base = """
+# NFR Reflection Analysis
+
+You are a specialized non-functional requirements analyst participating in a convoy reflection.
+
+## Context
+- **Formula**: {{.formula_name}}
+- **Phase**: {{.phase_name}}
+- **Scope**: {{.scope}}
+- **Your Dimension**: {{.leg.focus}}
+- **Leg ID**: {{.leg.id}}
+- **Time Range**: {{.time_range}}
+
+{{if .source_convoy}}
+## Source Convoy
+This reflection was triggered by convoy completion: {{.source_convoy}}
+{{end}}
+
+## Your Task
+{{.leg.description}}
+
+## Analysis Approach
+
+1. **Explore the scope:**
+   ```bash
+   # For directory scope:
+   find {{.scope}} -type f -name "*.go" -o -name "*.ts" | head -50
+
+   # For recent changes:
+   git log --oneline --since="{{.time_range}}" -- {{.scope}}
+   git diff HEAD~20 --stat -- {{.scope}}
+   ```
+
+2. **Read and analyze code:**
+   Focus on your dimension ({{.leg.id}}). Look for patterns, anti-patterns, and improvement opportunities.
+
+3. **Document findings:**
+   For each issue found, record:
+   - Location (file:line)
+   - Severity (P0/P1/P2/P3)
+   - Description
+   - Suggested improvement
+   - Estimated effort
+
+## Output Format
+
+Write your analysis to: **{{.output_path}}**
+
+Structure your output as follows:
+```markdown
+# {{.leg.title}}
+
+## Summary
+(1-2 paragraph overview of this dimension's health)
+
+## Findings
+
+### Finding 1: <brief title>
+- **Severity**: P0/P1/P2/P3
+- **Category**: {{.leg.id}}
+- **Location**: <file:line or module>
+- **Description**: <detailed description of the issue>
+- **Suggestion**: <specific improvement recommendation>
+- **Effort**: Low/Medium/High
+
+### Finding 2: ...
+(repeat for each finding)
+
+## Metrics
+- Files analyzed: N
+- Issues found: N (by severity)
+- Top areas needing attention: (list)
+
+## Recommendations
+(Prioritized list of improvements for this dimension)
+```
+
+Be specific and actionable. Focus on measurable improvements.
+Do NOT fix issues yourself - document them for others to fix.
+"""
+
+# Output configuration
+[output]
+directory = ".reflections/{{.reflection_id}}"
+leg_pattern = "{{.leg.id}}.md"
+synthesis = "reflection-summary.md"
+
+# Leg definitions - each spawns a parallel polecat
+
+[[legs]]
+id = "testability"
+title = "Testability Analysis"
+focus = "Test coverage and testability patterns"
+description = """
+Analyze testability of the completed work.
+
+**Examine:**
+- Test coverage: Are critical paths tested? Use coverage tools if available.
+- Test isolation: Can components be tested independently?
+- Mocking boundaries: Are external dependencies injectable?
+- Test data: Is test data well-managed and realistic?
+- Test performance: Are tests fast and reliable (no flakiness)?
+- Test organization: Are tests discoverable and well-structured?
+
+**Common issues to look for:**
+- Hard-coded dependencies preventing unit testing
+- Missing integration test scenarios for critical paths
+- Flaky tests due to timing, ordering, or external dependencies
+- Untested error paths and edge cases
+- Tests that test implementation rather than behavior
+- Missing test utilities or helpers for common patterns
+
+**Questions to answer:**
+- What percentage of critical paths have test coverage?
+- Can new developers easily write tests for this code?
+- Are there any untestable patterns that should be refactored?
+
+**Create findings for:**
+- Missing test coverage in critical areas
+- Refactoring needed for testability
+- Test infrastructure improvements
+- Flaky test patterns that need fixing
+"""
+
+[[legs]]
+id = "modifiability"
+title = "Modifiability Analysis"
+focus = "Coupling, cohesion, and change readiness"
+description = """
+Analyze modifiability and maintainability.
+
+**Examine:**
+- Coupling: How interconnected are modules? Look for tight coupling.
+- Cohesion: Do modules have single responsibilities?
+- Extension points: Can behavior be extended without modification?
+- Change impact: How many files need changing for typical modifications?
+- Abstraction quality: Are abstractions at the right level?
+- Dependency direction: Do dependencies flow toward stability?
+
+**Common issues to look for:**
+- God objects/functions with too many responsibilities
+- Circular dependencies between packages
+- Hardcoded magic numbers/strings
+- Missing abstraction layers
+- Leaky abstractions exposing implementation details
+- Shotgun surgery patterns (small changes touch many files)
+- Feature envy (methods that use other classes more than their own)
+
+**Questions to answer:**
+- How easy would it be to add a new feature?
+- What's the blast radius of typical changes?
+- Are there clear module boundaries?
+
+**Create findings for:**
+- Refactoring highly-coupled code
+- Adding extension points
+- Improving abstraction boundaries
+- Documenting design decisions
+"""
+
+[[legs]]
+id = "observability"
+title = "Observability Analysis"
+focus = "Logging, metrics, and debugging support"
+description = """
+Analyze observability capabilities.
+
+**Examine:**
+- Logging: Are important operations logged with context?
+- Log levels: Are log levels appropriate (debug/info/warn/error)?
+- Structured logging: Are logs machine-parseable?
+- Metrics: Are key measurements exposed?
+- Tracing: Can requests be traced through the system?
+- Error context: Do errors include enough detail to diagnose?
+- Debug support: Can behavior be inspected at runtime?
+
+**Common issues to look for:**
+- Silent failures or swallowed errors
+- Log spam without useful context
+- Missing correlation IDs for distributed tracing
+- No metrics for critical operations
+- Errors without stack traces or context
+- Sensitive data in logs (PII, credentials)
+- Missing health check endpoints
+- No way to debug production issues
+
+**Questions to answer:**
+- Can you diagnose a production issue from logs alone?
+- What's the time-to-diagnosis for typical problems?
+- Are there blind spots in observability?
+
+**Create findings for:**
+- Adding structured logging
+- Exposing operational metrics
+- Improving error messages and context
+- Adding debug capabilities
+"""
+
+[[legs]]
+id = "reliability"
+title = "Reliability Analysis"
+focus = "Error handling and fault tolerance"
+description = """
+Analyze reliability and resilience.
+
+**Examine:**
+- Error handling: Are all error cases handled appropriately?
+- Retry logic: Do transient failures retry with backoff?
+- Timeouts: Are network/IO operations bounded?
+- Graceful degradation: Does the system handle partial failures?
+- Recovery: Can the system recover from crashes?
+- Idempotency: Are operations safe to retry?
+- Resource cleanup: Are resources properly released?
+
+**Common issues to look for:**
+- Panics instead of error returns
+- Missing timeouts on network operations
+- No retry for transient failures
+- Cascading failures from single point of failure
+- Resource leaks (goroutines, file handles, connections)
+- Missing circuit breakers for external dependencies
+- Non-idempotent operations that can't be safely retried
+- Incomplete error handling (only happy path)
+
+**Questions to answer:**
+- What happens when external services are unavailable?
+- How does the system behave under load?
+- Can the system recover from a crash mid-operation?
+
+**Create findings for:**
+- Adding proper error handling
+- Implementing retry with backoff
+- Adding circuit breakers or bulkheads
+- Improving resource management
+"""
+
+[[legs]]
+id = "performance"
+title = "Performance Analysis"
+focus = "Bottlenecks and resource efficiency"
+description = """
+Analyze performance characteristics.
+
+**Examine:**
+- Algorithmic complexity: Are there O(n^2) or worse operations?
+- Resource usage: Memory, CPU, file handles, connections
+- Caching: Are repeat computations cached appropriately?
+- I/O patterns: Are disk/network operations batched?
+- Startup time: Is initialization efficient?
+- Concurrency: Is parallelism used effectively?
+
+**Common issues to look for:**
+- N+1 query patterns (database or API)
+- Unnecessary allocations in hot paths
+- Missing caching for expensive operations
+- Blocking I/O in critical paths
+- Unbounded growth (memory leaks, queue growth)
+- Synchronous operations that could be async
+- Missing pagination for large datasets
+- Inefficient data structures for access patterns
+
+**Questions to answer:**
+- What are the hot paths and are they optimized?
+- Where would you see problems at 10x scale?
+- Are there obvious quick wins for performance?
+
+**Create findings for:**
+- Optimizing hot paths
+- Adding caching layers
+- Batching I/O operations
+- Fixing algorithmic complexity issues
+"""
+
+[[legs]]
+id = "security"
+title = "Security Analysis"
+focus = "Attack surface and trust boundaries"
+description = """
+Analyze security posture.
+
+**Examine:**
+- Input validation: Are all inputs validated and sanitized?
+- Trust boundaries: Where does trusted/untrusted code meet?
+- Secrets management: Are credentials properly managed?
+- Attack surface: What new entry points were added?
+- Authentication: Are auth checks consistent and correct?
+- Authorization: Are permissions properly enforced?
+- Data protection: Is sensitive data encrypted/protected?
+
+**Common issues to look for:**
+- Missing input validation
+- Secrets in code, logs, or config files
+- Over-permissive access controls
+- SQL injection or command injection vectors
+- Path traversal vulnerabilities
+- Insecure deserialization
+- Missing CSRF/XSS protections
+- Hardcoded credentials or API keys
+- Insufficient rate limiting
+
+**Questions to answer:**
+- What's the attack surface of this code?
+- Are there any obvious vulnerabilities?
+- How is sensitive data protected?
+
+**Create findings for:**
+- Adding input validation
+- Improving secrets management
+- Reducing attack surface
+- Fixing authentication/authorization gaps
+"""
+
+[[legs]]
+id = "documentation"
+title = "Documentation Analysis"
+focus = "Consistency, completeness, and discoverability"
+description = """
+Analyze documentation quality.
+
+**Examine:**
+- Code comments: Are complex sections explained?
+- API documentation: Are public interfaces documented?
+- README quality: Can someone understand the project quickly?
+- Architecture docs: Is the big picture documented?
+- Runbooks: Are operational procedures documented?
+- Change logs: Are changes tracked and explained?
+- Examples: Are there usage examples?
+
+**Common issues to look for:**
+- Outdated documentation (doesn't match code)
+- Missing documentation for public APIs
+- Complex code without explanatory comments
+- No onboarding documentation for new developers
+- Missing architecture decision records (ADRs)
+- Undocumented configuration options
+- No troubleshooting guides
+- Comments that describe "what" instead of "why"
+
+**Questions to answer:**
+- Can a new developer understand this code quickly?
+- Is the documentation accurate and up-to-date?
+- What's missing that would help operators?
+
+**Create findings for:**
+- Adding missing documentation
+- Updating outdated documentation
+- Creating architecture documentation
+- Adding operational runbooks
+"""
+
+# Synthesis step - combines all leg outputs into improvement beads
+[synthesis]
+title = "NFR Reflection Synthesis"
+depends_on = ["testability", "modifiability", "observability", "reliability", "performance", "security", "documentation"]
+description = """
+Synthesize all dimension findings into improvement beads.
+
+**Your input:**
+All dimension analyses from: {{.output.directory}}/
+
+**Your tasks:**
+
+1. **Read all dimension analyses:**
+   ```bash
+   cat {{.output.directory}}/*.md
+   ```
+
+2. **Deduplicate overlapping findings:**
+   Some issues may appear in multiple dimensions. Consolidate them.
+
+3. **Prioritize by severity and effort:**
+   - P0 (critical): Security vulnerabilities, data loss risks
+   - P1 (high): Bugs affecting users, broken functionality
+   - P2 (medium): Code quality issues, technical debt
+   - P3 (low): Nice-to-have improvements
+
+4. **Create beads for each actionable finding:**
+   ```bash
+   bd create --type=task --priority=<P> \
+     --title="[NFR:{{category}}] <title>" \
+     --description="Found during NFR reflection of {{.phase_name}}.
+
+   Location: <file:line>
+
+   Issue:
+   <description>
+
+   Suggestion:
+   <how to improve>
+
+   Effort: <Low/Medium/High>
+   Source: NFR reflection {{.reflection_id}}"
+   ```
+
+5. **Create a reflection convoy:**
+   After creating all beads, create a tracking convoy:
+   ```bash
+   gt convoy create "NFR Reflection: {{.phase_name}}" <bead-ids...> --notify mayor/
+   ```
+
+**Output:**
+Write summary to {{.output.directory}}/{{.output.synthesis}}
+
+Include:
+```markdown
+# NFR Reflection Summary: {{.phase_name}}
+
+## Overview
+- Scope analyzed: {{.scope}}
+- Time range: {{.time_range}}
+- Dimensions analyzed: 7
+
+## Findings by Dimension
+
+| Dimension | P0 | P1 | P2 | P3 | Total |
+|-----------|----|----|----|----|-------|
+| testability | N | N | N | N | N |
+| modifiability | N | N | N | N | N |
+| observability | N | N | N | N | N |
+| reliability | N | N | N | N | N |
+| performance | N | N | N | N | N |
+| security | N | N | N | N | N |
+| documentation | N | N | N | N | N |
+| **Total** | N | N | N | N | N |
+
+## Top 5 Highest-Impact Improvements
+1. [NFR:category] Title - P# - Effort
+2. ...
+
+## Beads Created
+<list of bead IDs created>
+
+## Convoy
+Tracking convoy: <convoy-id>
+
+## Next Steps
+- Review P0/P1 findings immediately
+- Schedule P2 improvements in next sprint
+- Add P3 items to backlog
+```
+
+Identify conflicts between dimensions. Be concrete and actionable.
+"""
