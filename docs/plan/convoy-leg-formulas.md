@@ -1,5 +1,14 @@
 # Convoy Leg Formula Support
 
+## Related Issues
+
+- **#288**: "gt sling should auto-attach mol-polecat-work when slinging to polecats"
+  - Same pattern applied to regular polecat dispatch
+  - Our work is the convoy-specific version of this
+- **#355**: "gt sling with formula fails"
+  - Bug with `--on` flag and variable auto-population
+  - May need addressing for this feature to work smoothly
+
 ## Problem
 
 Convoy formulas create leg beads but dispatch them with plain `gt sling <leg> <rig>` - no workflow formula is applied. This means polecats receive work without step-by-step guidance, leading to:
@@ -8,9 +17,28 @@ Convoy formulas create leg beads but dispatch them with plain `gt sling <leg> <r
 - No crash-recovery (can't resume from last completed step)
 - Inconsistent execution across legs
 
+This is the same problem described in #288, but for convoy leg dispatch rather than general polecat dispatch.
+
 ## Solution
 
 Allow convoy formulas to specify a workflow formula for leg execution, following the same pattern as `gt sling <formula> --on <bead> <rig>`.
+
+## Architectural Context
+
+```
+CURRENT STATE:
+  gt sling <bead> <rig>                    → No formula (bare bead)
+  gt sling <formula> --on <bead> <rig>     → Formula applied (explicit)
+  gt formula run <convoy>                  → Legs get bare beads (no formula)
+
+PROPOSED (this work):
+  gt formula run <convoy>                  → Legs get leg_formula applied
+
+RELATED (#288):
+  gt sling <bead> polecat                  → Auto-apply mol-polecat-work
+```
+
+Both #288 and this work address: **"When should formula application be implicit vs explicit?"**
 
 ## Design
 
@@ -159,3 +187,82 @@ leg_formula = "mol-nfr-leg"
 | `internal/cmd/formula.go` | Update dispatch logic |
 | `internal/formula/formulas/mol-nfr-leg.formula.toml` | New file |
 | `internal/formula/formulas/mol-nfr-reflection.formula.toml` | Add convoy config |
+
+## Documentation Updates
+
+### Required Updates
+
+| File | Changes Needed |
+|------|----------------|
+| `docs/convoy.md` | Add section on convoy formulas with `[convoy] leg_formula` config |
+| `docs/molecules.md` | Add convoy formula type, explain leg formula dispatch |
+| `docs/reference.md` | Document `leg_formula` in convoy formula examples |
+| `docs/glossary.md` | Add terms: `leg_formula`, `ConvoyConfig` |
+
+### New Documentation (Optional)
+
+Consider creating `docs/convoy-formulas.md` with:
+- Convoy formula type explained
+- leg_formula configuration
+- Per-leg formula overrides
+- Examples (design.formula.toml, mol-nfr-reflection.formula.toml)
+- Comparison to workflow formulas
+
+### Example Doc Addition for `docs/convoy.md`
+
+```markdown
+## Convoy Formulas
+
+Convoy formulas define parallel work with a synthesis step. Each "leg" runs
+independently, and results are combined in synthesis.
+
+### Leg Formulas
+
+By default, convoy legs are dispatched as bare beads. To give polecats
+step-by-step workflow guidance, specify a `leg_formula`:
+
+\`\`\`toml
+[convoy]
+leg_formula = "mol-analysis-workflow"  # All legs use this
+
+[[legs]]
+id = "api"
+title = "API Analysis"
+# Uses mol-analysis-workflow
+
+[[legs]]
+id = "security"
+title = "Security Analysis"
+formula = "mol-security-audit"  # Override for this leg
+\`\`\`
+
+This causes dispatch to use `gt sling <formula> --on <leg-bead> <rig>`
+instead of plain `gt sling <leg-bead> <rig>`.
+```
+
+## Future Considerations
+
+### Unified Default Formula Config
+
+Issue #288 proposes auto-applying `mol-polecat-work` for all polecat slings.
+This could be generalized to a rig-level config:
+
+```json
+// settings/config.json
+{
+  "workflow": {
+    "default_formula": "reckoning-work"
+  }
+}
+```
+
+If implemented, convoy `leg_formula` would take precedence over rig default.
+
+### Priority Order
+
+```
+1. leg.formula (per-leg override)
+2. convoy.leg_formula (convoy default)
+3. rig.workflow.default_formula (rig default, if #288 implemented)
+4. none (bare bead, current behavior)
+```
