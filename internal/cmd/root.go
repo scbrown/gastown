@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/ui"
 	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -66,6 +68,20 @@ var branchCheckExemptCommands = map[string]bool{
 
 // persistentPreRun runs before every command.
 func persistentPreRun(cmd *cobra.Command, args []string) error {
+	// Check if binary was built properly (via make build, not raw go build).
+	// Raw go build produces unsigned binaries that macOS will kill.
+	if BuiltProperly == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: This binary was built with 'go build' directly.")
+		fmt.Fprintln(os.Stderr, "       Use 'make build' to create a properly signed binary.")
+		if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
+			fmt.Fprintf(os.Stderr, "       Run from: %s\n", gtRoot)
+		}
+		os.Exit(1)
+	}
+
+	// Initialize CLI theme (dark/light mode support)
+	initCLITheme()
+
 	// Get the root command name being run
 	cmdName := cmd.Name()
 
@@ -86,6 +102,22 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 
 	// Check beads version
 	return CheckBeadsVersion()
+}
+
+// initCLITheme initializes the CLI color theme based on settings and environment.
+func initCLITheme() {
+	// Try to load town settings for CLITheme config
+	var configTheme string
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		settingsPath := config.TownSettingsPath(townRoot)
+		if settings, err := config.LoadOrCreateTownSettings(settingsPath); err == nil {
+			configTheme = settings.CLITheme
+		}
+	}
+
+	// Initialize theme with config value (env var takes precedence inside InitTheme)
+	ui.InitTheme(configTheme)
+	ui.ApplyThemeMode()
 }
 
 // warnIfTownRootOffMain prints a warning if the town root is not on main branch.
