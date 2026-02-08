@@ -800,13 +800,8 @@ func GetActiveConnectionCount(townRoot string) (int, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx,
-		"dolt",
-		"sql",
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(config.Port),
-		"--user", config.User,
-		"--no-auto-commit",
-		"--result-format", "csv",
+		"dolt", "sql",
+		"-r", "csv",
 		"-q", "SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST",
 	)
 	cmd.Dir = config.DataDir
@@ -928,14 +923,7 @@ func MeasureQueryLatency(townRoot string) (time.Duration, error) {
 	config := DefaultConfig(townRoot)
 
 	start := time.Now()
-	cmd := exec.Command("dolt",
-		"sql",
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(config.Port),
-		"--user", config.User,
-		"--no-auto-commit",
-		"-q", "SELECT 1",
-	)
+	cmd := exec.Command("dolt", "sql", "-q", "SELECT 1")
 	cmd.Dir = config.DataDir
 	output, err := cmd.CombinedOutput()
 	elapsed := time.Since(start)
@@ -1014,19 +1002,16 @@ func moveDir(src, dest string) error {
 }
 
 // doltSQL executes a SQL statement against a specific rig database on the Dolt server.
-// Uses the dolt CLI to connect to the running server.
+// Uses the dolt CLI from the data directory (auto-detects running server).
+// The USE prefix selects the database since --use-db is not available on all dolt versions.
 func doltSQL(townRoot, rigDB, query string) error {
 	config := DefaultConfig(townRoot)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "dolt", "sql",
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(config.Port),
-		"--user", config.User,
-		"--use-db", rigDB,
-		"-q", query,
-	)
+	// Prepend USE <db> to select the target database.
+	fullQuery := fmt.Sprintf("USE %s; %s", rigDB, query)
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", fullQuery)
 	cmd.Dir = config.DataDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
