@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
@@ -627,6 +628,47 @@ func TestIsDoltOptimisticLockError(t *testing.T) {
 				t.Errorf("isDoltOptimisticLockError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsDoltWriterLockError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"writer lock signature", fmt.Errorf("failed to create dolt database: the database is locked by another dolt process"), true},
+		{"other lock text", fmt.Errorf("lock wait timeout exceeded"), false},
+		{"generic error", fmt.Errorf("something else"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDoltWriterLockError(tt.err); got != tt.want {
+				t.Errorf("isDoltWriterLockError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCreateAgentBeadBackoff(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, 250 * time.Millisecond},
+		{1, 250 * time.Millisecond},
+		{2, 500 * time.Millisecond},
+		{3, 1 * time.Second},
+		{4, 2 * time.Second},
+		{9, 2 * time.Second},
+	}
+
+	for _, tt := range tests {
+		if got := createAgentBeadBackoff(tt.attempt); got != tt.want {
+			t.Errorf("createAgentBeadBackoff(%d) = %v, want %v", tt.attempt, got, tt.want)
+		}
 	}
 }
 

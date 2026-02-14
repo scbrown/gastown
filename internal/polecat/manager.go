@@ -31,6 +31,10 @@ const (
 	doltMaxRetries  = 10
 	doltBaseBackoff = 500 * time.Millisecond
 	doltBackoffMax  = 30 * time.Second
+
+	// PATCH-A (x1e): early-abort threshold for repeated writer-lock collisions
+	// in agent-bead creation. Keeps contention windows bounded.
+	createWriterLockAbortThreshold = 3
 )
 
 // doltBackoff calculates exponential backoff with ±25% jitter for a given attempt (1-indexed).
@@ -66,6 +70,32 @@ func isDoltOptimisticLockError(err error) bool {
 		strings.Contains(msg, "try restarting transaction") ||
 		strings.Contains(msg, "database is read only") ||
 		strings.Contains(msg, "cannot update manifest")
+}
+
+// isDoltWriterLockError identifies the lock signature seen on x1e canaries.
+// This is treated as a writer-lock collision class for early-abort policy.
+func isDoltWriterLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked by another dolt process")
+}
+
+// createAgentBeadBackoff returns deterministic cooldown steps for agent-bead create retries.
+// PATCH-A (x1e): bounded deterministic ladder avoids long jitter tails under contention.
+// attempt is 1-indexed.
+func createAgentBeadBackoff(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 250 * time.Millisecond
+	}
+	if attempt == 2 {
+		return 500 * time.Millisecond
+	}
+	if attempt == 3 {
+		return 1 * time.Second
+	}
+	return 2 * time.Second
 }
 
 // isDoltConfigError returns true if the error indicates a configuration or initialization
@@ -278,6 +308,7 @@ func (m *Manager) CheckDoltServerCapacity() error {
 // transient and retrying them wastes ~3 minutes for identical failures.
 func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFields) error {
 	var lastErr error
+	writerLockFailures := 0
 	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
 		_, err := m.beads.CreateOrReopenAgentBead(agentID, agentID, fields)
 		if err == nil {
@@ -293,8 +324,19 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 		if isDoltConfigError(err) {
 			return fmt.Errorf("agent bead creation failed (DB not initialized — not retrying): %w", err)
 		}
+		if isDoltWriterLockError(err) {
+			writerLockFailures++
+			if writerLockFailures > createWriterLockAbortThreshold {
+				return fmt.Errorf(
+					"agent bead creation aborted after repeated writer-lock collisions (attempt=%d threshold=%d): %w",
+					attempt,
+					createWriterLockAbortThreshold,
+					err,
+				)
+			}
+		}
 		if attempt < doltMaxRetries {
-			backoff := doltBackoff(attempt)
+			backoff := createAgentBeadBackoff(attempt)
 			fmt.Printf("Warning: agent bead creation attempt %d failed, retrying in %v: %v\n", attempt, backoff, err)
 			time.Sleep(backoff)
 		}
