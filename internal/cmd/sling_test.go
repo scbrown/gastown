@@ -845,6 +845,110 @@ exit /b 1
 	}
 }
 
+// TestVerifyBeadExistsFromCrewWorkspaceRoutedIDs ensures sling's bead verification
+// uses the caller workspace context (like direct `bd show`) so cross-rig routed IDs
+// resolve correctly from crew workspaces.
+// Fixes: gt-tdo (routed bead IDs unresolved by gt sling while bd show worked).
+func TestVerifyBeadExistsFromCrewWorkspaceRoutedIDs(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Minimal workspace marker.
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test-town"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	// Route table present at town level.
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"aegis-","path":"aegis/mayor/rig"}`,
+		`{"prefix":"gt-","path":"gastown/mayor/rig"}`,
+		`{"prefix":"hq-","path":"."}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	// Crew workspace (the reported failing context).
+	crewDir := filepath.Join(townRoot, "aegis", "crew", "goldblum", "rig")
+	if err := os.MkdirAll(crewDir, 0755); err != nil {
+		t.Fatalf("mkdir crew dir: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+set -e
+echo "$(pwd)|$*" >> "${BD_LOG}"
+cmd="$1"
+id="$2"
+if [ "$cmd" = "show" ]; then
+  case "$id" in
+    aegis-*|gt-*)
+      echo '[{"title":"Routed bead","status":"open","assignee":""}]'
+      exit 0
+      ;;
+  esac
+fi
+echo '{"error":"not found"}'
+exit 1
+`
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo %CD%^|%*>>"%BD_LOG%"
+set "cmd=%1"
+set "id=%2"
+if "%cmd%"=="show" (
+  echo %id%| findstr /b "aegis- gt-" >nul
+  if not errorlevel 1 (
+    echo [{"title":"Routed bead","status":"open","assignee":""}]
+    exit /b 0
+  )
+)
+echo {"error":"not found"}
+exit /b 1
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(crewDir); err != nil {
+		t.Fatalf("chdir crew: %v", err)
+	}
+
+	for _, beadID := range []string{"aegis-822", "gt-tdo"} {
+		if err := verifyBeadExists(beadID); err != nil {
+			t.Fatalf("verifyBeadExists(%q): %v", beadID, err)
+		}
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	logText := string(logBytes)
+
+	for _, beadID := range []string{"aegis-822", "gt-tdo"} {
+		if !strings.Contains(logText, crewDir+"|show "+beadID+" --json --allow-stale") {
+			t.Fatalf("expected bd show for %s from crew cwd %s, got log:\n%s", beadID, crewDir, logText)
+		}
+	}
+}
+
 // TestSlingWithAllowStale tests the full gt sling flow with --allow-stale fix.
 // This is an integration test for the gtl-ncq bug.
 func TestSlingWithAllowStale(t *testing.T) {

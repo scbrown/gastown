@@ -20,23 +20,23 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-// resolveBeadDir returns the directory to run bd commands for a given bead ID.
-// Uses prefix-based routing to find the correct rig directory.
-// Falls back to rigs.json prefix mapping, then town root.
+// resolveBeadDir returns the directory to run routing-capable bd commands.
+// For commands like `bd show`, we intentionally run from the caller's current
+// workspace (crew/polecat/mayor), letting bd perform native walk-up routing.
+// Pre-routing to a rig path here can break valid cross-rig IDs that `bd show`
+// resolves correctly from the current workspace.
 func resolveBeadDir(beadID string) string {
-	townRoot, err := workspace.FindFromCwd()
-	if err != nil {
-		return "."
+	_ = beadID
+
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		return cwd
 	}
-	prefix := beads.ExtractPrefix(beadID)
-	if rigPath := beads.GetRigPathForPrefix(townRoot, prefix); rigPath != "" {
-		return rigPath
+
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		return townRoot
 	}
-	// Fallback: consult rigs.json for prefix-to-rig mapping
-	if rigDir := resolveBeadDirFromRigsJSON(townRoot, prefix); rigDir != "" {
-		return rigDir
-	}
-	return townRoot
+
+	return "."
 }
 
 // resolveBeadDirFromRigsJSON looks up the rig directory from rigs.json using prefix.
@@ -77,9 +77,6 @@ type beadInfo struct {
 // verifyBeadExists checks that the bead exists using bd show.
 // Uses bd's native prefix-based routing via routes.jsonl - do NOT set BEADS_DIR
 // as that overrides routing and breaks resolution of rig-level beads.
-//
-// Checks bead existence using bd show.
-// Resolves the rig directory from the bead's prefix for correct dolt access.
 func verifyBeadExists(beadID string) error {
 	cmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
 	cmd.Dir = resolveBeadDir(beadID)
@@ -93,8 +90,7 @@ func verifyBeadExists(beadID string) error {
 	return nil
 }
 
-// getBeadInfo returns status and assignee for a bead.
-// Resolves the rig directory from the bead's prefix for correct dolt access.
+// getBeadInfo returns status and assignee for a bead via routed bd show.
 func getBeadInfo(beadID string) (*beadInfo, error) {
 	cmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
 	cmd.Dir = resolveBeadDir(beadID)
