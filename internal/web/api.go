@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,19 +14,13 @@ import (
 	"time"
 )
 
-const (
-	// DefaultCommandTimeout is the default timeout for command execution.
-	DefaultCommandTimeout = 30 * time.Second
-	// MaxCommandTimeout is the maximum allowed timeout.
-	MaxCommandTimeout = 60 * time.Second
-)
 
 // CommandRequest is the JSON request body for /api/run.
 type CommandRequest struct {
 	// Command is the gt command to run (without the "gt" prefix).
 	// Example: "status --json" or "mail inbox"
 	Command string `json:"command"`
-	// Timeout in seconds (optional, default 30, max 60)
+	// Timeout in seconds (optional; see WebTimeoutsConfig for defaults)
 	Timeout int `json:"timeout,omitempty"`
 }
 
@@ -49,6 +44,9 @@ type APIHandler struct {
 	gtPath string
 	// workDir is the working directory for command execution.
 	workDir string
+	// Configurable timeouts (from TownSettings.WebTimeouts)
+	defaultRunTimeout time.Duration
+	maxRunTimeout     time.Duration
 	// Options cache
 	optionsCache     *OptionsResponse
 	optionsCacheTime time.Time
@@ -57,14 +55,16 @@ type APIHandler struct {
 
 const optionsCacheTTL = 30 * time.Second
 
-// NewAPIHandler creates a new API handler.
-func NewAPIHandler() *APIHandler {
+// NewAPIHandler creates a new API handler with the given run timeouts.
+func NewAPIHandler(defaultRunTimeout, maxRunTimeout time.Duration) *APIHandler {
 	// Use PATH lookup for gt binary. Do NOT use os.Executable() here - during
 	// tests it returns the test binary, causing fork bombs when executed.
 	workDir, _ := os.Getwd()
 	return &APIHandler{
-		gtPath:  "gt",
-		workDir: workDir,
+		gtPath:            "gt",
+		workDir:           workDir,
+		defaultRunTimeout: defaultRunTimeout,
+		maxRunTimeout:     maxRunTimeout,
 	}
 }
 
@@ -125,11 +125,11 @@ func (h *APIHandler) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Determine timeout
-	timeout := DefaultCommandTimeout
+	timeout := h.defaultRunTimeout
 	if req.Timeout > 0 {
 		timeout = time.Duration(req.Timeout) * time.Second
-		if timeout > MaxCommandTimeout {
-			timeout = MaxCommandTimeout
+		if timeout > h.maxRunTimeout {
+			timeout = h.maxRunTimeout
 		}
 	}
 
@@ -304,6 +304,10 @@ func (h *APIHandler) handleMailRead(w http.ResponseWriter, r *http.Request) {
 		h.sendError(w, "Missing message ID", http.StatusBadRequest)
 		return
 	}
+	if !isValidID(msgID) {
+		h.sendError(w, "Invalid message ID format", http.StatusBadRequest)
+		return
+	}
 
 	output, err := h.runGtCommand(r.Context(), 10*time.Second, []string{"mail", "read", msgID})
 	if err != nil {
@@ -338,14 +342,42 @@ func (h *APIHandler) handleMailSend(w http.ResponseWriter, r *http.Request) {
 		h.sendError(w, "Missing required fields (to, subject)", http.StatusBadRequest)
 		return
 	}
+	if !isValidMailAddress(req.To) {
+		h.sendError(w, "Invalid recipient format", http.StatusBadRequest)
+		return
+	}
+	if req.ReplyTo != "" && !isValidID(req.ReplyTo) {
+		h.sendError(w, "Invalid reply-to ID format", http.StatusBadRequest)
+		return
+	}
 
-	args := []string{"mail", "send", req.To, "-s", req.Subject}
+	// Enforce length limits (consistent with handleIssueCreate)
+	const maxSubjectLen = 500
+	const maxBodyLen = 100_000
+	if len(req.Subject) > maxSubjectLen {
+		h.sendError(w, fmt.Sprintf("Subject too long (max %d bytes)", maxSubjectLen), http.StatusBadRequest)
+		return
+	}
+	if len(req.Body) > maxBodyLen {
+		h.sendError(w, fmt.Sprintf("Body too long (max %d bytes)", maxBodyLen), http.StatusBadRequest)
+		return
+	}
+	if strings.Contains(req.Subject, "\x00") || strings.Contains(req.Body, "\x00") {
+		h.sendError(w, "Subject and body cannot contain null bytes", http.StatusBadRequest)
+		return
+	}
+
+	// Build mail send command. Flags go first, then -- to end flag parsing,
+	// then the positional recipient (consistent with handleIssueCreate/handleInstall).
+	args := []string{"mail", "send"}
+	args = append(args, "-s", req.Subject)
 	if req.Body != "" {
 		args = append(args, "-m", req.Body)
 	}
 	if req.ReplyTo != "" {
 		args = append(args, "--reply-to", req.ReplyTo)
 	}
+	args = append(args, "--", req.To)
 
 	output, err := h.runGtCommand(r.Context(), 30*time.Second, args)
 	if err != nil {
@@ -387,7 +419,7 @@ func parseMailInboxText(output string) []MailMessage {
 			rest := strings.TrimSpace(trimmed[2:])
 			if strings.HasPrefix(rest, "●") {
 				current.Read = false
-				current.Subject = strings.TrimSpace(rest[len("●"):])
+				current.Subject = strings.TrimSpace(strings.TrimPrefix(rest, "●"))
 			} else {
 				current.Read = true
 				current.Subject = rest
@@ -489,6 +521,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Rigs = parseRigListOutput(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: rig list: %v", err)
 		}
 	}()
 
@@ -499,6 +533,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Polecats = parseJSONPaths(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: polecat list: %v", err)
 		}
 	}()
 
@@ -509,6 +545,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Convoys = parseConvoyListOutput(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: convoy list: %v", err)
 		}
 	}()
 
@@ -519,6 +557,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Hooks = parseHooksListOutput(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: hooks list: %v", err)
 		}
 	}()
 
@@ -529,6 +569,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Messages = parseMailInboxOutput(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: mail inbox: %v", err)
 		}
 	}()
 
@@ -539,6 +581,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Crew = parseCrewListOutput(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: crew list: %v", err)
 		}
 	}()
 
@@ -549,6 +593,8 @@ func (h *APIHandler) handleOptions(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			resp.Agents = parseAgentsFromStatus(output)
 			mu.Unlock()
+		} else {
+			log.Printf("warning: handleOptions: status: %v", err)
 		}
 	}()
 
@@ -705,30 +751,6 @@ func parseAgentsFromStatus(jsonStr string) []OptionItem {
 	return agents
 }
 
-// parseJSONNames extracts a field from a JSON array of objects.
-func parseJSONNames(jsonStr string, field string) []string {
-	var items []map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &items); err != nil {
-		// Try parsing as object with array field
-		var wrapper map[string][]map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonStr), &wrapper); err != nil {
-			return nil
-		}
-		for _, v := range wrapper {
-			items = v
-			break
-		}
-	}
-
-	var names []string
-	for _, item := range items {
-		if name, ok := item[field].(string); ok && name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
-}
-
 // parseJSONPaths extracts rig/name paths from polecat JSON output.
 func parseJSONPaths(jsonStr string) []string {
 	var items []map[string]interface{}
@@ -776,15 +798,48 @@ func (h *APIHandler) handleIssueShow(w http.ResponseWriter, r *http.Request) {
 		h.sendError(w, "Missing issue ID", http.StatusBadRequest)
 		return
 	}
+	// Issue IDs may use external:prefix:id format for cross-rig dependencies
+	// (see internal/web/fetcher.go:extractIssueID). Unwrap to the raw bead ID
+	// before validation and before passing to bd show, which doesn't handle
+	// the external: prefix. This also fixes a pre-existing bug where the
+	// wrapped ID was passed to bd show and always failed to resolve.
+	showID := issueID
+	if strings.HasPrefix(issueID, "external:") {
+		parts := strings.SplitN(issueID, ":", 3)
+		if len(parts) == 3 {
+			showID = parts[2]
+		} else {
+			h.sendError(w, "Malformed external issue ID (expected external:prefix:id)", http.StatusBadRequest)
+			return
+		}
+	}
+	if !isValidID(showID) {
+		h.sendError(w, "Invalid issue ID format", http.StatusBadRequest)
+		return
+	}
 
-	// Run bd show to get issue details
-	output, err := h.runBdCommand(r.Context(), 10*time.Second, []string{"show", issueID})
+	// Try structured JSON output first (preferred — no text parsing needed)
+	output, err := h.runBdCommand(r.Context(), 10*time.Second, []string{"show", showID, "--json"})
+	if err == nil {
+		if resp, ok := parseIssueShowJSON(output); ok {
+			// Preserve the original request ID in the response (may be external:prefix:id).
+			// Callers may store/compare the full prefixed form.
+			resp.ID = issueID
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+	}
+
+	// Fall back to text parsing
+	output, err = h.runBdCommand(r.Context(), 10*time.Second, []string{"show", showID})
 	if err != nil {
 		h.sendError(w, "Failed to fetch issue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Parse the output
+	// Pass issueID (not showID) to preserve the original ID in the API response.
+	// Callers may store/compare the full external:prefix:id form.
 	resp := parseIssueShowOutput(output, issueID)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -819,6 +874,18 @@ func (h *APIHandler) handleIssueCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce length limits to prevent oversized payloads
+	const maxTitleLen = 500
+	const maxDescriptionLen = 100_000 // 100KB
+	if len(req.Title) > maxTitleLen {
+		h.sendError(w, fmt.Sprintf("Title too long (max %d bytes)", maxTitleLen), http.StatusBadRequest)
+		return
+	}
+	if len(req.Description) > maxDescriptionLen {
+		h.sendError(w, fmt.Sprintf("Description too long (max %d bytes)", maxDescriptionLen), http.StatusBadRequest)
+		return
+	}
+
 	// Validate title doesn't contain control characters or newlines
 	if strings.ContainsAny(req.Title, "\n\r\x00") {
 		h.sendError(w, "Title cannot contain newlines or control characters", http.StatusBadRequest)
@@ -831,8 +898,10 @@ func (h *APIHandler) handleIssueCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build bd create command
-	args := []string{"create", req.Title}
+	// Build bd create command. Flags go first, then -- to end flag parsing,
+	// then the positional title (prevents titles like "--help" being parsed as flags).
+	// bd uses cobra/pflag which respects -- natively (verified: bd --help shows cobra format).
+	args := []string{"create"}
 
 	// Add priority if specified (default is P2)
 	if req.Priority >= 1 && req.Priority <= 4 {
@@ -843,6 +912,8 @@ func (h *APIHandler) handleIssueCreate(w http.ResponseWriter, r *http.Request) {
 	if req.Description != "" {
 		args = append(args, "--body", req.Description)
 	}
+
+	args = append(args, "--", req.Title)
 
 	// Run bd create
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -913,7 +984,48 @@ func (h *APIHandler) runBdCommand(ctx context.Context, timeout time.Duration, ar
 	return output, nil
 }
 
-// parseIssueShowOutput parses the output from "bd show <id>".
+// parseIssueShowJSON parses the JSON output from "bd show <id> --json".
+// Returns (response, true) on success, or (zero, false) if parsing fails.
+func parseIssueShowJSON(output string) (IssueShowResponse, bool) {
+	var items []struct {
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Status      string   `json:"status"`
+		Priority    int      `json:"priority"`
+		Type        string   `json:"issue_type"`
+		CreatedAt   string   `json:"created_at"`
+		UpdatedAt   string   `json:"updated_at"`
+		DependsOn   []string `json:"depends_on,omitempty"`
+		Blocks      []string `json:"blocks,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(output), &items); err != nil || len(items) == 0 {
+		return IssueShowResponse{}, false
+	}
+	item := items[0]
+
+	priority := ""
+	if item.Priority > 0 {
+		priority = fmt.Sprintf("P%d", item.Priority)
+	}
+
+	return IssueShowResponse{
+		ID:          item.ID,
+		Title:       item.Title,
+		Type:        item.Type,
+		Status:      item.Status,
+		Priority:    priority,
+		Description: item.Description,
+		Created:     item.CreatedAt,
+		Updated:     item.UpdatedAt,
+		DependsOn:   item.DependsOn,
+		Blocks:      item.Blocks,
+		RawOutput:   output,
+	}, true
+}
+
+// parseIssueShowOutput parses the text output from "bd show <id>".
+// This is the fallback path when --json is unavailable.
 func parseIssueShowOutput(output string, issueID string) IssueShowResponse {
 	resp := IssueShowResponse{
 		ID:        issueID,
@@ -950,14 +1062,13 @@ func parseIssueShowOutput(output string, issueID string) IssueShowResponse {
 
 				// Now parse the title from before the bracket
 				// Format: "○ id · title"
-				// Find the second · which separates id from title
-				if firstDot := strings.Index(beforeBracket, "·"); firstDot > 0 {
-					afterFirstDot := beforeBracket[firstDot+len("·"):]
-					if secondDot := strings.Index(afterFirstDot, "·"); secondDot > 0 {
-						resp.Title = strings.TrimSpace(afterFirstDot[secondDot+len("·"):])
+				// Use strings.Cut for safe splitting on multi-byte "·" separator
+				if _, afterFirst, ok := strings.Cut(beforeBracket, "·"); ok {
+					if _, afterSecond, ok := strings.Cut(afterFirst, "·"); ok {
+						resp.Title = strings.TrimSpace(afterSecond)
 					} else {
 						// Only one dot - id is embedded in icon part
-						resp.Title = strings.TrimSpace(afterFirstDot)
+						resp.Title = strings.TrimSpace(afterFirst)
 					}
 				}
 			}
@@ -967,9 +1078,10 @@ func parseIssueShowOutput(output string, issueID string) IssueShowResponse {
 		if strings.HasPrefix(line, "Type:") {
 			resp.Type = strings.TrimSpace(strings.TrimPrefix(line, "Type:"))
 		} else if strings.HasPrefix(line, "Created:") {
+			// Split always returns >= 1 element; parts[0] is safe unconditionally
 			parts := strings.Split(line, "·")
 			resp.Created = strings.TrimSpace(strings.TrimPrefix(parts[0], "Created:"))
-			if len(parts) > 1 {
+			if len(parts) >= 2 {
 				resp.Updated = strings.TrimSpace(strings.TrimPrefix(parts[1], "Updated:"))
 			}
 		} else if line == "DESCRIPTION" {
@@ -1043,6 +1155,36 @@ func (h *APIHandler) handlePRShow(w http.ResponseWriter, r *http.Request) {
 	if prURL == "" && (repo == "" || number == "") {
 		h.sendError(w, "Missing repo/number or url parameter", http.StatusBadRequest)
 		return
+	}
+
+	// Validate inputs to prevent argument injection.
+	// When url is provided, repo/number are ignored — only validate what's used.
+	if prURL != "" {
+		const maxURLLen = 2000
+		if len(prURL) > maxURLLen {
+			h.sendError(w, fmt.Sprintf("PR URL too long (max %d bytes)", maxURLLen), http.StatusBadRequest)
+			return
+		}
+		if strings.ContainsAny(prURL, "\x00\n\r") {
+			h.sendError(w, "PR URL cannot contain null bytes or newlines", http.StatusBadRequest)
+			return
+		}
+		// Allow any https:// URL, not just github.com — supports GitHub Enterprise.
+		// gh CLI validates against the configured host and rejects non-GitHub API responses,
+		// limiting SSRF risk. Localhost-only deployment further reduces exposure.
+		if !strings.HasPrefix(prURL, "https://") {
+			h.sendError(w, "PR URL must start with https://", http.StatusBadRequest)
+			return
+		}
+	} else {
+		if !isNumeric(number) {
+			h.sendError(w, "Invalid PR number format", http.StatusBadRequest)
+			return
+		}
+		if !isValidRepoRef(repo) {
+			h.sendError(w, "Invalid repo format (expected owner/repo)", http.StatusBadRequest)
+			return
+		}
 	}
 
 	var args []string
@@ -1290,7 +1432,9 @@ func (h *APIHandler) detectCrewState(ctx context.Context, sessionName, hook stri
 
 		// Found session
 		var activityUnix int64
-		fmt.Sscanf(parts[1], "%d", &activityUnix)
+		if _, err := fmt.Sscanf(parts[1], "%d", &activityUnix); err != nil {
+			continue
+		}
 		attached := parts[2] == "1"
 
 		sessionStatus := "detached"

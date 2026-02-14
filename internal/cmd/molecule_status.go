@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -507,6 +506,8 @@ func buildAgentIdentity(ctx RoleContext) string {
 		return "mayor/"
 	case RoleDeacon:
 		return "deacon/"
+	case RoleBoot:
+		return "deacon/boot"
 	case RoleWitness:
 		return ctx.Rig + "/witness"
 	case RoleRefinery:
@@ -977,23 +978,14 @@ func outputMoleculeCurrent(info MoleculeCurrentInfo) error {
 	return nil
 }
 
-// getGitRootForMolStatus returns the git root for hook file lookup.
-func getGitRootForMolStatus() (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 // isTownLevelRole returns true if the agent ID is a town-level role.
 // Town-level roles (Mayor, Deacon) operate from the town root and may have
 // pinned beads in any rig's beads directory.
 // Accepts both "mayor" and "mayor/" formats for compatibility.
 func isTownLevelRole(agentID string) bool {
 	return agentID == "mayor" || agentID == "mayor/" ||
-		agentID == "deacon" || agentID == "deacon/"
+		agentID == "deacon" || agentID == "deacon/" ||
+		agentID == "boot" || agentID == "deacon/boot"
 }
 
 // extractMailSender extracts the sender from mail bead labels.
@@ -1020,7 +1012,14 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 
 	// Scan each rig's beads directory
 	for _, route := range routes {
-		rigBeadsDir := filepath.Join(townRoot, route.Path)
+		// Handle both absolute and relative paths in routes.jsonl
+		// Go's filepath.Join doesn't replace with absolute paths like Python
+		var rigBeadsDir string
+		if filepath.IsAbs(route.Path) {
+			rigBeadsDir = route.Path
+		} else {
+			rigBeadsDir = filepath.Join(townRoot, route.Path)
+		}
 		if _, err := os.Stat(rigBeadsDir); os.IsNotExist(err) {
 			continue
 		}

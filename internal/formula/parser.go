@@ -3,6 +3,7 @@ package formula
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/BurntSushi/toml"
 )
@@ -99,6 +100,15 @@ func (f *Formula) validateConvoy() error {
 		for _, dep := range f.Synthesis.DependsOn {
 			if !seen[dep] {
 				return fmt.Errorf("synthesis depends_on references unknown leg: %s", dep)
+			}
+		}
+	}
+
+	// Validate RequiredUnless references point to existing input keys
+	for name, input := range f.Inputs {
+		for _, ref := range input.RequiredUnless {
+			if _, ok := f.Inputs[ref]; !ok {
+				return fmt.Errorf("input %q has required_unless referencing unknown input %q", name, ref)
 			}
 		}
 	}
@@ -238,7 +248,14 @@ func checkDependencyCycles(deps map[string][]string) error {
 		return nil
 	}
 
+	// Sort keys for deterministic cycle detection order
+	ids := make([]string, 0, len(deps))
 	for id := range deps {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
 		if err := visit(id); err != nil {
 			return err
 		}

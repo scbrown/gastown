@@ -27,6 +27,8 @@
 package doltserver
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,9 +36,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,9 +51,21 @@ import (
 
 // Default configuration
 const (
-	DefaultPort = 3307
-	DefaultUser = "root" // Default Dolt user (no password for local access)
+	DefaultPort           = 3307
+	DefaultUser           = "root" // Default Dolt user (no password for local access)
+	DefaultMaxConnections = 50     // Conservative default to prevent connection storms
 )
+
+// metadataMu provides per-path mutexes for EnsureMetadata goroutine synchronization.
+// flock is inter-process only and cannot reliably synchronize goroutines within the
+// same process (the same process may acquire the same flock twice without blocking).
+var metadataMu sync.Map // map[string]*sync.Mutex
+
+// getMetadataMu returns a mutex for the given metadata file path, creating one if needed.
+func getMetadataMu(path string) *sync.Mutex {
+	mu, _ := metadataMu.LoadOrStore(path, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
 
 // Config holds Dolt server configuration.
 type Config struct {
@@ -71,18 +87,24 @@ type Config struct {
 
 	// PidFile is the path to the PID file.
 	PidFile string
+
+	// MaxConnections is the maximum number of simultaneous connections the server will accept.
+	// Set to 0 to use the Dolt default (1000). Gas Town defaults to 50 to prevent
+	// connection storms during mass polecat slings.
+	MaxConnections int
 }
 
 // DefaultConfig returns the default Dolt server configuration.
 func DefaultConfig(townRoot string) *Config {
 	daemonDir := filepath.Join(townRoot, "daemon")
 	return &Config{
-		TownRoot: townRoot,
-		Port:     DefaultPort,
-		User:     DefaultUser,
-		DataDir:  filepath.Join(townRoot, ".dolt-data"),
-		LogFile:  filepath.Join(daemonDir, "dolt.log"),
-		PidFile:  filepath.Join(daemonDir, "dolt.pid"),
+		TownRoot:       townRoot,
+		Port:           DefaultPort,
+		User:           DefaultUser,
+		DataDir:        filepath.Join(townRoot, ".dolt-data"),
+		LogFile:        filepath.Join(daemonDir, "dolt.log"),
+		PidFile:        filepath.Join(daemonDir, "dolt.pid"),
+		MaxConnections: DefaultMaxConnections,
 	}
 }
 
@@ -197,7 +219,7 @@ func CheckServerReachable(townRoot string) error {
 	if err != nil {
 		return fmt.Errorf("Dolt server not reachable at %s: %w\n\nStart with: gt dolt start", addr, err)
 	}
-	conn.Close()
+	_ = conn.Close()
 	return nil
 }
 
@@ -228,7 +250,7 @@ func HasServerModeMetadata(townRoot string) []string {
 	}
 
 	for rigName := range config.Rigs {
-		beadsDir := findRigBeadsDir(townRoot, rigName)
+		beadsDir := FindRigBeadsDir(townRoot, rigName)
 		if beadsDir != "" && hasServerMode(beadsDir) {
 			serverRigs = append(serverRigs, rigName)
 		}
@@ -358,10 +380,14 @@ func Start(townRoot string) error {
 	// Start dolt sql-server with --data-dir to serve all databases
 	// Note: --user flag is deprecated in newer Dolt; authentication is handled
 	// via privilege system. Default is root user with no password for localhost.
-	cmd := exec.Command("dolt", "sql-server",
+	args := []string{"sql-server",
 		"--port", strconv.Itoa(config.Port),
 		"--data-dir", config.DataDir,
-	)
+	}
+	if config.MaxConnections > 0 {
+		args = append(args, "--max-connections", strconv.Itoa(config.MaxConnections))
+	}
+	cmd := exec.Command("dolt", args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -542,10 +568,196 @@ func ListDatabases(townRoot string) ([]string, error) {
 	return databases, nil
 }
 
+// VerifyDatabases queries the running Dolt SQL server for SHOW DATABASES and
+// compares the result against the filesystem-discovered databases from
+// ListDatabases. Returns the list of databases the server is actually serving
+// and any that exist on disk but are missing from the server.
+//
+// This catches the silent failure mode where Dolt skips databases with stale
+// manifests after migration — the filesystem says they exist, but the server
+// doesn't serve them.
+func VerifyDatabases(townRoot string) (served, missing []string, err error) {
+	return verifyDatabasesWithRetry(townRoot, 1)
+}
+
+// VerifyDatabasesWithRetry is like VerifyDatabases but retries the SHOW DATABASES
+// query with exponential backoff to handle the case where the server has just started
+// and is still loading databases.
+func VerifyDatabasesWithRetry(townRoot string, maxAttempts int) (served, missing []string, err error) {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	return verifyDatabasesWithRetry(townRoot, maxAttempts)
+}
+
+func verifyDatabasesWithRetry(townRoot string, maxAttempts int) (served, missing []string, err error) {
+	config := DefaultConfig(townRoot)
+
+	// Retry with backoff since the server may still be loading databases
+	// after a recent start (Start() only waits 500ms + process-alive check).
+	// Both reachability and query are inside the loop so transient startup
+	// failures are retried.
+	const baseBackoff = 1 * time.Second
+	const maxBackoff = 8 * time.Second
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Check if the server is reachable (TCP-level).
+		if reachErr := CheckServerReachable(townRoot); reachErr != nil {
+			lastErr = fmt.Errorf("server not reachable: %w", reachErr)
+			if attempt < maxAttempts {
+				backoff := baseBackoff
+				for i := 1; i < attempt; i++ {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+						break
+					}
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, "dolt", "sql",
+			"-r", "json",
+			"-q", "SHOW DATABASES",
+		)
+		cmd.Dir = config.DataDir
+
+		// Capture stderr separately so it doesn't corrupt JSON parsing.
+		// Dolt commonly writes deprecation/manifest warnings to stderr.
+		// See also daemon/dolt.go:listDatabases() which uses cmd.Output()
+		// for the same reason.
+		var stderrBuf bytes.Buffer
+		cmd.Stderr = &stderrBuf
+		output, queryErr := cmd.Output()
+		cancel()
+		if queryErr != nil {
+			stderrMsg := strings.TrimSpace(stderrBuf.String())
+			errDetail := strings.TrimSpace(string(output))
+			if stderrMsg != "" {
+				errDetail = errDetail + " (stderr: " + stderrMsg + ")"
+			}
+			lastErr = fmt.Errorf("querying SHOW DATABASES: %w (output: %s)", queryErr, errDetail)
+			if attempt < maxAttempts {
+				backoff := baseBackoff
+				for i := 1; i < attempt; i++ {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+						break
+					}
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+
+		var parseErr error
+		served, parseErr = parseShowDatabases(output)
+		if parseErr != nil {
+			return nil, nil, fmt.Errorf("parsing SHOW DATABASES output: %w", parseErr)
+		}
+
+		// Compare against filesystem databases.
+		fsDatabases, fsErr := ListDatabases(townRoot)
+		if fsErr != nil {
+			return served, nil, fmt.Errorf("listing filesystem databases: %w", fsErr)
+		}
+
+		missing = findMissingDatabases(served, fsDatabases)
+		return served, missing, nil
+	}
+	return nil, nil, lastErr
+}
+
+// parseShowDatabases parses the output of SHOW DATABASES from dolt sql.
+// It tries JSON parsing first, falling back to line-based parsing for
+// plain-text output. Returns an error if the output format is unrecognized.
+// Filters out the information_schema database.
+func parseShowDatabases(output []byte) ([]string, error) {
+	// Try JSON first. Use a raw map to detect schema presence.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(output, &raw); err != nil {
+		// Check if the output looks like JSON that failed to parse —
+		// don't fall through to line parsing with JSON-shaped text.
+		trimmed := strings.TrimSpace(string(output))
+		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			return nil, fmt.Errorf("output looks like JSON but failed to parse: %w", err)
+		}
+
+		// Fall back to line parsing for plain-text output.
+		var databases []string
+		for _, line := range strings.Split(string(output), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && line != "Database" && !strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "|") {
+				if line != "information_schema" {
+					databases = append(databases, line)
+				}
+			}
+		}
+		if len(databases) == 0 && len(trimmed) > 0 {
+			return nil, fmt.Errorf("fallback parser returned zero databases from non-empty output (%d bytes); format may be unrecognized", len(trimmed))
+		}
+		return databases, nil
+	}
+
+	// JSON parsed — require the expected "rows" key.
+	rowsRaw, hasRows := raw["rows"]
+	if !hasRows {
+		return nil, fmt.Errorf("JSON output missing expected 'rows' key (keys: %v); Dolt output schema may have changed", jsonKeys(raw))
+	}
+
+	var rows []struct {
+		Database string `json:"Database"`
+	}
+	if err := json.Unmarshal(rowsRaw, &rows); err != nil {
+		return nil, fmt.Errorf("JSON 'rows' field has unexpected type: %w", err)
+	}
+
+	var databases []string
+	for _, row := range rows {
+		if row.Database != "" && row.Database != "information_schema" {
+			databases = append(databases, row.Database)
+		}
+	}
+	return databases, nil
+}
+
+// findMissingDatabases returns filesystem databases not present in the served list.
+// Comparison is case-insensitive since Dolt database names are case-insensitive
+// in SQL but case-preserving on the filesystem.
+func findMissingDatabases(served, fsDatabases []string) []string {
+	servedSet := make(map[string]bool, len(served))
+	for _, db := range served {
+		servedSet[strings.ToLower(db)] = true
+	}
+	var missing []string
+	for _, db := range fsDatabases {
+		if !servedSet[strings.ToLower(db)] {
+			missing = append(missing, db)
+		}
+	}
+	return missing
+}
+
+// jsonKeys returns the top-level keys from a JSON object map, for diagnostics.
+func jsonKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // InitRig initializes a new rig database in the data directory.
-func InitRig(townRoot, rigName string) error {
+// If the Dolt server is running, it executes CREATE DATABASE to register the
+// database with the live server (avoiding the need for a restart).
+// Returns true if the database was registered with a running server.
+func InitRig(townRoot, rigName string) (serverWasRunning bool, err error) {
 	if rigName == "" {
-		return fmt.Errorf("rig name cannot be empty")
+		return false, fmt.Errorf("rig name cannot be empty")
 	}
 
 	config := DefaultConfig(townRoot)
@@ -553,28 +765,39 @@ func InitRig(townRoot, rigName string) error {
 	// Validate rig name (simple alphanumeric + underscore/dash)
 	for _, r := range rigName {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
-			return fmt.Errorf("invalid rig name %q: must contain only alphanumeric, underscore, or dash", rigName)
+			return false, fmt.Errorf("invalid rig name %q: must contain only alphanumeric, underscore, or dash", rigName)
 		}
 	}
 
 	rigDir := filepath.Join(config.DataDir, rigName)
 
-	// Check if already exists
+	// Check if already exists on disk
 	if _, err := os.Stat(filepath.Join(rigDir, ".dolt")); err == nil {
-		return fmt.Errorf("rig database %q already exists at %s", rigName, rigDir)
+		return false, fmt.Errorf("rig database %q already exists at %s", rigName, rigDir)
 	}
 
-	// Create the rig directory
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
-		return fmt.Errorf("creating rig directory: %w", err)
-	}
+	// Check if server is running
+	running, _, _ := IsRunning(townRoot)
 
-	// Initialize Dolt database
-	cmd := exec.Command("dolt", "init")
-	cmd.Dir = rigDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
+	if running {
+		// Server is running: use CREATE DATABASE which both creates the
+		// directory and registers the database with the live server.
+		if err := serverExecSQL(townRoot, fmt.Sprintf("CREATE DATABASE `%s`", rigName)); err != nil {
+			return true, fmt.Errorf("creating database on running server: %w", err)
+		}
+	} else {
+		// Server not running: create directory and init manually.
+		// The database will be picked up when the server starts.
+		if err := os.MkdirAll(rigDir, 0755); err != nil {
+			return false, fmt.Errorf("creating rig directory: %w", err)
+		}
+
+		cmd := exec.Command("dolt", "init")
+		cmd.Dir = rigDir
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return false, fmt.Errorf("initializing Dolt database: %w\n%s", err, output)
+		}
 	}
 
 	// Update metadata.json to point to the server
@@ -583,7 +806,7 @@ func InitRig(townRoot, rigName string) error {
 		fmt.Fprintf(os.Stderr, "Warning: database initialized but metadata.json update failed: %v\n", err)
 	}
 
-	return nil
+	return running, nil
 }
 
 // Migration represents a database migration from old to new location.
@@ -593,6 +816,59 @@ type Migration struct {
 	TargetPath string
 }
 
+// findLocalDoltDB scans beadsDir/dolt/ for a subdirectory containing a .dolt
+// directory (an embedded Dolt database). Returns the full path to the database
+// directory, or "" if none found.
+//
+// bd names the subdirectory based on internal conventions (e.g., beads_hq,
+// beads_gt) that have changed across versions. Scanning avoids hardcoding
+// assumptions about the naming scheme.
+//
+// If multiple databases are found, returns "" and logs a warning to stderr.
+// Callers should not silently pick one — ambiguity requires manual resolution.
+func findLocalDoltDB(beadsDir string) string {
+	doltParent := filepath.Join(beadsDir, "dolt")
+	entries, err := os.ReadDir(doltParent)
+	if err != nil {
+		return ""
+	}
+	var candidates []string
+	for _, e := range entries {
+		// Resolve symlinks: DirEntry.IsDir() returns false for symlinks-to-directories
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(filepath.Join(doltParent, e.Name()))
+			if err != nil {
+				continue
+			}
+			fi, err := os.Stat(resolved)
+			if err != nil || !fi.IsDir() {
+				continue
+			}
+		} else if !e.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(doltParent, e.Name())
+		if _, err := os.Stat(filepath.Join(candidate, ".dolt")); err == nil {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
+		if len(entries) > 0 {
+			fmt.Fprintf(os.Stderr, "[doltserver] Warning: %s exists but contains no valid dolt database\n", doltParent)
+		}
+		return ""
+	}
+	if len(candidates) > 1 {
+		fmt.Fprintf(os.Stderr, "[doltserver] Warning: multiple dolt databases found in %s: %v — manual resolution required\n", doltParent, candidates)
+		return ""
+	}
+	return candidates[0]
+}
+
 // FindMigratableDatabases finds existing dolt databases that can be migrated.
 func FindMigratableDatabases(townRoot string) []Migration {
 	var migrations []Migration
@@ -600,8 +876,8 @@ func FindMigratableDatabases(townRoot string) []Migration {
 
 	// Check town-level beads database -> .dolt-data/hq
 	townBeadsDir := beads.ResolveBeadsDir(townRoot)
-	townSource := filepath.Join(townBeadsDir, "dolt", "beads")
-	if _, err := os.Stat(filepath.Join(townSource, ".dolt")); err == nil {
+	townSource := findLocalDoltDB(townBeadsDir)
+	if townSource != "" {
 		// Check target doesn't already have data
 		targetDir := filepath.Join(config.DataDir, "hq")
 		if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); os.IsNotExist(err) {
@@ -627,9 +903,9 @@ func FindMigratableDatabases(townRoot string) []Migration {
 
 		rigName := entry.Name()
 		resolvedBeadsDir := beads.ResolveBeadsDir(filepath.Join(townRoot, rigName))
-		rigSource := filepath.Join(resolvedBeadsDir, "dolt", "beads")
+		rigSource := findLocalDoltDB(resolvedBeadsDir)
 
-		if _, err := os.Stat(filepath.Join(rigSource, ".dolt")); err == nil {
+		if rigSource != "" {
 			// Check target doesn't already have data
 			targetDir := filepath.Join(config.DataDir, rigName)
 			if _, err := os.Stat(filepath.Join(targetDir, ".dolt")); os.IsNotExist(err) {
@@ -646,7 +922,7 @@ func FindMigratableDatabases(townRoot string) []Migration {
 }
 
 // MigrateRigFromBeads migrates an existing beads Dolt database to the data directory.
-// This is used to migrate from the old per-rig .beads/dolt/beads layout to the new
+// This is used to migrate from the old per-rig .beads/dolt/<db_name> layout to the new
 // centralized .dolt-data/<rigname> layout.
 func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 	config := DefaultConfig(townRoot)
@@ -682,6 +958,139 @@ func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 	return nil
 }
 
+// DatabaseExists checks whether a rig database exists in the centralized .dolt-data/ directory.
+func DatabaseExists(townRoot, rigName string) bool {
+	config := DefaultConfig(townRoot)
+	doltDir := filepath.Join(config.DataDir, rigName, ".dolt")
+	_, err := os.Stat(doltDir)
+	return err == nil
+}
+
+// BrokenWorkspace represents a workspace whose metadata.json points to a
+// nonexistent database on the Dolt server.
+type BrokenWorkspace struct {
+	// RigName is the rig whose database is missing.
+	RigName string
+
+	// BeadsDir is the path to the .beads directory with the broken metadata.
+	BeadsDir string
+
+	// ConfiguredDB is the dolt_database value from metadata.json.
+	ConfiguredDB string
+
+	// HasLocalData is true if .beads/dolt/<dbname> exists locally and can be migrated.
+	HasLocalData bool
+
+	// LocalDataPath is the path to local Dolt data, if present.
+	LocalDataPath string
+}
+
+// FindBrokenWorkspaces scans all rig metadata.json files for Dolt server
+// configuration where the referenced database doesn't exist in .dolt-data/.
+// These workspaces are broken: bd commands will fail or silently create
+// isolated local databases instead of connecting to the centralized server.
+func FindBrokenWorkspaces(townRoot string) []BrokenWorkspace {
+	var broken []BrokenWorkspace
+
+	// Check town-level beads (hq)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if ws := checkWorkspace(townRoot, "hq", townBeadsDir); ws != nil {
+		broken = append(broken, *ws)
+	}
+
+	// Check rig-level beads via rigs.json
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	data, err := os.ReadFile(rigsPath)
+	if err != nil {
+		return broken
+	}
+	var config struct {
+		Rigs map[string]interface{} `json:"rigs"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return broken
+	}
+
+	for rigName := range config.Rigs {
+		beadsDir := FindRigBeadsDir(townRoot, rigName)
+		if beadsDir == "" {
+			continue
+		}
+		if ws := checkWorkspace(townRoot, rigName, beadsDir); ws != nil {
+			broken = append(broken, *ws)
+		}
+	}
+
+	return broken
+}
+
+// checkWorkspace checks a single rig's metadata.json for broken Dolt configuration.
+// Returns nil if the workspace is healthy or not configured for Dolt server mode.
+func checkWorkspace(townRoot, rigName, beadsDir string) *BrokenWorkspace {
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return nil
+	}
+
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+		Backend      string `json:"backend"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil
+	}
+
+	// Only check workspaces configured for Dolt server mode
+	if metadata.DoltMode != "server" || metadata.Backend != "dolt" {
+		return nil
+	}
+
+	dbName := metadata.DoltDatabase
+	if dbName == "" {
+		dbName = rigName
+	}
+
+	// Check if the database actually exists
+	if DatabaseExists(townRoot, dbName) {
+		return nil // healthy
+	}
+
+	ws := &BrokenWorkspace{
+		RigName:      rigName,
+		BeadsDir:     beadsDir,
+		ConfiguredDB: dbName,
+	}
+
+	// Check for local data that could be migrated
+	localDoltPath := findLocalDoltDB(beadsDir)
+	if localDoltPath != "" {
+		ws.HasLocalData = true
+		ws.LocalDataPath = localDoltPath
+	}
+
+	return ws
+}
+
+// RepairWorkspace fixes a broken workspace by creating the missing database
+// or migrating local data if present. Returns a description of what was done.
+func RepairWorkspace(townRoot string, ws BrokenWorkspace) (string, error) {
+	if ws.HasLocalData {
+		// Migrate local data to centralized location
+		if err := MigrateRigFromBeads(townRoot, ws.ConfiguredDB, ws.LocalDataPath); err != nil {
+			return "", fmt.Errorf("migrating local data for %s: %w", ws.RigName, err)
+		}
+		return fmt.Sprintf("migrated local data from %s", ws.LocalDataPath), nil
+	}
+
+	// No local data — create a fresh database
+	if _, err := InitRig(townRoot, ws.ConfiguredDB); err != nil {
+		return "", fmt.Errorf("creating database for %s: %w", ws.RigName, err)
+	}
+	return "created new database", nil
+}
+
 // EnsureMetadata writes or updates the metadata.json for a rig's beads directory
 // to include proper Dolt server configuration. This prevents the split-brain problem
 // where bd falls back to local embedded databases instead of connecting to the
@@ -690,12 +1099,22 @@ func MigrateRigFromBeads(townRoot, rigName, sourcePath string) error {
 // For the "hq" rig, it writes to <townRoot>/.beads/metadata.json.
 // For other rigs, it writes to <townRoot>/<rigName>/mayor/rig/.beads/metadata.json.
 func EnsureMetadata(townRoot, rigName string) error {
-	beadsDir := findRigBeadsDir(townRoot, rigName)
-	if beadsDir == "" {
-		return fmt.Errorf("could not find .beads directory for rig %q", rigName)
+	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
+	// avoiding the TOCTOU race where the directory state changes between
+	// FindRigBeadsDir's Stat check and our subsequent file operations.
+	beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
+	if err != nil {
+		return fmt.Errorf("resolving beads directory for rig %q: %w", rigName, err)
 	}
 
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
+
+	// Acquire per-path mutex for goroutine synchronization.
+	// EnsureAllMetadata calls EnsureMetadata concurrently; flock (inter-process)
+	// cannot reliably synchronize goroutines within the same process.
+	mu := getMetadataMu(metadataPath)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Load existing metadata if present (preserve any extra fields)
 	existing := make(map[string]interface{})
@@ -709,22 +1128,16 @@ func EnsureMetadata(townRoot, rigName string) error {
 	existing["dolt_mode"] = "server"
 	existing["dolt_database"] = rigName
 
-	// Ensure jsonl_export has a default
-	if _, ok := existing["jsonl_export"]; !ok {
-		existing["jsonl_export"] = "issues.jsonl"
-	}
+	// Always set jsonl_export to the canonical filename.
+	// Historical migrations may have left stale values (e.g., "beads.jsonl").
+	existing["jsonl_export"] = "issues.jsonl"
 
 	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling metadata: %w", err)
 	}
 
-	// Ensure directory exists
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		return fmt.Errorf("creating beads directory: %w", err)
-	}
-
-	if err := os.WriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
+	if err := util.AtomicWriteFile(metadataPath, append(data, '\n'), 0600); err != nil {
 		return fmt.Errorf("writing metadata.json: %w", err)
 	}
 
@@ -751,11 +1164,17 @@ func EnsureAllMetadata(townRoot string) (updated []string, errs []error) {
 	return updated, errs
 }
 
-// findRigBeadsDir returns the canonical .beads directory path for a rig.
+// FindRigBeadsDir returns the .beads directory path for a rig (read-only lookup).
 // For "hq", returns <townRoot>/.beads.
 // For other rigs, returns <townRoot>/<rigName>/mayor/rig/.beads if it exists,
-// otherwise <townRoot>/<rigName>/.beads.
-func findRigBeadsDir(townRoot, rigName string) string {
+// otherwise <townRoot>/<rigName>/.beads if it exists,
+// otherwise <townRoot>/<rigName>/mayor/rig/.beads (for creation by caller).
+//
+// WARNING: This function has a TOCTOU race — the returned directory may change
+// state between the Stat check and the caller's operation. For write operations
+// that need the directory to exist, use FindOrCreateRigBeadsDir instead.
+// For read-only operations, handle errors on the returned path gracefully.
+func FindRigBeadsDir(townRoot, rigName string) string {
 	if rigName == "hq" {
 		return filepath.Join(townRoot, ".beads")
 	}
@@ -774,6 +1193,376 @@ func findRigBeadsDir(townRoot, rigName string) string {
 
 	// Neither exists; return mayor path (caller will create it)
 	return mayorBeads
+}
+
+// FindOrCreateRigBeadsDir atomically resolves and ensures the .beads directory
+// exists for a rig. Unlike FindRigBeadsDir, this combines directory resolution
+// with creation to avoid TOCTOU races where the directory state changes between
+// the existence check and the caller's write operation.
+//
+// Use this for write operations (EnsureMetadata, etc.) where the directory must
+// exist. Use FindRigBeadsDir for read-only lookups where graceful failure on
+// missing directories is acceptable.
+func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
+	if rigName == "hq" {
+		dir := filepath.Join(townRoot, ".beads")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("creating HQ beads dir: %w", err)
+		}
+		return dir, nil
+	}
+
+	// Check mayor/rig/.beads first (canonical location)
+	mayorBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
+	if _, err := os.Stat(mayorBeads); err == nil {
+		return mayorBeads, nil
+	}
+
+	// Check rig-root .beads
+	rigBeads := filepath.Join(townRoot, rigName, ".beads")
+	if _, err := os.Stat(rigBeads); err == nil {
+		return rigBeads, nil
+	}
+
+	// Neither exists — atomically create the canonical mayor path.
+	// MkdirAll uses mkdir(2) which is atomic per POSIX, so concurrent
+	// callers creating the same path won't race.
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		return "", fmt.Errorf("creating beads dir: %w", err)
+	}
+
+	return mayorBeads, nil
+}
+
+// GetActiveConnectionCount queries the Dolt server to get the number of active connections.
+// Uses `dolt sql` to query information_schema.PROCESSLIST, which avoids needing
+// a MySQL driver dependency. Returns 0 if the server is unreachable or the query fails.
+func GetActiveConnectionCount(townRoot string) (int, error) {
+	config := DefaultConfig(townRoot)
+
+	// Use dolt sql-client to query the server with a timeout to prevent
+	// hanging indefinitely if the Dolt server is unresponsive.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
+		"dolt", "sql",
+		"-r", "csv",
+		"-q", "SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST",
+	)
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("querying connection count: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	// Parse CSV output: "cnt\n5\n"
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("unexpected output from connection count query: %s", string(output))
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(lines[len(lines)-1]))
+	if err != nil {
+		return 0, fmt.Errorf("parsing connection count %q: %w", lines[len(lines)-1], err)
+	}
+
+	return count, nil
+}
+
+// HasConnectionCapacity checks whether the Dolt server has capacity for new connections.
+// Returns true if the active connection count is below the threshold (80% of max_connections).
+// Returns false with error if the connection count cannot be determined — fail closed
+// to prevent connection storms that cause read-only mode (gt-lfc0d).
+func HasConnectionCapacity(townRoot string) (bool, int, error) {
+	config := DefaultConfig(townRoot)
+	maxConn := config.MaxConnections
+	if maxConn <= 0 {
+		maxConn = 1000 // Dolt default
+	}
+
+	active, err := GetActiveConnectionCount(townRoot)
+	if err != nil {
+		// Fail closed: if we can't check, the server may be overloaded
+		return false, 0, err
+	}
+
+	// Use 80% threshold to leave headroom for existing operations
+	threshold := (maxConn * 80) / 100
+	if threshold < 1 {
+		threshold = 1
+	}
+
+	return active < threshold, active, nil
+}
+
+// HealthMetrics holds resource monitoring data for the Dolt server.
+type HealthMetrics struct {
+	// Connections is the number of active connections (from information_schema.PROCESSLIST).
+	Connections int `json:"connections"`
+
+	// MaxConnections is the configured maximum connections.
+	MaxConnections int `json:"max_connections"`
+
+	// ConnectionPct is the percentage of max connections in use.
+	ConnectionPct float64 `json:"connection_pct"`
+
+	// DiskUsageBytes is the total size of the .dolt-data/ directory.
+	DiskUsageBytes int64 `json:"disk_usage_bytes"`
+
+	// DiskUsageHuman is a human-readable disk usage string.
+	DiskUsageHuman string `json:"disk_usage_human"`
+
+	// QueryLatency is the time taken for a SELECT 1 round-trip.
+	QueryLatency time.Duration `json:"query_latency_ms"`
+
+	// ReadOnly indicates whether the server is in read-only mode.
+	// When true, the server accepts reads but rejects all writes.
+	ReadOnly bool `json:"read_only"`
+
+	// Healthy indicates whether the server is within acceptable resource limits.
+	Healthy bool `json:"healthy"`
+
+	// Warnings contains any degradation warnings (non-fatal).
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// GetHealthMetrics collects resource monitoring metrics from the Dolt server.
+// Returns partial metrics if some checks fail — always returns what it can.
+func GetHealthMetrics(townRoot string) *HealthMetrics {
+	config := DefaultConfig(townRoot)
+	metrics := &HealthMetrics{
+		Healthy:        true,
+		MaxConnections: config.MaxConnections,
+	}
+	if metrics.MaxConnections <= 0 {
+		metrics.MaxConnections = 1000 // Dolt default
+	}
+
+	// 1. Query latency: time a SELECT 1
+	latency, err := MeasureQueryLatency(townRoot)
+	if err == nil {
+		metrics.QueryLatency = latency
+		if latency > 1*time.Second {
+			metrics.Warnings = append(metrics.Warnings,
+				fmt.Sprintf("query latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond)))
+		}
+	}
+
+	// 2. Connection count
+	connCount, err := GetActiveConnectionCount(townRoot)
+	if err == nil {
+		metrics.Connections = connCount
+		metrics.ConnectionPct = float64(connCount) / float64(metrics.MaxConnections) * 100
+		if metrics.ConnectionPct >= 80 {
+			metrics.Healthy = false
+			metrics.Warnings = append(metrics.Warnings,
+				fmt.Sprintf("connection count %d is %.0f%% of max %d — approaching limit",
+					connCount, metrics.ConnectionPct, metrics.MaxConnections))
+		}
+	}
+
+	// 3. Disk usage
+	diskBytes := dirSize(config.DataDir)
+	metrics.DiskUsageBytes = diskBytes
+	metrics.DiskUsageHuman = formatBytes(diskBytes)
+
+	// 4. Read-only probe: attempt a test write
+	readOnly, _ := CheckReadOnly(townRoot)
+	metrics.ReadOnly = readOnly
+	if readOnly {
+		metrics.Healthy = false
+		metrics.Warnings = append(metrics.Warnings,
+			"server is in READ-ONLY mode — requires restart to recover")
+	}
+
+	return metrics
+}
+
+// CheckReadOnly probes the Dolt server to detect read-only state by attempting
+// a test write. The server can enter read-only mode under concurrent write load
+// ("cannot update manifest: database is read only") and will NOT self-recover.
+// Returns (true, nil) if read-only, (false, nil) if writable, (false, err) on probe failure.
+func CheckReadOnly(townRoot string) (bool, error) {
+	config := DefaultConfig(townRoot)
+
+	// Need a database to test writes against
+	databases, err := ListDatabases(townRoot)
+	if err != nil || len(databases) == 0 {
+		return false, nil // Can't probe without a database
+	}
+
+	db := databases[0]
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Attempt a write operation: create a temp table, write a row, drop it.
+	// If the server is in read-only mode, this will fail with a characteristic error.
+	query := fmt.Sprintf(
+		"USE `%s`; CREATE TABLE IF NOT EXISTS `__gt_health_probe` (v INT PRIMARY KEY); REPLACE INTO `__gt_health_probe` VALUES (1); DROP TABLE IF EXISTS `__gt_health_probe`",
+		db,
+	)
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", query)
+	cmd.Dir = config.DataDir
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(output))
+		if IsReadOnlyError(msg) {
+			return true, nil
+		}
+		return false, fmt.Errorf("write probe failed: %w (%s)", err, msg)
+	}
+
+	return false, nil
+}
+
+// IsReadOnlyError checks if an error message indicates a Dolt read-only state.
+// The characteristic error is "cannot update manifest: database is read only".
+func IsReadOnlyError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "read only") ||
+		strings.Contains(lower, "read-only") ||
+		strings.Contains(lower, "readonly")
+}
+
+// RecoverReadOnly detects a read-only Dolt server, restarts it, and verifies
+// recovery. This is the gt-level counterpart to the daemon's auto-recovery:
+// when a gt command (spawn, done, etc.) encounters persistent read-only errors,
+// it can call this to attempt recovery without waiting for the daemon's 30s loop.
+// Returns nil if recovery succeeded, an error if recovery failed or wasn't needed.
+func RecoverReadOnly(townRoot string) error {
+	readOnly, err := CheckReadOnly(townRoot)
+	if err != nil {
+		return fmt.Errorf("read-only probe failed: %w", err)
+	}
+	if !readOnly {
+		return nil // Server is writable, no recovery needed
+	}
+
+	fmt.Printf("Dolt server is in read-only mode, attempting recovery...\n")
+
+	// Stop the server
+	if err := Stop(townRoot); err != nil {
+		// Server might already be stopped or unreachable
+		fmt.Printf("Warning: stop returned error (proceeding with restart): %v\n", err)
+	}
+
+	// Brief pause for cleanup
+	time.Sleep(1 * time.Second)
+
+	// Restart the server
+	if err := Start(townRoot); err != nil {
+		return fmt.Errorf("failed to restart Dolt server: %w", err)
+	}
+
+	// Verify recovery with exponential backoff (server may need time to become writable)
+	const maxAttempts = 5
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 8 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		backoff := baseBackoff
+		for i := 1; i < attempt; i++ {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+				break
+			}
+		}
+		time.Sleep(backoff)
+
+		readOnly, err = CheckReadOnly(townRoot)
+		if err != nil {
+			if attempt == maxAttempts {
+				return fmt.Errorf("post-restart probe failed after %d attempts: %w", maxAttempts, err)
+			}
+			continue
+		}
+		if !readOnly {
+			fmt.Printf("Dolt server recovered from read-only state\n")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("Dolt server still read-only after restart (%d verification attempts)", maxAttempts)
+}
+
+// doltSQLWithRecovery executes a SQL statement with retry logic and, if retries
+// are exhausted due to read-only errors, attempts server restart before a final retry.
+// This is the gt-level recovery path for polecat management operations (spawn, done).
+func doltSQLWithRecovery(townRoot, rigDB, query string) error {
+	err := doltSQLWithRetry(townRoot, rigDB, query)
+	if err == nil {
+		return nil
+	}
+
+	// If the final error is a read-only error, attempt recovery
+	if !IsReadOnlyError(err.Error()) {
+		return err
+	}
+
+	// Attempt server recovery
+	if recoverErr := RecoverReadOnly(townRoot); recoverErr != nil {
+		return fmt.Errorf("read-only recovery failed: %w (original: %v)", recoverErr, err)
+	}
+
+	// Retry the operation after recovery
+	if retryErr := doltSQL(townRoot, rigDB, query); retryErr != nil {
+		return fmt.Errorf("operation failed after read-only recovery: %w", retryErr)
+	}
+
+	return nil
+}
+
+// MeasureQueryLatency times a SELECT 1 query against the Dolt server.
+func MeasureQueryLatency(townRoot string) (time.Duration, error) {
+	config := DefaultConfig(townRoot)
+
+	start := time.Now()
+	cmd := exec.Command("dolt", "sql", "-q", "SELECT 1")
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		return 0, fmt.Errorf("SELECT 1 failed: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	return elapsed, nil
+}
+
+// dirSize returns the total size of a directory tree in bytes.
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip errors
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// formatBytes returns a human-readable size string.
+func formatBytes(b int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case b >= GB:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(GB))
+	case b >= MB:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(MB))
+	case b >= KB:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 // moveDir moves a directory from src to dest. It first tries os.Rename for
@@ -806,4 +1595,287 @@ func moveDir(src, dest string) error {
 		return fmt.Errorf("removing source after copy: %w", err)
 	}
 	return nil
+}
+
+// serverExecSQL executes a SQL statement against the Dolt server without targeting
+// a specific database. Used for server-level commands like CREATE DATABASE.
+func serverExecSQL(townRoot, query string) error {
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", query)
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// doltSQL executes a SQL statement against a specific rig database on the Dolt server.
+// Uses the dolt CLI from the data directory (auto-detects running server).
+// The USE prefix selects the database since --use-db is not available on all dolt versions.
+func doltSQL(townRoot, rigDB, query string) error {
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Prepend USE <db> to select the target database.
+	fullQuery := fmt.Sprintf("USE %s; %s", rigDB, query)
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-q", fullQuery)
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// doltSQLWithRetry executes a SQL statement with exponential backoff on transient errors.
+func doltSQLWithRetry(townRoot, rigDB, query string) error {
+	const maxRetries = 5
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 15 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := doltSQL(townRoot, rigDB, query); err != nil {
+			lastErr = err
+			if !isDoltRetryableError(err) {
+				return err
+			}
+			if attempt < maxRetries {
+				backoff := baseBackoff
+				for i := 1; i < attempt; i++ {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+						break
+					}
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
+}
+
+// isDoltRetryableError returns true if the error is a transient Dolt failure worth retrying.
+// Covers manifest lock contention, read-only mode, optimistic lock failures, and timeouts.
+func isDoltRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is read only") ||
+		strings.Contains(msg, "cannot update manifest") ||
+		strings.Contains(msg, "optimistic lock") ||
+		strings.Contains(msg, "serialization failure") ||
+		strings.Contains(msg, "lock wait timeout") ||
+		strings.Contains(msg, "try restarting transaction")
+}
+
+// validBranchNameRe matches only safe branch name characters: alphanumeric, hyphen,
+// underscore, dot, and forward slash. This prevents SQL injection via branch names
+// interpolated into Dolt stored procedure calls.
+var validBranchNameRe = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
+
+// validateBranchName returns an error if branchName contains characters that could
+// break out of SQL string literals. Defense-in-depth: PolecatBranchName generates
+// safe names, but callers accept arbitrary strings.
+func validateBranchName(branchName string) error {
+	if branchName == "" {
+		return fmt.Errorf("branch name must not be empty")
+	}
+	if !validBranchNameRe.MatchString(branchName) {
+		return fmt.Errorf("branch name %q contains invalid characters", branchName)
+	}
+	return nil
+}
+
+// PolecatBranchName returns the Dolt branch name for a polecat.
+// Format: polecat-<name>-<unix-timestamp>
+func PolecatBranchName(polecatName string) string {
+	return fmt.Sprintf("polecat-%s-%d", strings.ToLower(polecatName), time.Now().Unix())
+}
+
+// CreatePolecatBranch creates a Dolt branch for a polecat's isolated writes.
+// Each polecat gets its own branch to eliminate optimistic lock contention.
+// Retries with exponential backoff on transient errors (read-only, manifest lock, etc).
+// If read-only errors persist after retries, attempts server recovery (gt-chx92).
+func CreatePolecatBranch(townRoot, rigDB, branchName string) error {
+	if err := validateBranchName(branchName); err != nil {
+		return fmt.Errorf("creating Dolt branch in %s: %w", rigDB, err)
+	}
+	query := fmt.Sprintf("CALL DOLT_BRANCH('%s')", branchName)
+
+	if err := doltSQLWithRecovery(townRoot, rigDB, query); err != nil {
+		return fmt.Errorf("creating Dolt branch %s in %s: %w", branchName, rigDB, err)
+	}
+	return nil
+}
+
+// CommitServerWorkingSet stages all pending changes and commits them on the current branch via SQL.
+// This flushes the Dolt working set to HEAD so that DOLT_BRANCH (which forks from
+// HEAD, not the working set) will include all recent writes. Critical for the sling
+// flow where BD_DOLT_AUTO_COMMIT=off leaves writes in working set only.
+//
+// NOTE: This flushes ALL pending working set changes on the target branch, not just
+// those from a specific polecat. In batch sling, polecat B's flush may capture
+// polecat A's writes. This is benign because beads are keyed by unique ID, so
+// duplicate data across branches merges cleanly.
+func CommitServerWorkingSet(townRoot, rigDB, message string) error {
+	if err := doltSQLWithRecovery(townRoot, rigDB, "CALL DOLT_ADD('-A')"); err != nil {
+		return fmt.Errorf("staging working set in %s: %w", rigDB, err)
+	}
+	escaped := strings.ReplaceAll(message, "'", "''")
+	query := fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-m', '%s')", escaped)
+	if err := doltSQLWithRecovery(townRoot, rigDB, query); err != nil {
+		return fmt.Errorf("committing working set in %s: %w", rigDB, err)
+	}
+	return nil
+}
+
+// MergePolecatBranch merges a polecat's Dolt branch into main and deletes it.
+// Called at gt done time to make the polecat's beads changes visible.
+//
+// CRITICAL: The entire operation runs as a single SQL script (one connection).
+// In Dolt server mode, each `dolt sql -q` call opens a new connection, and
+// DOLT_CHECKOUT only affects the current connection. Separate calls would
+// checkout the polecat branch on connection 1, then ADD/COMMIT on connection 2
+// (which defaults back to main), silently losing all polecat working set data.
+//
+// The script handles two scenarios:
+//  1. Fast-forward merge (no conflict): commit polecat working set, merge to main
+//  2. Conflict: disable autocommit, merge, resolve with --theirs (polecat wins), commit
+//
+// On conflict, a second script runs with autocommit disabled so conflicts can
+// be resolved rather than triggering an automatic rollback.
+func MergePolecatBranch(townRoot, rigDB, branchName string) error {
+	if err := validateBranchName(branchName); err != nil {
+		return fmt.Errorf("merging Dolt branch in %s: %w", rigDB, err)
+	}
+
+	// Phase 1: Commit polecat working set and attempt merge.
+	// All in one connection so DOLT_CHECKOUT persists across statements.
+	// NOTE: DOLT_BRANCH('-D') is deliberately NOT in the merge scripts.
+	// If the merge fails (conflict), the branch must still exist for Phase 2.
+	// Branch deletion happens separately after successful merge.
+	escaped := strings.ReplaceAll(branchName, "'", "''")
+	script := fmt.Sprintf(`USE %s;
+CALL DOLT_CHECKOUT('%s');
+CALL DOLT_ADD('-A');
+CALL DOLT_COMMIT('--allow-empty', '-m', 'polecat %s final state');
+CALL DOLT_CHECKOUT('main');
+CALL DOLT_MERGE('%s');
+`, rigDB, escaped, escaped, escaped)
+
+	if err := doltSQLScriptWithRetry(townRoot, script); err != nil {
+		if !strings.Contains(err.Error(), "Merge conflict") {
+			return fmt.Errorf("merging %s to main in %s: %w", branchName, rigDB, err)
+		}
+
+		// Phase 2: Conflict detected. Re-run merge with autocommit disabled
+		// so conflicts are staged (not rolled back) and can be resolved.
+		// --theirs: polecat state wins (latest mutations, always authoritative).
+		fmt.Printf("Dolt merge conflict on %s, auto-resolving (--theirs)...\n", branchName)
+		conflictScript := fmt.Sprintf(`USE %s;
+SET @@autocommit = 0;
+CALL DOLT_CHECKOUT('main');
+CALL DOLT_MERGE('%s');
+CALL DOLT_CONFLICTS_RESOLVE('--theirs', '.');
+CALL DOLT_COMMIT('-m', 'merge %s (conflicts auto-resolved)');
+SET @@autocommit = 1;
+`, rigDB, escaped, escaped)
+
+		if err := doltSQLScriptWithRetry(townRoot, conflictScript); err != nil {
+			return fmt.Errorf("conflict-resolving merge of %s in %s: %w", branchName, rigDB, err)
+		}
+	}
+
+	// Delete branch only after successful merge (either phase).
+	// This prevents branch loss if the merge script fails partway through.
+	DeletePolecatBranch(townRoot, rigDB, branchName)
+	return nil
+}
+
+// doltSQLScript executes a multi-statement SQL script via a temp file.
+// Uses `dolt sql --file` for reliable multi-statement execution within a
+// single connection, preserving DOLT_CHECKOUT state across statements.
+func doltSQLScript(townRoot, script string) error {
+	config := DefaultConfig(townRoot)
+
+	tmpFile, err := os.CreateTemp("", "dolt-script-*.sql")
+	if err != nil {
+		return fmt.Errorf("creating temp SQL file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(script); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("writing SQL script: %w", err)
+	}
+	tmpFile.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "--file", tmpFile.Name())
+	cmd.Dir = config.DataDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// doltSQLScriptWithRetry executes a SQL script with exponential backoff on transient errors.
+// Callers must ensure scripts are idempotent, as partial execution may have occurred
+// before the retry. Uses the same retry classification as doltSQLWithRetry but with
+// fewer retries and shorter backoff since multi-statement scripts are more expensive.
+func doltSQLScriptWithRetry(townRoot, script string) error {
+	const maxRetries = 3
+	const baseBackoff = 500 * time.Millisecond
+	const maxBackoff = 8 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := doltSQLScript(townRoot, script); err != nil {
+			lastErr = err
+			if !isDoltRetryableError(err) {
+				return err
+			}
+			if attempt < maxRetries {
+				backoff := baseBackoff
+				for i := 1; i < attempt; i++ {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+						break
+					}
+				}
+				time.Sleep(backoff)
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
+}
+
+// DeletePolecatBranch deletes a polecat's Dolt branch (cleanup/nuke).
+// Best-effort: logs warning if branch doesn't exist or deletion fails.
+func DeletePolecatBranch(townRoot, rigDB, branchName string) {
+	if err := validateBranchName(branchName); err != nil {
+		fmt.Printf("Warning: invalid Dolt branch name %q: %v\n", branchName, err)
+		return
+	}
+	query := fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s')", branchName)
+	if err := doltSQL(townRoot, rigDB, query); err != nil {
+		// Non-fatal: branch may not exist (already merged/deleted)
+		fmt.Printf("Warning: could not delete Dolt branch %s: %v\n", branchName, err)
+	}
 }

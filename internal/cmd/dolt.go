@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/daemon"
@@ -31,6 +32,24 @@ Server configuration:
   - Data directory: .dolt-data/ (contains all rig databases)
 
 Each rig (hq, gastown, beads) has its own database subdirectory.`,
+}
+
+var doltInitCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Initialize and repair Dolt workspace configuration",
+	Long: `Verify and repair the Dolt workspace configuration.
+
+This command scans all rig metadata.json files for Dolt server configuration
+and ensures the referenced databases actually exist. It fixes the broken state
+where metadata.json says backend=dolt but the database is missing from .dolt-data/.
+
+For each broken workspace, it will:
+  1. Check if local .beads/dolt/ data exists and migrate it
+  2. Otherwise, create a fresh database in .dolt-data/
+
+This is safe to run multiple times (idempotent). It will not modify workspaces
+that are already healthy.`,
+	RunE: runDoltInit,
 }
 
 var doltStartCmd = &cobra.Command{
@@ -129,6 +148,48 @@ Safe to run multiple times (idempotent). Preserves any existing fields in metada
 	RunE: runDoltFixMetadata,
 }
 
+var doltRecoverCmd = &cobra.Command{
+	Use:   "recover",
+	Short: "Detect and recover from Dolt read-only state",
+	Long: `Detect if the Dolt server is in read-only mode and attempt recovery.
+
+When the Dolt server enters read-only mode (e.g., from concurrent write
+contention on the storage manifest), all write operations fail. This command:
+
+  1. Probes the server to detect read-only state
+  2. Stops the server if read-only
+  3. Restarts the server
+  4. Verifies recovery with a write probe
+
+If the server is already writable, this is a no-op.
+
+The daemon performs this check automatically every 30 seconds. Use this command
+for immediate recovery without waiting for the daemon's health check loop.`,
+	RunE: runDoltRecover,
+}
+
+var doltSyncCmd = &cobra.Command{
+	Use:   "sync",
+	Short: "Push Dolt databases to DoltHub remotes",
+	Long: `Push all local Dolt databases to their configured DoltHub remotes.
+
+This command automates the tedious process of pushing each database individually:
+  1. Stops the Dolt server (required for CLI push)
+  2. Iterates databases in .dolt-data/
+  3. For each database with a configured remote, runs dolt push
+  4. Reports success/failure per database
+  5. Restarts the Dolt server
+
+Use --db to sync a single database, --dry-run to preview, or --force for force-push.
+
+Examples:
+  gt dolt sync                # Push all databases with remotes
+  gt dolt sync --dry-run      # Preview what would be pushed
+  gt dolt sync --db gastown   # Push only the gastown database
+  gt dolt sync --force        # Force-push all databases`,
+	RunE: runDoltSync,
+}
+
 var doltRollbackCmd = &cobra.Command{
 	Use:   "rollback [backup-dir]",
 	Short: "Restore .beads directories from a migration backup",
@@ -156,9 +217,13 @@ var (
 	doltMigrateDry   bool
 	doltRollbackDry  bool
 	doltRollbackList bool
+	doltSyncDry      bool
+	doltSyncForce    bool
+	doltSyncDB       string
 )
 
 func init() {
+	doltCmd.AddCommand(doltInitCmd)
 	doltCmd.AddCommand(doltStartCmd)
 	doltCmd.AddCommand(doltStopCmd)
 	doltCmd.AddCommand(doltStatusCmd)
@@ -168,7 +233,9 @@ func init() {
 	doltCmd.AddCommand(doltListCmd)
 	doltCmd.AddCommand(doltMigrateCmd)
 	doltCmd.AddCommand(doltFixMetadataCmd)
+	doltCmd.AddCommand(doltRecoverCmd)
 	doltCmd.AddCommand(doltRollbackCmd)
+	doltCmd.AddCommand(doltSyncCmd)
 
 	doltLogsCmd.Flags().IntVarP(&doltLogLines, "lines", "n", 50, "Number of lines to show")
 	doltLogsCmd.Flags().BoolVarP(&doltLogFollow, "follow", "f", false, "Follow log output")
@@ -177,6 +244,10 @@ func init() {
 
 	doltRollbackCmd.Flags().BoolVar(&doltRollbackDry, "dry-run", false, "Show what would be restored without making changes")
 	doltRollbackCmd.Flags().BoolVar(&doltRollbackList, "list", false, "List available backups and exit")
+
+	doltSyncCmd.Flags().BoolVar(&doltSyncDry, "dry-run", false, "Preview what would be pushed without pushing")
+	doltSyncCmd.Flags().BoolVar(&doltSyncForce, "force", false, "Force-push to remotes")
+	doltSyncCmd.Flags().StringVar(&doltSyncDB, "db", "", "Sync a single database instead of all")
 
 	rootCmd.AddCommand(doltCmd)
 }
@@ -200,6 +271,23 @@ func runDoltStart(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Data dir: %s\n", state.DataDir)
 	fmt.Printf("  Databases: %s\n", style.Dim.Render(strings.Join(state.Databases, ", ")))
 	fmt.Printf("  Connection: %s\n", style.Dim.Render(doltserver.GetConnectionString(townRoot)))
+
+	// Verify all filesystem databases are actually served by the SQL server.
+	// Use retry since Start() only waits 500ms — DBs may still be loading.
+	served, missing, verifyErr := doltserver.VerifyDatabasesWithRetry(townRoot, 5)
+	if verifyErr != nil {
+		fmt.Printf("  %s Could not verify databases: %v\n", style.Dim.Render("⚠"), verifyErr)
+	} else if len(missing) > 0 {
+		fmt.Printf("\n%s Some databases exist on disk but are NOT served:\n", style.Bold.Render("⚠"))
+		for _, db := range missing {
+			fmt.Printf("  - %s\n", db)
+		}
+		fmt.Printf("\n  Served: %v\n", served)
+		fmt.Printf("  This usually means the database has a stale manifest.\n")
+		fmt.Printf("  Try: %s\n", style.Dim.Render("cd ~/gt/.dolt-data/<db> && dolt fsck --repair"))
+	} else {
+		fmt.Printf("  %s All %d databases verified\n", style.Bold.Render("✓"), len(served))
+	}
 
 	return nil
 }
@@ -252,6 +340,39 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 				}
 			}
 			fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+		}
+
+		// Resource metrics
+		metrics := doltserver.GetHealthMetrics(townRoot)
+		fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
+		fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
+		fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
+			metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
+		fmt.Printf("    Disk usage:    %s\n", metrics.DiskUsageHuman)
+		if metrics.ReadOnly {
+			fmt.Printf("\n  %s %s\n",
+				style.Bold.Render("!!!"),
+				style.Bold.Render("SERVER IS READ-ONLY — run 'gt dolt recover' to restart"))
+		}
+
+		// Verify all filesystem databases are actually served.
+		_, missing, verifyErr := doltserver.VerifyDatabases(townRoot)
+		if verifyErr != nil {
+			fmt.Printf("\n  %s Database verification failed: %v\n", style.Bold.Render("!"), verifyErr)
+		} else if len(missing) > 0 {
+			fmt.Printf("\n  %s %s\n", style.Bold.Render("!!!"),
+				style.Bold.Render("MISSING DATABASES — exist on disk but not served:"))
+			for _, db := range missing {
+				fmt.Printf("    - %s\n", db)
+			}
+			fmt.Printf("  Try: cd ~/gt/.dolt-data/<db> && dolt fsck --repair\n")
+		}
+
+		if len(metrics.Warnings) > 0 {
+			fmt.Printf("\n  %s\n", style.Bold.Render("Warnings:"))
+			for _, w := range metrics.Warnings {
+				fmt.Printf("    %s %s\n", style.Bold.Render("!"), w)
+			}
 		}
 	} else {
 		fmt.Printf("%s Dolt server is %s\n",
@@ -362,7 +483,8 @@ func runDoltInitRig(cmd *cobra.Command, args []string) error {
 
 	rigName := args[0]
 
-	if err := doltserver.InitRig(townRoot, rigName); err != nil {
+	serverWasRunning, err := doltserver.InitRig(townRoot, rigName)
+	if err != nil {
 		return err
 	}
 
@@ -372,7 +494,61 @@ func runDoltInitRig(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Initialized rig database %q\n", style.Bold.Render("✓"), rigName)
 	fmt.Printf("  Location: %s\n", rigDir)
 	fmt.Printf("  Data dir: %s\n", config.DataDir)
-	fmt.Printf("\nStart server with: %s\n", style.Dim.Render("gt dolt start"))
+
+	if serverWasRunning {
+		fmt.Printf("  Server: %s\n", style.Bold.Render("database registered with running server"))
+	} else {
+		fmt.Printf("\nStart server with: %s\n", style.Dim.Render("gt dolt start"))
+	}
+
+	return nil
+}
+
+func runDoltInit(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Find workspaces with broken Dolt configuration
+	broken := doltserver.FindBrokenWorkspaces(townRoot)
+
+	if len(broken) == 0 {
+		// Also check if there are any databases at all
+		databases, _ := doltserver.ListDatabases(townRoot)
+		if len(databases) == 0 {
+			fmt.Println("No Dolt databases found and no workspaces configured for Dolt.")
+			fmt.Printf("\nInitialize a rig database with: %s\n", style.Dim.Render("gt dolt init-rig <name>"))
+		} else {
+			fmt.Printf("%s All workspaces healthy (%d database(s) verified)\n",
+				style.Bold.Render("✓"), len(databases))
+		}
+		return nil
+	}
+
+	fmt.Printf("Found %d workspace(s) with broken Dolt configuration:\n\n", len(broken))
+
+	repaired := 0
+	for _, ws := range broken {
+		fmt.Printf("  %s %s: metadata.json → database %q (missing from .dolt-data/)\n",
+			style.Bold.Render("!"), ws.RigName, ws.ConfiguredDB)
+		if ws.HasLocalData {
+			fmt.Printf("    Local data found at %s\n", style.Dim.Render(ws.LocalDataPath))
+		}
+
+		action, err := doltserver.RepairWorkspace(townRoot, ws)
+		if err != nil {
+			fmt.Printf("    %s Repair failed: %v\n", style.Bold.Render("✗"), err)
+			continue
+		}
+
+		fmt.Printf("    %s Repaired: %s\n", style.Bold.Render("✓"), action)
+		repaired++
+	}
+
+	if repaired > 0 {
+		fmt.Printf("\n%s Repaired %d/%d workspace(s)\n", style.Bold.Render("✓"), repaired, len(broken))
+	}
 
 	return nil
 }
@@ -413,7 +589,7 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	// Check if daemon is running - must stop first to avoid race conditions.
 	// The daemon spawns many bd processes via gt status heartbeats. If these
 	// run concurrently with migration, race conditions occur between old
-	// SQLite and new Dolt backends.
+	// old and new backends.
 	daemonRunning, _, _ := daemon.IsRunning(townRoot)
 	if daemonRunning {
 		return fmt.Errorf("Gas Town daemon is running. Stop it first with: gt daemon stop\n\nThe daemon spawns bd processes that can race with migration.\nStop the daemon, run migration, then restart it.")
@@ -477,6 +653,42 @@ func runDoltMigrate(cmd *cobra.Command, args []string) error {
 	} else {
 		state, _ := doltserver.LoadState(townRoot)
 		fmt.Printf("%s Dolt server started (PID %d)\n", style.Bold.Render("✓"), state.PID)
+
+		// Set sync.mode=dolt-native in each rig's database BEFORE verification.
+		// ShouldExportJSONL reads sync.mode from the DB (not config.yaml) to decide
+		// whether to export JSONL. Without this, every bd write pays a 10-25s JSONL
+		// export penalty even though the rig is configured for dolt-native in yaml.
+		// This must run unconditionally — even if verification fails, we don't want
+		// to leave the user with the JSONL penalty on top of missing-DB issues.
+		setSyncModeErrs := setSyncModeForAllRigs(townRoot)
+		for _, err := range setSyncModeErrs {
+			fmt.Printf("  %s sync.mode set failed: %v\n", style.Dim.Render("⚠"), err)
+		}
+
+		// Verify the server is actually serving all databases that exist on disk.
+		// Dolt silently skips databases with stale manifests after migration,
+		// so filesystem discovery and SQL discovery can diverge.
+		// Use retry since the server may still be loading databases after Start().
+		served, missing, verifyErr := doltserver.VerifyDatabasesWithRetry(townRoot, 5)
+		if verifyErr != nil {
+			fmt.Printf("  %s Could not verify databases: %v\n", style.Dim.Render("⚠"), verifyErr)
+			fmt.Printf("  Migration may be incomplete. Verify manually with: %s\n", style.Dim.Render("gt dolt status"))
+			return fmt.Errorf("database verification failed after migration: %w", verifyErr)
+		} else if len(missing) > 0 {
+			fmt.Printf("\n%s Some databases exist on disk but are NOT served by Dolt:\n", style.Bold.Render("⚠"))
+			for _, db := range missing {
+				fmt.Printf("  - %s\n", db)
+			}
+			fmt.Printf("\n  Served databases: %v\n", served)
+			fmt.Printf("\n  This usually means the database has a stale manifest from migration.\n")
+			fmt.Printf("  To fix, try:\n")
+			fmt.Printf("    1. Stop the server:  %s\n", style.Dim.Render("gt dolt stop"))
+			fmt.Printf("    2. Repair the DB:    %s\n", style.Dim.Render("cd ~/gt/.dolt-data/<db> && dolt fsck --repair"))
+			fmt.Printf("    3. Restart:           %s\n", style.Dim.Render("gt dolt start"))
+			return fmt.Errorf("migration incomplete: %d database(s) exist on disk but are not served: %v", len(missing), missing)
+		} else {
+			fmt.Printf("  %s All %d databases verified as served\n", style.Bold.Render("✓"), len(served))
+		}
 	}
 
 	return nil
@@ -523,6 +735,42 @@ func runDoltFixMetadata(cmd *cobra.Command, args []string) error {
 		fmt.Println("No rig databases found. Nothing to update.")
 	}
 
+	// Also ensure sync.mode=dolt-native is set in each rig's database.
+	// This prevents the 10-25s JSONL export penalty on every bd write.
+	syncErrs := setSyncModeForAllRigs(townRoot)
+	for _, syncErr := range syncErrs {
+		fmt.Printf("  %s sync.mode set failed: %v\n", style.Dim.Render("⚠"), syncErr)
+	}
+
+	return nil
+}
+
+func runDoltRecover(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	running, _, _ := doltserver.IsRunning(townRoot)
+	if !running {
+		return fmt.Errorf("Dolt server is not running — start with 'gt dolt start'")
+	}
+
+	readOnly, err := doltserver.CheckReadOnly(townRoot)
+	if err != nil {
+		return fmt.Errorf("read-only probe failed: %w", err)
+	}
+
+	if !readOnly {
+		fmt.Printf("%s Dolt server is writable (no recovery needed)\n", style.Bold.Render("✓"))
+		return nil
+	}
+
+	if err := doltserver.RecoverReadOnly(townRoot); err != nil {
+		return fmt.Errorf("recovery failed: %w", err)
+	}
+
+	fmt.Printf("%s Dolt server recovered from read-only state\n", style.Bold.Render("✓"))
 	return nil
 }
 
@@ -630,7 +878,7 @@ func runDoltRollback(cmd *cobra.Command, args []string) error {
 	validateCmd.Dir = townRoot
 	output, validateErr := validateCmd.CombinedOutput()
 	if validateErr != nil {
-		fmt.Printf("  %s bd list returned an error (this may be expected if reverting to SQLite): %v\n",
+		fmt.Printf("  %s bd list returned an error: %v\n",
 			style.Dim.Render("⚠"), validateErr)
 		if len(output) > 0 {
 			fmt.Printf("  %s\n", string(output))
@@ -702,3 +950,121 @@ func printBackupContents(backupPath, townRoot string) {
 		}
 	}
 }
+
+func runDoltSync(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Validate --db flag if set
+	if doltSyncDB != "" && !doltserver.DatabaseExists(townRoot, doltSyncDB) {
+		return fmt.Errorf("database %q not found in .dolt-data/\nRun 'gt dolt list' to see available databases", doltSyncDB)
+	}
+
+	// Check server state
+	wasRunning, pid, _ := doltserver.IsRunning(townRoot)
+
+	if wasRunning {
+		fmt.Printf("Stopping Dolt server (PID %d)...\n", pid)
+		if err := doltserver.Stop(townRoot); err != nil {
+			return fmt.Errorf("stopping Dolt server: %w", err)
+		}
+		fmt.Printf("%s Dolt server stopped\n", style.Bold.Render("✓"))
+
+		// Guarantee restart even if push fails
+		defer func() {
+			fmt.Printf("\nRestarting Dolt server...\n")
+			if startErr := doltserver.Start(townRoot); startErr != nil {
+				fmt.Printf("%s Failed to restart Dolt server: %v\n", style.Bold.Render("✗"), startErr)
+				fmt.Printf("  Start manually with: %s\n", style.Dim.Render("gt dolt start"))
+			} else {
+				fmt.Printf("%s Dolt server restarted\n", style.Bold.Render("✓"))
+			}
+		}()
+	}
+
+	opts := doltserver.SyncOptions{
+		Force:  doltSyncForce,
+		DryRun: doltSyncDry,
+		Filter: doltSyncDB,
+	}
+
+	results := doltserver.SyncDatabases(townRoot, opts)
+
+	if len(results) == 0 {
+		fmt.Println("No databases to sync.")
+		return nil
+	}
+
+	fmt.Printf("\nSyncing %d database(s)...\n", len(results))
+
+	var pushed, skipped, failed int
+	for _, r := range results {
+		fmt.Println()
+		switch {
+		case r.Pushed:
+			fmt.Printf("  %s %s → origin main\n", style.Bold.Render("✓"), r.Database)
+			fmt.Printf("    %s\n", style.Dim.Render(r.Remote))
+			pushed++
+		case r.DryRun:
+			fmt.Printf("  %s %s → origin main (dry run)\n", style.Bold.Render("~"), r.Database)
+			fmt.Printf("    %s\n", style.Dim.Render(r.Remote))
+			pushed++ // count as would-push for summary
+		case r.Skipped:
+			fmt.Printf("  %s %s — no remote configured\n", style.Dim.Render("○"), r.Database)
+			skipped++
+		case r.Error != nil:
+			fmt.Printf("  %s %s → origin main\n", style.Bold.Render("✗"), r.Database)
+			fmt.Printf("    error: %v\n", r.Error)
+			failed++
+		}
+	}
+
+	fmt.Printf("\nSummary: %d pushed, %d skipped, %d failed\n", pushed, skipped, failed)
+
+	if failed > 0 {
+		return fmt.Errorf("%d database(s) failed to sync", failed)
+	}
+	return nil
+}
+
+// setSyncModeForAllRigs sets sync.mode=dolt-native in each rig's beads database.
+// This is critical because ShouldExportJSONL reads sync.mode from the DB (not config.yaml).
+// Without this, every bd write triggers a full JSONL export (10-25s penalty).
+func setSyncModeForAllRigs(townRoot string) []error {
+	databases, err := doltserver.ListDatabases(townRoot)
+	if err != nil {
+		return []error{fmt.Errorf("listing databases: %w", err)}
+	}
+
+	var errs []error
+	var set []string
+	for _, dbName := range databases {
+		// Use FindOrCreateRigBeadsDir to atomically resolve and ensure the
+		// directory exists, avoiding TOCTOU races in the stat-then-use pattern.
+		beadsDir, err := doltserver.FindOrCreateRigBeadsDir(townRoot, dbName)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: resolving beads dir: %w", dbName, err))
+			continue
+		}
+
+		cmd := exec.Command("bd", "sync", "mode", "set", "dolt-native")
+		cmd.Dir = filepath.Dir(beadsDir) // run from parent of .beads
+		cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+
+		if output, err := cmd.CombinedOutput(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %v (%s)", dbName, err, strings.TrimSpace(string(output))))
+		} else {
+			set = append(set, dbName)
+		}
+	}
+
+	if len(set) > 0 {
+		fmt.Printf("%s Set sync.mode=dolt-native in DB for: %s\n",
+			style.Bold.Render("✓"), strings.Join(set, ", "))
+	}
+
+	return errs
+}
+

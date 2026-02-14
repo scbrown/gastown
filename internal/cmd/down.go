@@ -12,6 +12,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
@@ -26,6 +27,11 @@ import (
 const (
 	shutdownLockFile    = "daemon/shutdown.lock"
 	shutdownLockTimeout = 5 * time.Second
+
+	// defaultDownOrphanGraceSecs is the grace period for orphan cleanup during gt down.
+	// Short because gt down is meant to be quick - processes already had SIGTERM via
+	// KillSessionWithProcesses.
+	defaultDownOrphanGraceSecs = 5
 )
 
 var downCmd = &cobra.Command{
@@ -37,7 +43,7 @@ var downCmd = &cobra.Command{
 Shutdown levels (progressively more aggressive):
   gt down                    Stop infrastructure (default)
   gt down --polecats         Also stop all polecat sessions
-  gt down --all              Also stop bd daemons/activity
+  gt down --all              Full shutdown with orphan cleanup
   gt down --nuke             Also kill the tmux server (DESTRUCTIVE)
 
 Infrastructure agents stopped:
@@ -71,7 +77,7 @@ func init() {
 	downCmd.Flags().BoolVarP(&downQuiet, "quiet", "q", false, "Only show errors")
 	downCmd.Flags().BoolVarP(&downForce, "force", "f", false, "Force kill without graceful shutdown")
 	downCmd.Flags().BoolVarP(&downPolecats, "polecats", "p", false, "Also stop all polecat sessions")
-	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Stop bd daemons/activity and verify shutdown")
+	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Full shutdown with orphan cleanup and verification")
 	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill entire tmux server (DESTRUCTIVE - kills non-GT sessions!)")
 	downCmd.Flags().BoolVar(&downDryRun, "dry-run", false, "Preview what would be stopped without taking action")
 	rootCmd.AddCommand(downCmd)
@@ -96,8 +102,11 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 		defer func() {
 			_ = lock.Unlock()
-			// Clean up lock file after releasing (defense in depth)
-			_ = os.Remove(filepath.Join(townRoot, shutdownLockFile))
+			// Do NOT remove the lock file. Flock works on file descriptors,
+			// not paths. Removing the file while another process is waiting
+			// on the flock causes it to acquire a lock on the deleted inode,
+			// providing no mutual exclusion against a process that creates a
+			// new file at the same path.
 		}()
 
 		// Prevent tmux server from exiting when all sessions are killed.
@@ -220,8 +229,23 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 5: Verification (--all only)
-	if downAll && !downDryRun {
+	// Phase 5: Orphan cleanup and verification (--all or --force)
+	if (downAll || downForce) && !downDryRun {
+		fmt.Println()
+
+		// Kill any processes tracked via PID files (defense-in-depth for
+		// processes that survived normal session teardown).
+		killed, pidErrs := session.KillTrackedPIDs(townRoot)
+		if killed > 0 {
+			fmt.Printf("  Killed %d tracked orphan process(es) via PID files\n", killed)
+		}
+		for _, e := range pidErrs {
+			fmt.Printf("  PID cleanup warning: %s\n", e)
+		}
+
+		fmt.Println("Cleaning up orphaned Claude processes...")
+		cleanupOrphanedClaude(defaultDownOrphanGraceSecs)
+
 		time.Sleep(500 * time.Millisecond)
 		respawned := verifyShutdown(t, townRoot)
 		if len(respawned) > 0 {
@@ -231,10 +255,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  • %s\n", r)
 			}
 			fmt.Println()
-			fmt.Printf("This may indicate systemd/launchd is managing bd.\n")
+			fmt.Printf("This may indicate a process manager is respawning agents.\n")
 			fmt.Printf("Check with:\n")
-			fmt.Printf("  %s\n", style.Dim.Render("systemctl status bd-daemon  # Linux"))
-			fmt.Printf("  %s\n", style.Dim.Render("launchctl list | grep bd    # macOS"))
+			fmt.Printf("  %s\n", style.Dim.Render("ps aux | grep claude  # Find respawned processes"))
+			fmt.Printf("  %s\n", style.Dim.Render("gt status             # Verify town state"))
 			allOK = false
 		}
 	}
@@ -316,7 +340,7 @@ func stopAllPolecats(t *tmux.Tmux, townRoot string, rigNames []string, force boo
 		}
 
 		polecatMgr := polecat.NewSessionManager(t, r)
-		infos, err := polecatMgr.List()
+		infos, err := polecatMgr.ListPolecats()
 		if err != nil {
 			continue
 		}
@@ -365,7 +389,9 @@ func stopSession(t *tmux.Tmux, sessionName string) (bool, error) {
 	// Try graceful shutdown first (Ctrl-C, best-effort interrupt)
 	if !downForce {
 		_ = t.SendKeysRaw(sessionName, "C-c")
-		time.Sleep(100 * time.Millisecond)
+		if session.WaitForSessionExit(t, sessionName, constants.GracefulShutdownTimeout) {
+			return true, nil // Process exited gracefully
+		}
 	}
 
 	// Kill the session (with explicit process termination to prevent orphans)

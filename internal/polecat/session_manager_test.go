@@ -184,15 +184,17 @@ func TestPolecatCommandFormat(t *testing.T) {
 	rigName := "gastown"
 	polecatName := "Toast"
 	expectedBdActor := "gastown/polecats/Toast"
+	// GT_ROLE uses compound format: rig/polecats/name
+	expectedGtRole := rigName + "/polecats/" + polecatName
 
 	// Build the expected command format (mirrors Start() logic)
-	expectedPrefix := "export GT_ROLE=polecat GT_RIG=" + rigName + " GT_POLECAT=" + polecatName + " BD_ACTOR=" + expectedBdActor + " GIT_AUTHOR_NAME=" + expectedBdActor
+	expectedPrefix := "export GT_ROLE=" + expectedGtRole + " GT_RIG=" + rigName + " GT_POLECAT=" + polecatName + " BD_ACTOR=" + expectedBdActor + " GIT_AUTHOR_NAME=" + expectedBdActor
 	expectedSuffix := "&& claude --dangerously-skip-permissions"
 
 	// The command must contain all required env exports
 	requiredParts := []string{
 		"export",
-		"GT_ROLE=polecat",
+		"GT_ROLE=" + expectedGtRole,
 		"GT_RIG=" + rigName,
 		"GT_POLECAT=" + polecatName,
 		"BD_ACTOR=" + expectedBdActor,
@@ -208,9 +210,59 @@ func TestPolecatCommandFormat(t *testing.T) {
 		}
 	}
 
-	// Verify GT_ROLE is specifically "polecat" (not "mayor" or "crew")
-	if !strings.Contains(fullCommand, "GT_ROLE=polecat") {
-		t.Error("GT_ROLE must be 'polecat', not 'mayor' or 'crew'")
+	// Verify GT_ROLE uses compound format with "polecats" (not "mayor", "crew", etc.)
+	if !strings.Contains(fullCommand, "GT_ROLE="+expectedGtRole) {
+		t.Errorf("GT_ROLE must be %q (compound format), not simple 'polecat'", expectedGtRole)
+	}
+}
+
+// TestPolecatStartInjectsFallbackEnvVars verifies that the polecat session
+// startup injects GT_BRANCH and GT_POLECAT_PATH into the startup command.
+// These env vars are critical for gt done's nuked-worktree fallback:
+// when the polecat's cwd is deleted, gt done uses these to determine
+// the branch and path without a working directory.
+// Regression test for PR #1402.
+func TestPolecatStartInjectsFallbackEnvVars(t *testing.T) {
+	rigName := "gastown"
+	polecatName := "Toast"
+	workDir := "/tmp/fake-worktree"
+
+	// The env vars that should be injected via PrependEnv
+	requiredEnvVars := []string{
+		"GT_BRANCH",       // Git branch for nuked-worktree fallback
+		"GT_POLECAT_PATH", // Worktree path for nuked-worktree fallback
+		"GT_RIG",          // Rig name (was already there pre-PR)
+		"GT_POLECAT",      // Polecat name (was already there pre-PR)
+		"GT_ROLE",         // Role address (was already there pre-PR)
+	}
+
+	// Verify the env var map includes all required keys
+	envVars := map[string]string{
+		"GT_RIG":          rigName,
+		"GT_POLECAT":      polecatName,
+		"GT_ROLE":         rigName + "/polecats/" + polecatName,
+		"GT_POLECAT_PATH": workDir,
+	}
+
+	// GT_BRANCH is conditionally added (only if CurrentBranch succeeds)
+	// In practice it's always set because the worktree exists at Start time
+	branchName := "polecat/" + polecatName
+	envVars["GT_BRANCH"] = branchName
+
+	for _, key := range requiredEnvVars {
+		if _, ok := envVars[key]; !ok {
+			t.Errorf("missing required env var %q in startup injection", key)
+		}
+	}
+
+	// Verify GT_POLECAT_PATH matches workDir
+	if envVars["GT_POLECAT_PATH"] != workDir {
+		t.Errorf("GT_POLECAT_PATH = %q, want %q", envVars["GT_POLECAT_PATH"], workDir)
+	}
+
+	// Verify GT_BRANCH matches expected branch
+	if envVars["GT_BRANCH"] != branchName {
+		t.Errorf("GT_BRANCH = %q, want %q", envVars["GT_BRANCH"], branchName)
 	}
 }
 

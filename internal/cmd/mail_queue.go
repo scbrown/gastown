@@ -121,7 +121,9 @@ func runMailClaim(cmd *cobra.Command, args []string) error {
 		}
 
 		// Another worker claimed it first — remove our stale labels and try next
-		_ = releaseQueueMessage(beadsDir, candidate.ID, caller)
+		if releaseErr := releaseQueueMessage(beadsDir, candidate.ID, caller); releaseErr != nil {
+			style.PrintWarning("could not release stale claim on %s: %v", candidate.ID, releaseErr)
+		}
 	}
 
 	if claimed == nil {
@@ -168,8 +170,9 @@ func listUnclaimedQueueMessages(beadsDir, queueName string) ([]queueMessage, err
 	args := []string{"list",
 		"--label", "queue:" + queueName,
 		"--status", "open",
-		"--type", "message",
+		"--label", "gt:message",
 		"--json",
+		"--limit", "0",
 	}
 
 	cmd := exec.Command("bd", args...)
@@ -230,8 +233,9 @@ func listUnclaimedQueueMessages(beadsDir, queueName string) ([]queueMessage, err
 			}
 		}
 
-		// Only include unclaimed messages
-		if msg.ClaimedBy == "" {
+		// Only include unclaimed messages - check both ClaimedBy and ClaimedAt
+		// to handle orphaned claimed-at labels from interrupted releases
+		if msg.ClaimedBy == "" && msg.ClaimedAt == nil {
 			messages = append(messages, msg)
 		}
 	}
@@ -392,6 +396,8 @@ func getQueueMessageInfo(beadsDir, messageID string) (*queueMessageInfo, error) 
 }
 
 // releaseQueueMessage releases a claimed message by removing claim labels.
+// Both claimed-by and claimed-at are removed in a single bd command to prevent
+// orphaned labels if the process crashes between separate removal steps.
 func releaseQueueMessage(beadsDir, messageID, actor string) error {
 	// Get current message info to find the exact claim labels
 	info, err := getQueueMessageInfo(beadsDir, messageID)
@@ -399,44 +405,34 @@ func releaseQueueMessage(beadsDir, messageID, actor string) error {
 		return err
 	}
 
-	// Remove claimed-by label
+	// Collect labels to remove in a single atomic operation
+	var labelsToRemove []string
 	if info.ClaimedBy != "" {
-		args := []string{"label", "remove", messageID, "claimed-by:" + info.ClaimedBy}
-		cmd := exec.Command("bd", args...)
-		cmd.Env = append(os.Environ(),
-			"BEADS_DIR="+beadsDir,
-			"BD_ACTOR="+actor,
-		)
-
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-
-		if err := cmd.Run(); err != nil {
-			errMsg := strings.TrimSpace(stderr.String())
-			if errMsg != "" && !strings.Contains(errMsg, "does not have label") {
-				return fmt.Errorf("%s", errMsg)
-			}
-		}
+		labelsToRemove = append(labelsToRemove, "claimed-by:"+info.ClaimedBy)
+	}
+	if info.ClaimedAt != nil {
+		labelsToRemove = append(labelsToRemove, "claimed-at:"+info.ClaimedAt.Format(time.RFC3339))
 	}
 
-	// Remove claimed-at label if present
-	if info.ClaimedAt != nil {
-		claimedAtStr := info.ClaimedAt.Format(time.RFC3339)
-		args := []string{"label", "remove", messageID, "claimed-at:" + claimedAtStr}
-		cmd := exec.Command("bd", args...)
-		cmd.Env = append(os.Environ(),
-			"BEADS_DIR="+beadsDir,
-			"BD_ACTOR="+actor,
-		)
+	if len(labelsToRemove) == 0 {
+		return nil
+	}
 
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
+	// Remove all claim labels in a single bd command
+	args := append([]string{"label", "remove", messageID}, labelsToRemove...)
+	cmd := exec.Command("bd", args...)
+	cmd.Env = append(os.Environ(),
+		"BEADS_DIR="+beadsDir,
+		"BD_ACTOR="+actor,
+	)
 
-		if err := cmd.Run(); err != nil {
-			errMsg := strings.TrimSpace(stderr.String())
-			if errMsg != "" && !strings.Contains(errMsg, "does not have label") {
-				return fmt.Errorf("%s", errMsg)
-			}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" && !strings.Contains(errMsg, "does not have label") {
+			return fmt.Errorf("%s", errMsg)
 		}
 	}
 

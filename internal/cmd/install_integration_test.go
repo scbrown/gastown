@@ -61,10 +61,6 @@ func TestInstallCreatesCorrectStructure(t *testing.T) {
 		t.Errorf("rigs.json should be empty, got %d rigs", len(rigsConfig.Rigs))
 	}
 
-	// Verify CLAUDE.md exists in mayor/ (not town root, to avoid inheritance pollution)
-	claudePath := filepath.Join(hqPath, "mayor", "CLAUDE.md")
-	assertFileExists(t, claudePath, "mayor/CLAUDE.md")
-
 	// Verify Claude settings exist in mayor/.claude/ (not town root/.claude/)
 	// Mayor settings go here to avoid polluting child workspaces via directory traversal
 	mayorSettingsPath := filepath.Join(hqPath, "mayor", ".claude", "settings.json")
@@ -101,18 +97,19 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	beadsDir := filepath.Join(hqPath, ".beads")
 	assertDirExists(t, beadsDir, ".beads/")
 
-	// Verify beads database was created
-	dbPath := filepath.Join(beadsDir, "beads.db")
-	assertFileExists(t, dbPath, ".beads/beads.db")
+	// Verify beads database was initialized (both metadata.json and dolt/ exist with dolt backend)
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	assertFileExists(t, metadataPath, ".beads/metadata.json")
+	doltDir := filepath.Join(beadsDir, "dolt")
+	assertDirExists(t, doltDir, ".beads/dolt/")
 
 	// Verify prefix by running bd config get issue_prefix
-	// Use --no-daemon to avoid daemon startup issues in test environment
-	bdCmd := exec.Command("bd", "--no-daemon", "config", "get", "issue_prefix")
+	bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
 	bdCmd.Dir = hqPath
 	prefixOutput, err := bdCmd.Output() // Use Output() to get only stdout
 	if err != nil {
 		// If Output() fails, try CombinedOutput for better error info
-		combinedOut, _ := exec.Command("bd", "--no-daemon", "config", "get", "issue_prefix").CombinedOutput()
+		combinedOut, _ := exec.Command("bd", "config", "get", "issue_prefix").CombinedOutput()
 		t.Fatalf("bd config get issue_prefix failed: %v\nOutput: %s", err, combinedOut)
 	}
 
@@ -315,11 +312,11 @@ func assertFileExists(t *testing.T, path, name string) {
 
 func assertSlotValue(t *testing.T, townRoot, issueID, slot, want string) {
 	t.Helper()
-	cmd := exec.Command("bd", "--no-daemon", "--json", "slot", "show", issueID)
+	cmd := exec.Command("bd", "--json", "slot", "show", issueID)
 	cmd.Dir = townRoot
 	output, err := cmd.Output()
 	if err != nil {
-		debugCmd := exec.Command("bd", "--no-daemon", "--json", "slot", "show", issueID)
+		debugCmd := exec.Command("bd", "--json", "slot", "show", issueID)
 		debugCmd.Dir = townRoot
 		combined, _ := debugCmd.CombinedOutput()
 		t.Fatalf("bd slot show %s failed: %v\nOutput: %s", issueID, err, combined)

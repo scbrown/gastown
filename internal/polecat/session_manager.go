@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -65,6 +66,10 @@ type SessionStartOptions struct {
 	// RuntimeConfigDir is resolved config directory for the runtime account.
 	// If set, this is injected as an environment variable.
 	RuntimeConfigDir string
+
+	// DoltBranch is the polecat-specific Dolt branch for write isolation.
+	// If set, BD_BRANCH env var is injected into the polecat session.
+	DoltBranch string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -147,15 +152,21 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	sessionID := m.SessionName(polecat)
 
-	// Check if session already exists
-	// Note: Orphan sessions are cleaned up by ReconcilePool during AllocateName,
-	// so by this point, any existing session should be legitimately in use.
+	// Check if session already exists.
+	// If an existing session's pane process has died, kill the stale session
+	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if running {
-		return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		if m.isSessionStale(sessionID) {
+			if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+				return fmt.Errorf("killing stale session %s: %w", sessionID, err)
+			}
+		} else {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
 	}
 
 	// Determine working directory
@@ -172,14 +183,16 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 	}
 
-	runtimeConfig := config.LoadRuntimeConfig(m.rig.Path)
+	// Use ResolveRoleAgentConfig instead of deprecated LoadRuntimeConfig to properly
+	// resolve role_agents from town settings. This ensures EnsureSettingsForRole
+	// creates the correct settings/plugin for the configured agent (e.g., opencode).
+	townRoot := filepath.Dir(m.rig.Path)
+	runtimeConfig := config.ResolveRoleAgentConfig("polecat", townRoot, m.rig.Path)
 
-	// Ensure runtime settings exist in polecat's home directory (polecats/<name>/).
-	// This keeps settings out of the git worktree while allowing runtime to find them
-	// when walking up the tree from workDir (polecats/<name>/<rigname>/).
-	// Each polecat gets isolated settings rather than sharing a single settings file.
-	polecatHomeDir := m.polecatDir(polecat)
-	if err := runtime.EnsureSettingsForRole(polecatHomeDir, "polecat", runtimeConfig); err != nil {
+	// Ensure runtime settings exist in the shared polecats parent directory.
+	// Settings are passed to Claude Code via --settings flag.
+	polecatSettingsDir := config.RoleSettingsDir("polecat", m.rig.Path)
+	if err := runtime.EnsureSettingsForRole(polecatSettingsDir, workDir, "polecat", runtimeConfig); err != nil {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
 	}
 
@@ -209,6 +222,39 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		command = config.PrependEnv(command, map[string]string{runtimeConfig.Session.ConfigDirEnv: opts.RuntimeConfigDir})
 	}
 
+	// Branch-per-polecat: inject BD_BRANCH into startup command
+	if opts.DoltBranch != "" {
+		command = config.PrependEnv(command, map[string]string{"BD_BRANCH": opts.DoltBranch})
+	}
+
+	// Disable Dolt auto-commit for polecats to prevent manifest contention
+	// under concurrent load (gt-5cc2p). Changes merge at gt done time.
+	command = config.PrependEnv(command, map[string]string{"BD_DOLT_AUTO_COMMIT": "off"})
+
+	// FIX (ga-6s284): Prepend GT_RIG, GT_POLECAT, GT_ROLE to startup command
+	// so they're inherited by Kimi and other agents. Setting via tmux.SetEnvironment
+	// after session creation doesn't work for all agent types.
+	//
+	// GT_BRANCH and GT_POLECAT_PATH are critical for gt done's nuked-worktree fallback:
+	// when the polecat's cwd is deleted before gt done finishes, these env vars allow
+	// branch detection and path resolution without a working directory.
+	polecatGitBranch := ""
+	if g := git.NewGit(workDir); g != nil {
+		if b, err := g.CurrentBranch(); err == nil {
+			polecatGitBranch = b
+		}
+	}
+	envVarsToInject := map[string]string{
+		"GT_RIG":          m.rig.Name,
+		"GT_POLECAT":      polecat,
+		"GT_ROLE":         fmt.Sprintf("%s/polecats/%s", m.rig.Name, polecat),
+		"GT_POLECAT_PATH": workDir,
+	}
+	if polecatGitBranch != "" {
+		envVarsToInject["GT_BRANCH"] = polecatGitBranch
+	}
+	command = config.PrependEnv(command, envVarsToInject)
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := m.tmux.NewSessionWithCommand(sessionID, workDir, command); err != nil {
@@ -217,18 +263,34 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	// Set environment (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
-	townRoot := filepath.Dir(m.rig.Path)
+	// Note: townRoot already defined above for ResolveRoleAgentConfig
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:             "polecat",
 		Rig:              m.rig.Name,
 		AgentName:        polecat,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.RuntimeConfigDir,
-		BeadsNoDaemon:    true,
 	})
 	for k, v := range envVars {
 		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(sessionID, k, v))
 	}
+
+	// Set GT_BRANCH and GT_POLECAT_PATH in tmux session environment.
+	// This ensures respawned processes also inherit these for gt done fallback.
+	if polecatGitBranch != "" {
+		debugSession("SetEnvironment GT_BRANCH", m.tmux.SetEnvironment(sessionID, "GT_BRANCH", polecatGitBranch))
+	}
+	debugSession("SetEnvironment GT_POLECAT_PATH", m.tmux.SetEnvironment(sessionID, "GT_POLECAT_PATH", workDir))
+
+	// Branch-per-polecat: set BD_BRANCH in tmux session environment
+	// This ensures respawned processes also inherit the branch setting.
+	if opts.DoltBranch != "" {
+		debugSession("SetEnvironment BD_BRANCH", m.tmux.SetEnvironment(sessionID, "BD_BRANCH", opts.DoltBranch))
+	}
+
+	// Disable Dolt auto-commit in tmux session environment (gt-5cc2p).
+	// This ensures respawned processes also inherit the setting.
+	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(sessionID, "BD_DOLT_AUTO_COMMIT", "off"))
 
 	// Hook the issue to the polecat if provided via --issue flag
 	if opts.Issue != "" {
@@ -291,7 +353,18 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		return fmt.Errorf("session %s died during startup (agent command may have failed)", sessionID)
 	}
 
+	// Track PID for defense-in-depth orphan cleanup (non-fatal)
+	_ = session.TrackSessionPID(townRoot, sessionID, m.tmux)
+
 	return nil
+}
+
+// isSessionStale checks if a tmux session's pane process has died.
+// A stale session exists in tmux but its main process (the agent) is no longer running.
+// This happens when the agent crashes during startup but tmux keeps the dead pane.
+// Delegates to isSessionProcessDead to avoid duplicating process-check logic (gt-qgzj1h).
+func (m *SessionManager) isSessionStale(sessionID string) bool {
+	return isSessionProcessDead(m.tmux, sessionID)
 }
 
 // Stop terminates a polecat session.
@@ -309,7 +382,7 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	// Try graceful shutdown first
 	if !force {
 		_ = m.tmux.SendKeysRaw(sessionID, "C-c")
-		time.Sleep(100 * time.Millisecond)
+		session.WaitForSessionExit(m.tmux, sessionID, constants.GracefulShutdownTimeout)
 	}
 
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
@@ -381,7 +454,9 @@ func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
 	return info, nil
 }
 
-// List returns information about all polecat sessions for this rig.
+// List returns information about all sessions for this rig.
+// This includes polecats, witness, refinery, and crew sessions.
+// Use ListPolecats() to get only polecat sessions.
 func (m *SessionManager) List() ([]SessionInfo, error) {
 	sessions, err := m.tmux.ListSessions()
 	if err != nil {
@@ -406,6 +481,26 @@ func (m *SessionManager) List() ([]SessionInfo, error) {
 	}
 
 	return infos, nil
+}
+
+// ListPolecats returns information only about polecat sessions for this rig.
+// Filters out witness, refinery, and crew sessions.
+func (m *SessionManager) ListPolecats() ([]SessionInfo, error) {
+	infos, err := m.List()
+	if err != nil {
+		return nil, err
+	}
+
+	var filtered []SessionInfo
+	for _, info := range infos {
+		// Skip non-polecat sessions
+		if info.Polecat == "witness" || info.Polecat == "refinery" || strings.HasPrefix(info.Polecat, "crew-") {
+			continue
+		}
+		filtered = append(filtered, info)
+	}
+
+	return filtered, nil
 }
 
 // Attach attaches to a polecat session.
@@ -473,19 +568,19 @@ func (m *SessionManager) Inject(polecat, message string) error {
 
 // StopAll terminates all polecat sessions for this rig.
 func (m *SessionManager) StopAll(force bool) error {
-	infos, err := m.List()
+	infos, err := m.ListPolecats()
 	if err != nil {
 		return err
 	}
 
-	var lastErr error
+	var errs []error
 	for _, info := range infos {
 		if err := m.Stop(info.Polecat, force); err != nil {
-			lastErr = err
+			errs = append(errs, fmt.Errorf("stopping %s: %w", info.Polecat, err))
 		}
 	}
 
-	return lastErr
+	return errors.Join(errs...)
 }
 
 // resolveBeadsDir determines the correct working directory for bd commands

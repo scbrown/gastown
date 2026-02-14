@@ -133,16 +133,13 @@ type Target struct {
 	Path string // Full path to .claude/settings.json
 	Key  string // Override key: "gastown/crew", "mayor", etc.
 	Rig  string // Rig name or empty for town-level
-	Role string // crew, witness, refinery, polecats, mayor, deacon
+	Role string // Informational only — does NOT participate in override resolution (Key does). Singular form matching RoleSettingsDir: crew, witness, refinery, polecat, mayor, deacon.
 }
 
 // DisplayKey returns a human-readable label for the target.
 // For targets with a rig, shows "rig/role"; for town-level targets, shows the role.
 func (t Target) DisplayKey() string {
-	if t.Rig != "" {
-		return t.Rig + "/" + t.Role
-	}
-	return t.Role
+	return t.Key
 }
 
 // Merge merges an override config into a base config using per-matcher merging.
@@ -189,11 +186,13 @@ func ComputeExpected(target string) (*HooksConfig, error) {
 }
 
 // DiscoverTargets finds all managed .claude/settings.json locations in the workspace.
+// Settings are installed in gastown-managed parent directories and passed to Claude Code
+// via --settings flag. Crew members in a rig share one settings file, as do polecats.
 // Returns Target structs with path, override key, rig, and role information.
 func DiscoverTargets(townRoot string) ([]Target, error) {
 	var targets []Target
 
-	// Town-level targets
+	// Town-level targets (mayor/deacon cwd IS the settings dir)
 	targets = append(targets, Target{
 		Path: filepath.Join(townRoot, "mayor", ".claude", "settings.json"),
 		Key:  "mayor",
@@ -225,15 +224,8 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 			continue
 		}
 
-		// Rig-level
-		targets = append(targets, Target{
-			Path: filepath.Join(rigPath, ".claude", "settings.json"),
-			Key:  rigName + "/rig",
-			Rig:  rigName,
-			Role: "rig",
-		})
-
-		// Crew-level
+		// Crew — one shared settings file in the crew parent directory.
+		// All crew members share this via --settings flag.
 		crewDir := filepath.Join(rigPath, "crew")
 		if info, err := os.Stat(crewDir); err == nil && info.IsDir() {
 			targets = append(targets, Target{
@@ -242,48 +234,21 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 				Rig:  rigName,
 				Role: "crew",
 			})
-
-			// Individual crew members
-			if members, err := os.ReadDir(crewDir); err == nil {
-				for _, m := range members {
-					if m.IsDir() && !strings.HasPrefix(m.Name(), ".") {
-						targets = append(targets, Target{
-							Path: filepath.Join(crewDir, m.Name(), ".claude", "settings.json"),
-							Key:  rigName + "/crew",
-							Rig:  rigName,
-							Role: "crew",
-						})
-					}
-				}
-			}
 		}
 
-		// Polecats-level
+		// Polecats — one shared settings file in the polecats parent directory.
+		// All polecats share this via --settings flag.
 		polecatsDir := filepath.Join(rigPath, "polecats")
 		if info, err := os.Stat(polecatsDir); err == nil && info.IsDir() {
 			targets = append(targets, Target{
 				Path: filepath.Join(polecatsDir, ".claude", "settings.json"),
 				Key:  rigName + "/polecats",
 				Rig:  rigName,
-				Role: "polecats",
+				Role: "polecat",
 			})
-
-			// Individual polecats
-			if polecats, err := os.ReadDir(polecatsDir); err == nil {
-				for _, p := range polecats {
-					if p.IsDir() && !strings.HasPrefix(p.Name(), ".") {
-						targets = append(targets, Target{
-							Path: filepath.Join(polecatsDir, p.Name(), ".claude", "settings.json"),
-							Key:  rigName + "/polecats",
-							Rig:  rigName,
-							Role: "polecats",
-						})
-					}
-				}
-			}
 		}
 
-		// Witness
+		// Witness — settings in the witness parent directory
 		witnessDir := filepath.Join(rigPath, "witness")
 		if info, err := os.Stat(witnessDir); err == nil && info.IsDir() {
 			targets = append(targets, Target{
@@ -294,7 +259,7 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 			})
 		}
 
-		// Refinery
+		// Refinery — settings in the refinery parent directory
 		refineryDir := filepath.Join(rigPath, "refinery")
 		if info, err := os.Stat(refineryDir); err == nil && info.IsDir() {
 			targets = append(targets, Target{
@@ -439,27 +404,49 @@ func MarshalConfig(cfg *HooksConfig) ([]byte, error) {
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-// ValidTarget returns true if the target string is a valid override target.
-// Valid targets are roles (crew, witness, etc.) or rig/role combinations.
-func ValidTarget(target string) bool {
+// NormalizeTarget normalizes a target string, mapping singular role aliases
+// to their canonical forms (e.g., "polecat" → "polecats", "rig/polecat" → "rig/polecats").
+// Returns the normalized target and true if valid, or ("", false) if invalid.
+func NormalizeTarget(target string) (string, bool) {
+	// Alias map: singular → canonical
+	aliases := map[string]string{
+		"polecat": "polecats",
+	}
+
 	validRoles := map[string]bool{
 		"crew": true, "witness": true, "refinery": true,
 		"polecats": true, "mayor": true, "deacon": true,
-		"rig": true,
 	}
 
 	// Simple role target
 	if validRoles[target] {
-		return true
+		return target, true
+	}
+	if canonical, ok := aliases[target]; ok {
+		return canonical, true
 	}
 
 	// Rig/role target (e.g., "gastown/crew")
 	parts := strings.SplitN(target, "/", 2)
-	if len(parts) == 2 && parts[0] != "" && validRoles[parts[1]] {
-		return true
+	if len(parts) == 2 && parts[0] != "" {
+		role := parts[1]
+		if validRoles[role] {
+			return target, true
+		}
+		if canonical, ok := aliases[role]; ok {
+			return parts[0] + "/" + canonical, true
+		}
 	}
 
-	return false
+	return "", false
+}
+
+// ValidTarget returns true if the target string is a valid override target.
+// Valid targets are roles (crew, witness, etc.) or rig/role combinations.
+// Accepts singular aliases (e.g., "polecat") — use NormalizeTarget to get canonical form.
+func ValidTarget(target string) bool {
+	_, ok := NormalizeTarget(target)
+	return ok
 }
 
 // DefaultBase returns a sensible default base configuration.
@@ -468,13 +455,36 @@ func DefaultBase() *HooksConfig {
 	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
 
 	return &HooksConfig{
+		PreToolUse: []HookEntry{
+			{
+				Matcher: "Bash(gh pr create*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
+				}},
+			},
+			{
+				Matcher: "Bash(git checkout -b*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
+				}},
+			},
+			{
+				Matcher: "Bash(git switch -c*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
+				}},
+			},
+		},
 		SessionStart: []HookEntry{
 			{
 				Matcher: "",
 				Hooks: []Hook{
 					{
 						Type:    "command",
-						Command: fmt.Sprintf("%s && gt prime --hook && gt nudge deacon session-started", pathSetup),
+						Command: fmt.Sprintf("%s && gt prime --hook", pathSetup),
 					},
 				},
 			},

@@ -1,7 +1,6 @@
 package rig
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,8 +14,8 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
-	"github.com/steveyegge/gastown/internal/runtime"
 )
 
 // Common errors
@@ -24,6 +23,11 @@ var (
 	ErrRigNotFound = errors.New("rig not found")
 	ErrRigExists   = errors.New("rig already exists")
 )
+
+// reservedRigNames are names that cannot be used for rigs because they
+// collide with town-level infrastructure. "hq" is special-cased by
+// EnsureMetadata and dolt routing as the town-level beads alias.
+var reservedRigNames = []string{"hq"}
 
 // wrapCloneError wraps clone errors with helpful suggestions.
 // Detects common auth failures and suggests SSH as an alternative.
@@ -272,6 +276,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		return nil, fmt.Errorf("rig name %q contains invalid characters; hyphens, dots, and spaces are reserved for agent ID parsing. Try %q instead (underscores are allowed)", opts.Name, sanitized)
 	}
 
+	// Reject reserved names that collide with town-level infrastructure.
+	// "hq" is special-cased by EnsureMetadata and dolt routing as the town-level alias.
+	for _, reserved := range reservedRigNames {
+		if strings.EqualFold(opts.Name, reserved) {
+			return nil, fmt.Errorf("rig name %q is reserved for town-level infrastructure", opts.Name)
+		}
+	}
+
 	rigPath := filepath.Join(m.townRoot, opts.Name)
 
 	// Check if directory already exists
@@ -355,6 +367,16 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			defaultBranch = bareGit.DefaultBranch()
 		}
 	}
+	// Validate user-provided branch exists on remote (auto-detected branches are inherently valid)
+	if opts.DefaultBranch != "" {
+		ref := fmt.Sprintf("origin/%s", defaultBranch)
+		if exists, err := bareGit.RefExists(ref); err != nil {
+			return nil, fmt.Errorf("checking ref %s: %w", ref, err)
+		} else if !exists {
+			return nil, fmt.Errorf("branch %q does not exist on remote (ref %s not found in bare repo)", defaultBranch, ref)
+		}
+	}
+
 	rigConfig.DefaultBranch = defaultBranch
 	// Re-save config with default branch
 	if err := m.saveRigConfig(rigPath, rigConfig); err != nil {
@@ -391,9 +413,8 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	fmt.Printf("   ✓ Created mayor clone\n")
 
 	// Check if source repo has tracked .beads/ directory.
-	// If so, we need to initialize the database (beads.db is gitignored so it doesn't exist after clone).
+	// If so, we need to initialize the database (it doesn't exist after clone since DB files are gitignored).
 	sourceBeadsDir := filepath.Join(mayorRigPath, ".beads")
-	sourceBeadsDB := filepath.Join(sourceBeadsDir, "beads.db")
 	if _, err := os.Stat(sourceBeadsDir); err == nil {
 		// Remove any redirect file that might have been accidentally tracked.
 		// Redirect files are runtime/local config and should not be in git.
@@ -422,27 +443,31 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		}
 
 		// Initialize bd database if it doesn't exist.
-		// beads.db is gitignored so it won't exist after clone - we need to create it.
+		// DB files are gitignored so they won't exist after clone — bd init creates them.
 		// bd init --prefix will create the database and auto-import from issues.jsonl.
-		if _, err := os.Stat(sourceBeadsDB); os.IsNotExist(err) {
-			cmd := exec.Command("bd", "--no-daemon", "init", "--prefix", opts.BeadsPrefix, "--backend", "dolt") // opts.BeadsPrefix validated earlier
+		if !bdDatabaseExists(sourceBeadsDir) {
+			cmd := exec.Command("bd", "init", "--prefix", opts.BeadsPrefix, "--backend", "dolt", "--server") // opts.BeadsPrefix validated earlier
 			cmd.Dir = mayorRigPath
 			if output, err := cmd.CombinedOutput(); err != nil {
 				fmt.Printf("  Warning: Could not init bd database: %v (%s)\n", err, strings.TrimSpace(string(output)))
 			}
 			// Configure custom types for Gas Town (beads v0.46.0+)
-			configCmd := exec.Command("bd", "--no-daemon", "config", "set", "types.custom", constants.BeadsCustomTypes)
+			configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
 			configCmd.Dir = mayorRigPath
 			_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
+
+			// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
+			prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
+			prefixSetCmd.Dir = mayorRigPath
+			if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
+				fmt.Printf("  Warning: Could not set issue_prefix: %v (%s)\n", prefixErr, strings.TrimSpace(string(prefixOutput)))
+			}
 		}
 	}
 
-	// Create mayor CLAUDE.md (preserves existing from cloned repo)
-	if created, err := m.createRoleCLAUDEmd(mayorRigPath, "mayor", opts.Name, ""); err != nil {
-		return nil, fmt.Errorf("creating mayor CLAUDE.md: %w", err)
-	} else if !created {
-		fmt.Printf("   ✓ Preserved existing mayor/rig/CLAUDE.md\n")
-	}
+	// NOTE: No per-directory CLAUDE.md/AGENTS.md is created for any agent.
+	// Only ~/gt/CLAUDE.md (town-root identity anchor) exists on disk.
+	// Full context is injected ephemerally by `gt prime` at session start.
 
 	// Initialize beads at rig level BEFORE creating worktrees.
 	// This ensures rig/.beads exists so worktree redirects can point to it.
@@ -452,12 +477,23 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	}
 	fmt.Printf("   ✓ Initialized beads (prefix: %s)\n", opts.BeadsPrefix)
 
+	// Ensure metadata.json has dolt_mode=server and dolt_database=<rigName>.
+	// bd init --server sets dolt_mode but not dolt_database. EnsureMetadata
+	// writes both fields so bd connects to the correct centralized database.
+	if err := doltserver.EnsureMetadata(m.townRoot, opts.Name); err != nil {
+		// Non-fatal: daemon's EnsureAllMetadata self-heals on next startup,
+		// or user can run gt doctor --fix to repair manually.
+		fmt.Printf("  Warning: Could not set Dolt server metadata: %v\n", err)
+		fmt.Printf("  Run 'gt doctor --fix' to repair, or it will self-heal on next daemon start.\n")
+	}
+
 	// Provision PRIME.md with Gas Town context for all workers in this rig.
 	// This is the fallback if SessionStart hook fails - ensures ALL workers
 	// (crew, polecats, refinery, witness) have GUPP and essential Gas Town context.
 	// PRIME.md is read by bd prime and output to the agent.
-	rigBeadsPath := filepath.Join(rigPath, ".beads")
-	if err := beads.ProvisionPrimeMD(rigBeadsPath); err != nil {
+	// Use ResolveBeadsDir to follow redirect (writes to mayor/rig/.beads/ if tracked).
+	resolvedBeadsPath := beads.ResolveBeadsDir(rigPath)
+	if err := beads.ProvisionPrimeMD(resolvedBeadsPath); err != nil {
 		fmt.Printf("  Warning: Could not provision PRIME.md: %v\n", err)
 	}
 
@@ -472,16 +508,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if err := bareGit.WorktreeAddExisting(refineryRigPath, defaultBranch); err != nil {
 		return nil, fmt.Errorf("creating refinery worktree: %w", err)
 	}
+	refineryGit := git.NewGit(refineryRigPath)
+	if err := refineryGit.ConfigureHooksPath(); err != nil {
+		return nil, fmt.Errorf("configuring hooks for refinery: %w", err)
+	}
 	fmt.Printf("   ✓ Created refinery worktree\n")
 	// Set up beads redirect for refinery (points to rig-level .beads)
 	if err := beads.SetupRedirect(m.townRoot, refineryRigPath); err != nil {
 		fmt.Printf("  Warning: Could not set up refinery beads redirect: %v\n", err)
-	}
-	// Create refinery CLAUDE.md (preserves existing from cloned repo)
-	if created, err := m.createRoleCLAUDEmd(refineryRigPath, "refinery", opts.Name, ""); err != nil {
-		return nil, fmt.Errorf("creating refinery CLAUDE.md: %w", err)
-	} else if !created {
-		fmt.Printf("   ✓ Preserved existing refinery/rig/CLAUDE.md\n")
 	}
 	// Copy overlay files from .runtime/overlay/ to refinery root.
 	// This allows services to have .env and other config files at their root.
@@ -489,12 +523,10 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		// Non-fatal - log warning but continue
 		fmt.Printf("  Warning: Could not copy overlay files to refinery: %v\n", err)
 	}
-	// Create refinery hooks for patrol triggering (at refinery/ level, not rig/)
-	refineryPath := filepath.Dir(refineryRigPath)
-	runtimeConfig := config.LoadRuntimeConfig(rigPath)
-	if err := m.createPatrolHooks(refineryPath, runtimeConfig); err != nil {
-		fmt.Printf("  Warning: Could not create refinery hooks: %v\n", err)
-	}
+
+	// NOTE: Claude settings are installed by the agent at startup, not here.
+	// Claude Code does NOT traverse parent directories for settings.json.
+	// See: https://github.com/anthropics/claude-code/issues/12962
 
 	// Create empty crew directory with README (crew members added via gt crew add)
 	crewPath := filepath.Join(rigPath, "crew")
@@ -523,43 +555,22 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	if err := os.WriteFile(readmePath, []byte(readmeContent), 0644); err != nil {
 		return nil, fmt.Errorf("creating crew README: %w", err)
 	}
-
 	// Create witness directory (no clone needed)
 	witnessPath := filepath.Join(rigPath, "witness")
 	if err := os.MkdirAll(witnessPath, 0755); err != nil {
 		return nil, fmt.Errorf("creating witness dir: %w", err)
 	}
-	// Create witness hooks for patrol triggering
-	if err := m.createPatrolHooks(witnessPath, runtimeConfig); err != nil {
-		fmt.Printf("  Warning: Could not create witness hooks: %v\n", err)
-	}
+	// NOTE: Witness hooks are installed by witness/manager.go:Start() via EnsureSettingsForRole.
+	// No need to create patrol hooks here — agents self-install at startup.
 
 	// Create polecats directory (empty)
 	polecatsPath := filepath.Join(rigPath, "polecats")
 	if err := os.MkdirAll(polecatsPath, 0755); err != nil {
 		return nil, fmt.Errorf("creating polecats dir: %w", err)
 	}
-
-	// Install runtime settings for all agent directories.
-	// Settings are placed in parent directories (not inside git repos) so Claude
-	// finds them via directory traversal without polluting source repos.
-	fmt.Printf("  Installing runtime settings...\n")
-	settingsRoles := []struct {
-		dir  string
-		role string
-	}{
-		{witnessPath, "witness"},
-		{filepath.Join(rigPath, "refinery"), "refinery"},
-		{crewPath, "crew"},
-		{polecatsPath, "polecat"},
-	}
-	for _, sr := range settingsRoles {
-		runtimeConfig := config.ResolveRoleAgentConfig(sr.role, m.townRoot, rigPath)
-		if err := runtime.EnsureSettingsForRole(sr.dir, sr.role, runtimeConfig); err != nil {
-			fmt.Fprintf(os.Stderr, "  Warning: Could not create %s settings: %v\n", sr.role, err)
-		}
-	}
-	fmt.Printf("   ✓ Installed runtime settings\n")
+	// NOTE: Runtime settings are installed by each agent in their working directory at startup
+	// via EnsureSettingsForRole. Claude Code does NOT traverse parent directories for settings,
+	// so installing them here (at witness/, refinery/, crew/, polecats/) would create dead files.
 
 	// Create rig-level agent beads (witness, refinery) in rig beads.
 	// Town-level agents (mayor, deacon) are created by gt install in town beads.
@@ -661,40 +672,52 @@ func (m *Manager) initBeads(rigPath, prefix string) error {
 	}
 	filteredEnv = append(filteredEnv, "BEADS_DIR="+beadsDir)
 
-	// Run bd init if available (default to Dolt backend)
-	cmd := exec.Command("bd", "--no-daemon", "init", "--prefix", prefix, "--backend", "dolt")
+	// Run bd init if available (default to Dolt server backend).
+	// --server tells bd to set dolt_mode=server in metadata.json so bd
+	// connects to the centralized Dolt sql-server instead of embedded mode.
+	cmd := exec.Command("bd", "init", "--prefix", prefix, "--backend", "dolt", "--server")
 	cmd.Dir = rigPath
 	cmd.Env = filteredEnv
-	_, err := cmd.CombinedOutput()
-	if err != nil {
+	_, bdInitErr := cmd.CombinedOutput()
+	if bdInitErr != nil {
 		// bd might not be installed or failed, create minimal structure
 		// Note: beads currently expects YAML format for config
 		configPath := filepath.Join(beadsDir, "config.yaml")
-		configContent := fmt.Sprintf("prefix: %s\n", prefix)
+		configContent := fmt.Sprintf("prefix: %s\nissue-prefix: %s\n", prefix, prefix)
 		if writeErr := os.WriteFile(configPath, []byte(configContent), 0644); writeErr != nil {
 			return writeErr
 		}
-	}
+	} else {
+		// bd init succeeded - configure the Dolt database
 
-	// Configure custom types for Gas Town (agent, role, rig, convoy).
-	// These were extracted from beads core in v0.46.0 and now require explicit config.
-	configCmd := exec.Command("bd", "--no-daemon", "config", "set", "types.custom", constants.BeadsCustomTypes)
-	configCmd.Dir = rigPath
-	configCmd.Env = filteredEnv
-	// Ignore errors - older beads versions don't need this
-	_, _ = configCmd.CombinedOutput()
+		// Configure custom types for Gas Town (agent, role, rig, convoy).
+		// These were extracted from beads core in v0.46.0 and now require explicit config.
+		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
+		configCmd.Dir = rigPath
+		configCmd.Env = filteredEnv
+		// Ignore errors - older beads versions don't need this
+		_, _ = configCmd.CombinedOutput()
+
+		// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
+		// Without this, bd create and gt sling fail with "issue_prefix config is missing".
+		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", prefix)
+		prefixSetCmd.Dir = rigPath
+		prefixSetCmd.Env = filteredEnv
+		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
+			return fmt.Errorf("bd config set issue_prefix failed: %s", strings.TrimSpace(string(prefixOutput)))
+		}
+	}
 
 	// Ensure database has repository fingerprint (GH #25).
 	// This is idempotent - safe on both new and legacy (pre-0.17.5) databases.
 	// Without fingerprint, the bd daemon fails to start silently.
-	migrateCmd := exec.Command("bd", "--no-daemon", "migrate", "--update-repo-id")
+	migrateCmd := exec.Command("bd", "migrate", "--update-repo-id")
 	migrateCmd.Dir = rigPath
 	migrateCmd.Env = filteredEnv
 	// Ignore errors - fingerprint is optional for functionality
 	_, _ = migrateCmd.CombinedOutput()
 
 	// Ensure issues.jsonl exists to prevent bd auto-export from corrupting other files.
-	// bd init creates beads.db but not issues.jsonl in SQLite mode.
 	// Without issues.jsonl, bd's auto-export might write issues to other .jsonl files.
 	issuesJSONL := filepath.Join(beadsDir, "issues.jsonl")
 	if _, err := os.Stat(issuesJSONL); os.IsNotExist(err) {
@@ -884,6 +907,32 @@ func isValidBeadsPrefix(prefix string) bool {
 	return beadsPrefixRegexp.MatchString(prefix)
 }
 
+// isStandardBeadHash checks if a string looks like a standard 5-char bead hash.
+// Regular bead IDs use a 5-character base32-encoded hash (e.g., "mawit", "z0ixd").
+// This distinguishes regular issues from agent beads (suffix like "witness")
+// and merge requests (10-char suffix).
+func isStandardBeadHash(s string) bool {
+	if len(s) != 5 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// bdDatabaseExists checks if a beads directory has an initialized database.
+// Checks for Dolt metadata (the standard backend).
+func bdDatabaseExists(beadsDir string) bool {
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if _, err := os.Stat(metadataPath); err == nil {
+		return true
+	}
+	return false
+}
+
 // When adding a rig from a source repo that has .beads/ tracked in git (like a project
 // that already uses beads for issue tracking), we need to use that project's existing
 // prefix instead of generating a new one. Otherwise, the rig would have a mismatched
@@ -917,11 +966,13 @@ func detectBeadsPrefixFromConfig(configPath string) string {
 	}
 
 	// Fallback: try to detect prefix from existing issues in issues.jsonl
-	// Look for the first issue ID pattern like "gt-abc123"
+	// Parse multiple lines and only consider regular issue IDs (5-char hashes)
+	// to avoid misdetecting agent beads like "gt-demo-witness" as prefix "gt-demo".
 	beadsDir := filepath.Dir(configPath)
 	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
 	if issuesData, err := os.ReadFile(issuesPath); err == nil {
 		issuesLines := strings.Split(string(issuesData), "\n")
+		var detectedPrefix string
 		for _, line := range issuesLines {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -932,17 +983,31 @@ func detectBeadsPrefixFromConfig(configPath string) string {
 				start := idx + 6 // len(`"id":"`)
 				if end := strings.Index(line[start:], `"`); end != -1 {
 					issueID := line[start : start+end]
-					// Extract prefix (everything before the last hyphen-hash part)
+					// Only consider IDs with a 5-char alphanumeric hash suffix
+					// (standard bead format). This filters out agent beads
+					// (gt-demo-witness), merge requests (gt-mr-abc1234567),
+					// and other multi-hyphen IDs.
 					if dashIdx := strings.LastIndex(issueID, "-"); dashIdx > 0 {
+						hash := issueID[dashIdx+1:]
+						if !isStandardBeadHash(hash) {
+							continue
+						}
 						prefix := issueID[:dashIdx]
-						// Handle prefixes like "gt" (from "gt-abc") - return without trailing hyphen
-						if isValidBeadsPrefix(prefix) {
-							return prefix
+						if !isValidBeadsPrefix(prefix) {
+							continue
+						}
+						if detectedPrefix == "" {
+							detectedPrefix = prefix
+						} else if detectedPrefix != prefix {
+							// Conflicting prefixes — can't determine reliably
+							return ""
 						}
 					}
 				}
 			}
-			break // Only check first issue
+		}
+		if detectedPrefix != "" {
+			return detectedPrefix
 		}
 	}
 
@@ -989,6 +1054,12 @@ func (m *Manager) RegisterRig(opts RegisterRigOptions) (*RegisterRigResult, erro
 		sanitized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(opts.Name)
 		sanitized = strings.ToLower(sanitized)
 		return nil, fmt.Errorf("rig name %q contains invalid characters; hyphens, dots, and spaces are reserved for agent ID parsing. Try %q instead (underscores are allowed)", opts.Name, sanitized)
+	}
+
+	for _, reserved := range reservedRigNames {
+		if strings.EqualFold(opts.Name, reserved) {
+			return nil, fmt.Errorf("rig name %q is reserved for town-level infrastructure", opts.Name)
+		}
 	}
 
 	rigPath := filepath.Join(m.townRoot, opts.Name)
@@ -1076,152 +1147,11 @@ func (m *Manager) ListRigNames() []string {
 	return names
 }
 
-// createRoleCLAUDEmd creates a minimal bootstrap pointer CLAUDE.md file.
-// Full context is injected ephemerally by `gt prime` at session start.
-// This keeps on-disk files small (<30 lines) per the priming architecture.
-//
-// Returns (created bool, error) - created is false if file already exists.
-// Existing files are preserved to respect user customizations from cloned repos.
-func (m *Manager) createRoleCLAUDEmd(workspacePath string, role string, rigName string, workerName string) (bool, error) {
-	claudePath := filepath.Join(workspacePath, "CLAUDE.md")
-
-	// Check if file already exists - preserve existing from cloned repo
-	if _, err := os.Stat(claudePath); err == nil {
-		return false, nil // File exists, preserve it
-	} else if !os.IsNotExist(err) {
-		return false, err // Unexpected error
-	}
-
-	// Create role-specific bootstrap pointer
-	var bootstrap string
-	switch role {
-	case "mayor":
-		bootstrap = `# Mayor Context (` + rigName + `)
-
-> **Recovery**: Run ` + "`" + cli.Name() + " prime`" + ` after compaction, clear, or new session
-
-Full context is injected by ` + "`" + cli.Name() + " prime`" + ` at session start.
-`
-	case "refinery":
-		bootstrap = `# Refinery Context (` + rigName + `)
-
-> **Recovery**: Run ` + "`" + cli.Name() + " prime`" + ` after compaction, clear, or new session
-
-Full context is injected by ` + "`" + cli.Name() + " prime`" + ` at session start.
-
-## Quick Reference
-
-- Check MQ: ` + "`" + cli.Name() + " mq list`" + `
-- Process next: ` + "`" + cli.Name() + " mq process`" + `
-`
-	case "crew":
-		name := workerName
-		if name == "" {
-			name = "worker"
-		}
-		bootstrap = `# Crew Context (` + rigName + `/` + name + `)
-
-> **Recovery**: Run ` + "`" + cli.Name() + " prime`" + ` after compaction, clear, or new session
-
-Full context is injected by ` + "`" + cli.Name() + " prime`" + ` at session start.
-
-## Quick Reference
-
-- Check hook: ` + "`" + cli.Name() + " hook`" + `
-- Check mail: ` + "`" + cli.Name() + " mail inbox`" + `
-`
-	case "polecat":
-		name := workerName
-		if name == "" {
-			name = "worker"
-		}
-		bootstrap = `# Polecat Context (` + rigName + `/` + name + `)
-
-> **Recovery**: Run ` + "`" + cli.Name() + " prime`" + ` after compaction, clear, or new session
-
-Full context is injected by ` + "`" + cli.Name() + " prime`" + ` at session start.
-
-## Quick Reference
-
-- Check hook: ` + "`" + cli.Name() + " hook`" + `
-- Report done: ` + "`" + cli.Name() + " done`" + `
-`
-	default:
-		bootstrap = `# Agent Context
-
-> **Recovery**: Run ` + "`" + cli.Name() + " prime`" + ` after compaction, clear, or new session
-
-Full context is injected by ` + "`" + cli.Name() + " prime`" + ` at session start.
-`
-	}
-
-	return true, os.WriteFile(claudePath, []byte(bootstrap), 0644)
-}
-
-// createPatrolHooks creates .claude/settings.json with hooks for patrol roles.
-// These hooks trigger gt prime on session start and inject mail, enabling
-// autonomous patrol execution for Witness and Refinery roles.
-func (m *Manager) createPatrolHooks(workspacePath string, runtimeConfig *config.RuntimeConfig) error {
-	if runtimeConfig == nil || runtimeConfig.Hooks == nil || runtimeConfig.Hooks.Provider != "claude" {
-		return nil
-	}
-	if runtimeConfig.Hooks.Dir == "" || runtimeConfig.Hooks.SettingsFile == "" {
-		return nil
-	}
-
-	settingsDir := filepath.Join(workspacePath, runtimeConfig.Hooks.Dir)
-	if err := os.MkdirAll(settingsDir, 0755); err != nil {
-		return fmt.Errorf("creating settings dir: %w", err)
-	}
-
-	// Standard patrol hooks - same as deacon
-	hooksJSON := `{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gt prime && gt mail check --inject"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gt prime"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gt mail check --inject"
-          }
-        ]
-      }
-    ]
-  }
-}
-`
-	settingsPath := filepath.Join(settingsDir, runtimeConfig.Hooks.SettingsFile)
-	return os.WriteFile(settingsPath, []byte(hooksJSON), 0600)
-}
-
 // seedPatrolMolecules creates patrol molecule prototypes in the rig's beads database.
 // These molecules define the work loops for Deacon, Witness, and Refinery roles.
 func (m *Manager) seedPatrolMolecules(rigPath string) error {
 	// Use bd command to seed molecules (more reliable than internal API)
-	cmd := exec.Command("bd", "--no-daemon", "mol", "seed", "--patrol")
+	cmd := exec.Command("bd", "mol", "seed", "--patrol")
 	cmd.Dir = rigPath
 	if err := cmd.Run(); err != nil {
 		// Fallback: bd mol seed might not support --patrol yet
@@ -1254,7 +1184,7 @@ func (m *Manager) seedPatrolMoleculesManually(rigPath string) error {
 
 	for _, mol := range patrolMols {
 		// Check if already exists by title
-		checkCmd := exec.Command("bd", "--no-daemon", "list", "--type=molecule", "--format=json")
+		checkCmd := exec.Command("bd", "list", "--type=molecule", "--format=json")
 		checkCmd.Dir = rigPath
 		output, _ := checkCmd.Output()
 		if strings.Contains(string(output), mol.title) {
@@ -1262,7 +1192,7 @@ func (m *Manager) seedPatrolMoleculesManually(rigPath string) error {
 		}
 
 		// Create the molecule
-		cmd := exec.Command("bd", "--no-daemon", "create", //nolint:gosec // G204: bd is a trusted internal tool
+		cmd := exec.Command("bd", "create", //nolint:gosec // G204: bd is a trusted internal tool
 			"--type=molecule",
 			"--title="+mol.title,
 			"--description="+mol.desc,
@@ -1320,10 +1250,13 @@ See docs/deacon-plugins.md for full documentation.
 		return fmt.Errorf("creating rig plugins directory: %w", err)
 	}
 
-	// Add plugins/ and .repo.git/ to rig .gitignore
+	// Add plugins/, .repo.git/, and .land-worktree/ to rig .gitignore
 	gitignorePath := filepath.Join(rigPath, ".gitignore")
 	if err := m.ensureGitignoreEntry(gitignorePath, "plugins/"); err != nil {
 		return err
 	}
-	return m.ensureGitignoreEntry(gitignorePath, ".repo.git/")
+	if err := m.ensureGitignoreEntry(gitignorePath, ".repo.git/"); err != nil {
+		return err
+	}
+	return m.ensureGitignoreEntry(gitignorePath, ".land-worktree/")
 }

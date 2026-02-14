@@ -15,13 +15,12 @@ import (
 )
 
 // EnsureSettingsForRole provisions all agent-specific configuration for a role.
-// This includes settings/plugins AND slash commands.
-//
-// Design note: We keep this function name (vs creating EnsureAgentSetup) to minimize
-// changes across the codebase. All existing callers automatically get command
-// provisioning without code changes. The name is still accurate as commands are
-// part of agent settings/configuration.
-func EnsureSettingsForRole(workDir, role string, rc *config.RuntimeConfig) error {
+// settingsDir is where provider settings (e.g., .claude/settings.json) are installed.
+// workDir is the agent's working directory where slash commands are provisioned.
+// For roles like crew/witness/refinery/polecat, settingsDir is a gastown-managed
+// parent directory (passed via --settings flag), while workDir is the customer repo.
+// For mayor/deacon, settingsDir and workDir are the same.
+func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.RuntimeConfig) error {
 	if rc == nil {
 		rc = config.DefaultRuntimeConfig()
 	}
@@ -36,12 +35,15 @@ func EnsureSettingsForRole(workDir, role string, rc *config.RuntimeConfig) error
 	}
 
 	// 1. Provider-specific settings (settings.json for Claude, plugin for OpenCode)
+	// Settings are installed to settingsDir (gastown-managed parent for rig roles).
 	switch provider {
 	case "claude":
-		if err := claude.EnsureSettingsForRoleAt(workDir, role, rc.Hooks.Dir, rc.Hooks.SettingsFile); err != nil {
+		if err := claude.EnsureSettingsForRoleAt(settingsDir, role, rc.Hooks.Dir, rc.Hooks.SettingsFile); err != nil {
 			return err
 		}
 	case "opencode":
+		// OpenCode plugins stay in workDir — OpenCode has no --settings equivalent
+		// for path redirection, so it discovers plugins from the working directory.
 		if err := opencode.EnsurePluginAt(workDir, rc.Hooks.Dir, rc.Hooks.SettingsFile); err != nil {
 			return err
 		}
@@ -94,7 +96,9 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 	if isAutonomousRole(role) {
 		command += " && gt mail check --inject"
 	}
-	command += " && gt nudge deacon session-started"
+	// NOTE: session-started nudge to deacon removed — it interrupted
+	// the deacon's await-signal backoff (exponential sleep). The deacon
+	// already wakes on beads activity via bd activity --follow.
 
 	return []string{command}
 }
@@ -112,14 +116,14 @@ func RunStartupFallback(t *tmux.Tmux, sessionID, role string, rc *config.Runtime
 
 // isAutonomousRole returns true if the given role should automatically
 // inject mail check on startup. Autonomous roles (polecat, witness,
-// refinery, deacon) operate without human prompting and need mail injection
+// refinery, deacon, boot) operate without human prompting and need mail injection
 // to receive work assignments.
 //
 // Non-autonomous roles (mayor, crew) are human-guided and should not
 // have automatic mail injection to avoid confusion.
 func isAutonomousRole(role string) bool {
 	switch role {
-	case "polecat", "witness", "refinery", "deacon":
+	case "polecat", "witness", "refinery", "deacon", "boot":
 		return true
 	default:
 		return false
