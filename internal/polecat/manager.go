@@ -221,6 +221,22 @@ func (m *Manager) lockPool() (*flock.Flock, error) {
 	return fl, nil
 }
 
+// lockAgentCreatePath serializes agent-bead create/reopen writes across the rig.
+// Concrete x1e regression source: per-agent locks allow concurrent creates for
+// different polecats, but they all contend on the same Dolt write path.
+func (m *Manager) lockAgentCreatePath() (*flock.Flock, error) {
+	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, "agent-bead-create.lock")
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring agent create lock: %w", err)
+	}
+	return fl, nil
+}
+
 // CheckDoltHealth verifies that the Dolt database is reachable before spawning.
 // Returns an error if Dolt exists but is unhealthy after retries.
 // Returns nil if beads is not configured (test/setup environments).
@@ -307,6 +323,12 @@ func (m *Manager) CheckDoltServerCapacity() error {
 // Fails fast on configuration/initialization errors (gt-2ra) — these are not
 // transient and retrying them wastes ~3 minutes for identical failures.
 func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFields) error {
+	createLock, lockErr := m.lockAgentCreatePath()
+	if lockErr != nil {
+		return fmt.Errorf("agent create path lock: %w", lockErr)
+	}
+	defer func() { _ = createLock.Unlock() }()
+
 	var lastErr error
 	writerLockFailures := 0
 	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
