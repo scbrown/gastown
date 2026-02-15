@@ -140,12 +140,33 @@ type DoltRemotesConfig struct {
 	Branch string `json:"branch,omitempty"`
 }
 
+// ThrottleConfig holds configuration for resource-aware spawn throttling.
+// When enabled, the daemon reads a local state file written by a contention
+// monitoring script to decide whether to defer new polecat spawns.
+type ThrottleConfig struct {
+	// Enabled controls whether throttle checks run.
+	Enabled bool `json:"enabled"`
+
+	// StateFile is the path to the JSON contention state file.
+	// Default: ~/.local/state/aegis/resource_contention.json
+	StateFile string `json:"state_file,omitempty"`
+
+	// StaleSeconds is how old the state file can be before it's considered stale.
+	// If stale, throttling is disabled (fail-open). Default: 600 (10 minutes).
+	StaleSeconds int `json:"stale_seconds,omitempty"`
+
+	// ThrottleLevel is the minimum contention_level at which spawns are deferred.
+	// Default: 2 (high contention). Set to 1 to also throttle on moderate contention.
+	ThrottleLevel int `json:"throttle_level,omitempty"`
+}
+
 // DaemonPatrolConfig is the structure of mayor/daemon.json.
 type DaemonPatrolConfig struct {
-	Type      string         `json:"type"`
-	Version   int            `json:"version"`
-	Heartbeat *PatrolConfig  `json:"heartbeat,omitempty"`
-	Patrols   *PatrolsConfig `json:"patrols,omitempty"`
+	Type      string          `json:"type"`
+	Version   int             `json:"version"`
+	Heartbeat *PatrolConfig   `json:"heartbeat,omitempty"`
+	Patrols   *PatrolsConfig  `json:"patrols,omitempty"`
+	Throttle  *ThrottleConfig `json:"throttle,omitempty"`
 }
 
 // PatrolConfigFile returns the path to the patrol config file.

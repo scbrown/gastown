@@ -394,7 +394,11 @@ func (d *Daemon) heartbeat(state *State) {
 	// 7. Trigger pending polecat spawns (bootstrap mode - ZFC violation acceptable)
 	// This ensures polecats get nudged even when Deacon isn't in a patrol cycle.
 	// Uses regex-based WaitForRuntimeReady, which is acceptable for daemon bootstrap.
-	d.triggerPendingSpawns()
+	if throttle, reason := d.shouldThrottleSpawns(); throttle {
+		d.logger.Printf("Throttle: deferring polecat spawns — %s", reason)
+	} else {
+		d.triggerPendingSpawns()
+	}
 
 	// 8. Process lifecycle requests
 	d.processLifecycleRequests()
