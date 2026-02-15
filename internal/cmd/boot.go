@@ -370,10 +370,14 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 	return "nothing", "", nil
 }
 
-// isDeaconInBackoff checks if the Deacon is in await-signal backoff mode.
-// When in backoff mode, the deacon bead has an "idle:N" label where N >= 0.
-// This indicates the deacon is legitimately waiting for beads activity signals
-// and should not be interrupted for "stale work" - it's supposed to be idle.
+// isDeaconInBackoff checks if the Deacon is in an active await-signal backoff window.
+//
+// PATCH-011: Use backoff-until:TIMESTAMP label instead of idle:N for active backoff
+// detection. The idle:N label persists across patrol cycles (set on timeout, cleared
+// only when signal received), causing false positives — Boot would say "nothing" even
+// when the Deacon finished backoff and got stuck mid-patrol. The backoff-until label
+// is set when await-signal starts and cleared when it completes (timeout or signal),
+// making it an accurate indicator of active backoff.
 func isDeaconInBackoff() bool {
 	cmd := exec.Command("bd", "show", "hq-deacon", "--json")
 	output, err := cmd.Output()
@@ -389,12 +393,36 @@ func isDeaconInBackoff() bool {
 		return false
 	}
 
-	// Check for idle:N label (any value means await-signal is/was running)
+	// Check for backoff-until:TIMESTAMP label — this indicates an active await-signal
+	// window. The label is set when await-signal begins and cleared on completion.
 	for _, label := range result[0].Labels {
-		if len(label) >= 5 && label[:5] == "idle:" {
-			return true
+		if len(label) > 14 && label[:14] == "backoff-until:" {
+			// Parse the Unix timestamp
+			tsStr := label[14:]
+			ts := 0
+			valid := true
+			for i := 0; i < len(tsStr); i++ {
+				if tsStr[i] < '0' || tsStr[i] > '9' {
+					valid = false
+					break
+				}
+				ts = ts*10 + int(tsStr[i]-'0')
+			}
+			if valid && ts > 0 {
+				backoffUntil := time.Unix(int64(ts), 0)
+				if backoffUntil.After(time.Now()) {
+					return true // Active backoff window — deacon is legitimately waiting
+				}
+				// Backoff window expired — deacon should have resumed patrol by now.
+				// Return false so Boot can check if it's stuck.
+				return false
+			}
 		}
 	}
+
+	// No backoff-until label — deacon is not in an active await-signal call.
+	// The idle:N label may persist from a previous cycle but doesn't indicate
+	// current backoff state.
 	return false
 }
 
