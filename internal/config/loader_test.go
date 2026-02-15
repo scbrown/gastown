@@ -1512,10 +1512,10 @@ func TestGetRuntimeCommand_UsesRigAgentWhenRigPathProvided(t *testing.T) {
 
 func TestExpectedPaneCommands(t *testing.T) {
 	t.Parallel()
-	t.Run("claude maps to node and claude", func(t *testing.T) {
+	t.Run("claude maps to claude only", func(t *testing.T) {
 		got := ExpectedPaneCommands(&RuntimeConfig{Command: "claude"})
-		want := []string{"node", "claude"}
-		if len(got) != 2 || got[0] != "node" || got[1] != "claude" {
+		want := []string{"claude"}
+		if len(got) != 1 || got[0] != "claude" {
 			t.Fatalf("ExpectedPaneCommands(claude) = %v, want %v", got, want)
 		}
 	})

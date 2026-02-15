@@ -109,7 +109,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		Name:                AgentClaude,
 		Command:             "claude",
 		Args:                []string{"--dangerously-skip-permissions"},
-		ProcessNames:        []string{"node", "claude"}, // Claude runs as Node.js
+		ProcessNames:        []string{"claude"}, // Claude Code is a native binary since v2.x
 		SessionIDEnv:        "CLAUDE_SESSION_ID",
 		ResumeFlag:          "--resume",
 		ResumeStyle:         "flag",
@@ -431,8 +431,8 @@ func GetSessionIDEnvVar(agentName string) string {
 func GetProcessNames(agentName string) []string {
 	info := GetAgentPresetByName(agentName)
 	if info == nil || len(info.ProcessNames) == 0 {
-		// Default to Claude's process names for backwards compatibility
-		return []string{"node", "claude"}
+		// Default to Claude's process names (native binary since v2.x)
+		return []string{"claude"}
 	}
 	return info.ProcessNames
 }

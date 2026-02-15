@@ -384,14 +384,14 @@ func TestGetProcessNames(t *testing.T) {
 		agentName string
 		want      []string
 	}{
-		{"claude", []string{"node", "claude"}},
+		{"claude", []string{"claude"}},
 		{"gemini", []string{"gemini"}},
 		{"codex", []string{"codex"}},
 		{"cursor", []string{"cursor-agent"}},
 		{"auggie", []string{"auggie"}},
 		{"amp", []string{"amp"}},
 		{"opencode", []string{"opencode", "node", "bun"}},
-		{"unknown", []string{"node", "claude"}}, // Falls back to Claude's process
+		{"unknown", []string{"claude"}}, // Falls back to Claude's process
 	}
 
 	for _, tt := range tests {

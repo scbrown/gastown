@@ -1877,7 +1877,7 @@ func ExpectedPaneCommands(rc *RuntimeConfig) []string {
 		return nil
 	}
 	if filepath.Base(rc.Command) == "claude" {
-		return []string{"node", "claude"}
+		return []string{"claude"}
 	}
 	return []string{filepath.Base(rc.Command)}
 }

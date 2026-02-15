@@ -423,10 +423,10 @@ func TestIsRuntimeRunning(t *testing.T) {
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
 
-	// IsRuntimeRunning should be false (shell is running, not node/claude)
+	// IsRuntimeRunning should be false (shell is running, not claude)
 	cmd, _ := tm.GetPaneCommand(sessionName)
-	processNames := []string{"node", "claude"}
-	wantRunning := cmd == "node" || cmd == "claude"
+	processNames := []string{"claude"}
+	wantRunning := cmd == "claude"
 
 	if got := tm.IsRuntimeRunning(sessionName, processNames); got != wantRunning {
 		t.Errorf("IsRuntimeRunning() = %v, want %v (pane cmd: %q)", got, wantRunning, cmd)
@@ -464,7 +464,8 @@ func TestIsRuntimeRunning_ShellWithNodeChild(t *testing.T) {
 	}
 
 	// Now test IsRuntimeRunning - it should detect node as a child process
-	processNames := []string{"node", "claude"}
+	// Use "node" in processNames since we spawned a node process (tests general mechanism)
+	processNames := []string{"node"}
 	paneCmd, _ := tm.GetPaneCommand(sessionName)
 	if paneCmd == "node" {
 		// Direct node detection should work
@@ -557,7 +558,7 @@ func TestHasChildWithNames(t *testing.T) {
 	// Test the hasChildWithNames helper function directly
 
 	// Test with a definitely nonexistent PID
-	got := hasChildWithNames("999999999", []string{"node", "claude"})
+	got := hasChildWithNames("999999999", []string{"claude"})
 	if got {
 		t.Error("hasChildWithNames should return false for nonexistent PID")
 	}
@@ -575,9 +576,9 @@ func TestHasChildWithNames(t *testing.T) {
 	}
 
 	// Test with PID 1 (init/launchd) - should have children but not specific agent processes
-	got = hasChildWithNames("1", []string{"node", "claude"})
+	got = hasChildWithNames("1", []string{"claude"})
 	if got {
-		t.Logf("hasChildWithNames(\"1\", [node,claude]) = true - init has matching child?")
+		t.Logf("hasChildWithNames(\"1\", [claude]) = true - init has matching child?")
 	}
 }
 
