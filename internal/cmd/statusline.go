@@ -20,8 +20,13 @@ var (
 )
 
 var statusLineCmd = &cobra.Command{
-	Use:    "status-line",
-	Short:  "Output status line content for tmux (internal use)",
+	Use:   "status-line",
+	Short: "Output status line content for tmux (internal use)",
+	Long: `Output formatted status line content for the tmux status bar.
+
+Called internally by the tmux status-right configuration. Displays
+the current rig, role, worker name, and active issue. Pass --session
+to specify which tmux session to query.`,
 	Hidden: true, // Internal command called by tmux
 	RunE:   runStatusLine,
 }
@@ -363,7 +368,14 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 		if led == "🅿️" {
 			space = "  "
 		}
-		rigParts = append(rigParts, led+space+rig.name)
+		// Abbreviate rig names to beads prefix when >2 rigs
+		displayName := rig.name
+		if len(rigs) > 2 && townRoot != "" {
+			if prefix := config.GetRigPrefix(townRoot, rig.name); prefix != "" {
+				displayName = prefix
+			}
+		}
+		rigParts = append(rigParts, led+space+displayName)
 	}
 
 	if len(rigParts) > 0 {

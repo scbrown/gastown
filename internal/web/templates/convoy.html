@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
-    <div class="dashboard" id="dashboard-main" hx-get="/" hx-trigger="every 10s [!window.pauseRefresh]" hx-swap="morph:outerHTML" hx-ext="morph">
+    <div class="dashboard" id="dashboard-main" hx-get="/" hx-trigger="sse:dashboard-update, every 30s [!window.pauseRefresh && !window.sseConnected]" hx-swap="morph:outerHTML" hx-ext="morph">
         <header>
             <pre class="ascii-title">  __  __    __   _____ __  _   _  __  _    ___ __  __  _ _____ ___  __  _      ______ __  _ _____ ___ ___ 
  / _]/  \ /' _| |_   _/__\| | | ||  \| |  / _//__\|  \| |_   _| _ \/__\| |    / _/ __|  \| |_   _| __| _ \
@@ -19,8 +19,8 @@
                 <button class="cmd-btn" id="open-palette-btn">
                     <span>⌘</span> Commands <kbd>⌘K</kbd>
                 </button>
-                <span class="refresh-info">
-                    Auto-refresh: 10s
+                <span class="refresh-info" id="refresh-info">
+                    <span id="connection-status">Connecting...</span>
                     <span class="htmx-indicator">⟳</span>
                 </span>
             </div>
@@ -118,64 +118,131 @@
             <!-- Row 1: Convoys, Polecats, Sessions -->
 
             <!-- Convoys Panel -->
-            <div class="panel">
+            <div class="panel" id="convoy-panel">
                 <div class="panel-header">
                     <h2>🚚 Convoys</h2>
                     <span class="count">{{len .Convoys}}</span>
+                    <button class="new-convoy-btn" id="new-convoy-btn">+ New Convoy</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    {{if .Convoys}}
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Status</th>
-                                <th>Convoy</th>
-                                <th>Progress</th>
-                                <th>Activity</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {{range .Convoys}}
-                            <tr class="convoy-row">
-                                <td>
-                                    {{if eq .WorkStatus "complete"}}
-                                    <span class="badge badge-green">✓</span>
-                                    {{else if eq .WorkStatus "active"}}
-                                    <span class="badge badge-green">Active</span>
-                                    {{else if eq .WorkStatus "stale"}}
-                                    <span class="badge badge-yellow">Stale</span>
-                                    {{else if eq .WorkStatus "stuck"}}
-                                    <span class="badge badge-red">Stuck</span>
-                                    {{else}}
-                                    <span class="badge badge-muted">Wait</span>
-                                    {{end}}
-                                </td>
-                                <td>
-                                    <span class="convoy-id">{{.ID}}</span>
-                                    {{if .Title}}<div class="convoy-title">{{.Title}}</div>{{end}}
-                                </td>
-                                <td>
-                                    {{.Progress}}
-                                    {{if .Total}}
-                                    <div class="progress-bar">
-                                        <div class="progress-fill" style="width: {{progressPercent .Completed .Total}}%;"></div>
-                                    </div>
-                                    {{end}}
-                                </td>
-                                <td class="{{activityClass .LastActivity}}">
-                                    <span class="activity-dot"></span>
-                                    {{.LastActivity.FormattedAge}}
-                                </td>
-                            </tr>
-                            {{end}}
-                        </tbody>
-                    </table>
-                    {{else}}
-                    <div class="empty-state">
-                        <p>No active convoys</p>
+                    <!-- Convoy List View -->
+                    <div id="convoy-list">
+                        {{if .Convoys}}
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Status</th>
+                                    <th>Convoy</th>
+                                    <th>Progress</th>
+                                    <th>Activity</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {{range .Convoys}}
+                                <tr class="convoy-row" data-convoy-id="{{.ID}}">
+                                    <td>
+                                        {{if eq .WorkStatus "complete"}}
+                                        <span class="badge badge-green">✓</span>
+                                        {{else if eq .WorkStatus "active"}}
+                                        <span class="badge badge-green">Active</span>
+                                        {{else if eq .WorkStatus "stale"}}
+                                        <span class="badge badge-yellow">Stale</span>
+                                        {{else if eq .WorkStatus "stuck"}}
+                                        <span class="badge badge-red">Stuck</span>
+                                        {{else}}
+                                        <span class="badge badge-muted">Wait</span>
+                                        {{end}}
+                                    </td>
+                                    <td>
+                                        <span class="convoy-id">{{.ID}}</span>
+                                        {{if .Title}}<div class="convoy-title">{{.Title}}</div>{{end}}
+                                    </td>
+                                    <td>
+                                        {{.Progress}}
+                                        {{if .Total}}
+                                        <div class="progress-bar">
+                                            <div class="progress-fill" style="width: {{progressPercent .Completed .Total}}%;"></div>
+                                        </div>
+                                        {{end}}
+                                    </td>
+                                    <td class="{{activityClass .LastActivity}}">
+                                        <span class="activity-dot"></span>
+                                        {{.LastActivity.FormattedAge}}
+                                    </td>
+                                </tr>
+                                {{end}}
+                            </tbody>
+                        </table>
+                        {{else}}
+                        <div class="empty-state">
+                            <p>No active convoys</p>
+                        </div>
+                        {{end}}
                     </div>
-                    {{end}}
+                    <!-- Convoy Detail View (hidden by default) -->
+                    <div id="convoy-detail" style="display: none;">
+                        <div class="detail-header">
+                            <button id="convoy-back-btn" class="btn-back">← Back</button>
+                            <span id="convoy-detail-title" class="convoy-detail-title"></span>
+                        </div>
+                        <div class="convoy-detail-content">
+                            <div class="convoy-detail-meta">
+                                <span id="convoy-detail-id" class="convoy-id"></span>
+                                <span id="convoy-detail-status" class="badge"></span>
+                                <span id="convoy-detail-progress"></span>
+                            </div>
+                            <div class="convoy-detail-section">
+                                <div class="convoy-issues-header">
+                                    <h4>Tracked Issues</h4>
+                                    <button class="convoy-add-issue-btn" id="convoy-add-issue-btn">+ Add Issue</button>
+                                </div>
+                                <div id="convoy-add-issue-form" class="convoy-add-issue-form" style="display: none;">
+                                    <input type="text" id="convoy-add-issue-input" class="convoy-add-issue-input" placeholder="Enter issue ID...">
+                                    <button class="btn-primary convoy-add-issue-submit" id="convoy-add-issue-submit">Add</button>
+                                    <button class="btn-secondary convoy-add-issue-cancel" id="convoy-add-issue-cancel">Cancel</button>
+                                </div>
+                                <div id="convoy-issues-loading" class="loading-state">Loading issues...</div>
+                                <table id="convoy-issues-table" style="display: none;">
+                                    <thead>
+                                        <tr>
+                                            <th>Status</th>
+                                            <th>ID</th>
+                                            <th>Title</th>
+                                            <th>Assignee</th>
+                                            <th>Progress</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="convoy-issues-tbody">
+                                    </tbody>
+                                </table>
+                                <div id="convoy-issues-empty" class="empty-state" style="display: none;">
+                                    <p>No issues in this convoy</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- New Convoy Form (hidden by default) -->
+                    <div id="convoy-create-form" class="convoy-create-form" style="display: none;">
+                        <div class="detail-header">
+                            <button id="convoy-create-back-btn" class="btn-back">← Back</button>
+                            <span class="convoy-detail-title">New Convoy</span>
+                        </div>
+                        <div class="convoy-create-fields">
+                            <div class="command-field">
+                                <label class="command-field-label" for="convoy-create-name">Name</label>
+                                <input type="text" id="convoy-create-name" class="command-field-input" placeholder="Enter convoy name...">
+                            </div>
+                            <div class="command-field">
+                                <label class="command-field-label" for="convoy-create-issues">Issue IDs (space-separated)</label>
+                                <input type="text" id="convoy-create-issues" class="command-field-input" placeholder="e.g. gt-1kp gt-2ab">
+                            </div>
+                            <div class="form-actions">
+                                <button class="btn-secondary" id="convoy-create-cancel-btn">Cancel</button>
+                                <button class="btn-primary" id="convoy-create-submit-btn">Create Convoy</button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -724,6 +791,7 @@
                                     <th>Title</th>
                                     <th>Status</th>
                                     <th>Age</th>
+                                    <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -741,6 +809,7 @@
                                         {{if .Assignee}}<span class="badge badge-blue" title="{{.Assignee}}">{{.Assignee}}</span>{{else}}<span class="badge badge-green">Ready</span>{{end}}
                                     </td>
                                     <td>{{.Age}}</td>
+                                    <td><button class="sling-btn" data-bead-id="{{.ID}}" title="Sling to rig">Sling</button></td>
                                 </tr>
                                 {{end}}
                             </tbody>
@@ -765,8 +834,10 @@
                             <h3 id="issue-detail-title-text"></h3>
                             <div class="issue-detail-meta">
                                 <span id="issue-detail-type"></span>
+                                <span id="issue-detail-owner"></span>
                                 <span id="issue-detail-created"></span>
                             </div>
+                            <div id="issue-detail-actions" class="issue-detail-actions"></div>
                             <div class="issue-detail-section">
                                 <h4>Description</h4>
                                 <pre id="issue-detail-description"></pre>
@@ -789,9 +860,19 @@
                 <div class="panel-header">
                     <h2>🪝 Hooks</h2>
                     <span class="count{{if .Hooks}} {{end}}">{{len .Hooks}}</span>
+                    <button class="hook-attach-btn" onclick="openHookAttachForm()">+ Attach</button>
+                    {{if .Hooks}}<button class="hook-clear-all-btn" onclick="clearAllHooks()">Clear All</button>{{end}}
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
+                    <!-- Attach Hook Form (hidden by default) -->
+                    <div id="hook-attach-form" class="hook-attach-form" style="display:none;">
+                        <div class="hook-attach-form-row">
+                            <input type="text" id="hook-attach-bead" class="hook-attach-input" placeholder="Bead ID (e.g. gt-abc)">
+                            <button class="hook-attach-submit" onclick="submitHookAttach()">Attach</button>
+                            <button class="hook-attach-cancel" onclick="closeHookAttachForm()">Cancel</button>
+                        </div>
+                    </div>
                     {{if .Hooks}}
                     <table>
                         <thead>
@@ -800,6 +881,7 @@
                                 <th>Title</th>
                                 <th>Agent</th>
                                 <th>Hooked</th>
+                                <th></th>
                             </tr>
                         </thead>
                         <tbody>
@@ -815,6 +897,7 @@
                                     {{.Age}}
                                     {{end}}
                                 </td>
+                                <td><button class="hook-detach-btn" data-hook-id="{{.ID}}" onclick="detachHook(this)">Detach</button></td>
                             </tr>
                             {{end}}
                         </tbody>
@@ -832,7 +915,7 @@
     <!-- Command Palette (outside HTMX-refreshed area) -->
     <div id="command-palette-overlay" class="command-palette-overlay">
         <div class="command-palette">
-            <input type="text" id="command-palette-input" class="command-palette-input" placeholder="Search commands..." autocomplete="off">
+            <input type="text" id="command-palette-input" class="command-palette-input" placeholder="Type to search commands..." autocomplete="off">
             <div id="command-palette-results" class="command-palette-results"></div>
             <div class="command-palette-footer">
                 <span><kbd>↑↓</kbd> navigate</span>
@@ -894,6 +977,6 @@
         <div id="output-panel-content" class="output-panel-content"></div>
     </div>
 
-    <script src="/static/dashboard.js?v=2"></script>
+    <script src="/static/dashboard.js?v=3"></script>
 </body>
 </html>

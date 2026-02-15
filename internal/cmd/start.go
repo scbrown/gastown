@@ -461,10 +461,7 @@ func runShutdown(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 
-	// Get session names for categorization
-	mayorSession := getMayorSessionName()
-	deaconSession := getDeaconSessionName()
-	toStop, preserved := categorizeSessions(sessions, mayorSession, deaconSession)
+	toStop, preserved := categorizeSessions(sessions)
 
 	if len(toStop) == 0 {
 		fmt.Printf("%s Gas Town was not running\n", style.Dim.Render("○"))
@@ -512,26 +509,22 @@ func runShutdown(cmd *cobra.Command, args []string) error {
 }
 
 // categorizeSessions splits sessions into those to stop and those to preserve.
-// mayorSession and deaconSession are the dynamic session names for the current town.
-func categorizeSessions(sessions []string, mayorSession, deaconSession string) (toStop, preserved []string) {
+func categorizeSessions(sessions []string) (toStop, preserved []string) {
 	for _, sess := range sessions {
 		// Gas Town sessions use gt- (rig-level) or hq- (town-level) prefix
 		if !strings.HasPrefix(sess, "gt-") && !strings.HasPrefix(sess, "hq-") {
 			continue // Not a Gas Town session
 		}
 
-		// Check if it's a crew session (pattern: gt-<rig>-crew-<name>)
-		isCrew := strings.Contains(sess, "-crew-")
-
-		// Check if it's a polecat session (pattern: gt-<rig>-<name> where name is not crew/witness/refinery)
+		// Parse session to determine role
 		isPolecat := false
-		if !isCrew && sess != mayorSession && sess != deaconSession {
-			parts := strings.Split(sess, "-")
-			if len(parts) >= 3 {
-				role := parts[2]
-				if role != "witness" && role != "refinery" && role != "crew" {
-					isPolecat = true
-				}
+		isCrew := false
+		if identity, err := session.ParseSessionName(sess); err == nil {
+			switch identity.Role {
+			case session.RolePolecat:
+				isPolecat = true
+			case session.RoleCrew:
+				isCrew = true
 			}
 		}
 
@@ -704,13 +697,12 @@ func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSe
 			continue
 		}
 
-		// Categorize by role (third component of gt-<rig>-<role> pattern)
-		parts := strings.Split(sess, "-")
-		if len(parts) >= 3 {
-			switch parts[2] {
-			case "witness":
+		// Categorize by role using proper session name parser
+		if identity, err := session.ParseSessionName(sess); err == nil {
+			switch identity.Role {
+			case session.RoleWitness:
 				witnesses = append(witnesses, sess)
-			case "refinery":
+			case session.RoleRefinery:
 				refineries = append(refineries, sess)
 			default:
 				// Polecats, crew, and any other rig-level sessions

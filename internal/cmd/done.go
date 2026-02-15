@@ -84,7 +84,7 @@ func init() {
 	rootCmd.AddCommand(doneCmd)
 }
 
-func runDone(cmd *cobra.Command, args []string) error {
+func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Guard: Only polecats should call gt done
 	// Crew, deacons, witnesses etc. don't use gt done - they persist across tasks.
 	// Polecat sessions end with gt done — the session is cleaned up, but the
@@ -133,7 +133,7 @@ func runDone(cmd *cobra.Command, args []string) error {
 			if err := selfKillSession(deferredTownRoot, deferredRoleInfo); err != nil {
 				style.PrintWarning("deferred session kill failed: %v", err)
 			}
-			os.Exit(0)
+			retErr = NewSilentExit(0)
 		}
 	}()
 
@@ -173,6 +173,27 @@ func runDone(cmd *cobra.Command, args []string) error {
 	}
 	if rigName == "" {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
+	}
+
+	// When gt is invoked via shell alias (cd ~/gt && gt), cwd is the town
+	// root, not the polecat's worktree. Detect and reconstruct actual path.
+	if cwdAvailable && cwd == townRoot {
+		if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" && rigName != "" {
+			polecatClone := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+			if _, err := os.Stat(polecatClone); err == nil {
+				cwd = polecatClone
+			} else {
+				polecatClone = filepath.Join(townRoot, rigName, "polecats", polecatName)
+				if _, err := os.Stat(filepath.Join(polecatClone, ".git")); err == nil {
+					cwd = polecatClone
+				}
+			}
+		} else if crewName := os.Getenv("GT_CREW"); crewName != "" && rigName != "" {
+			crewClone := filepath.Join(townRoot, rigName, "crew", crewName)
+			if _, err := os.Stat(crewClone); err == nil {
+				cwd = crewClone
+			}
+		}
 	}
 
 	// Initialize git - use cwd if available, otherwise use rig's mayor clone
@@ -415,14 +436,68 @@ func runDone(cmd *cobra.Command, args []string) error {
 		// bypassing the MR/refinery flow (G20 root cause).
 		fmt.Printf("Pushing branch to remote...\n")
 		refspec := branch + ":" + branch
-		if err := g.Push("origin", refspec, false); err != nil {
-			// Non-fatal: record the error and skip to notifyWitness.
-			// The deferred session kill ensures the session still terminates.
+		pushErr := g.Push("origin", refspec, false)
+		if pushErr != nil {
+			// Primary push failed — try fallback from the bare repo (GH #1348).
+			// When polecat sessions are reused or worktrees are stale, the worktree's
+			// git context may be broken. But the branch always exists in the bare repo
+			// (.repo.git) because worktree commits share the same object database.
+			style.PrintWarning("primary push failed: %v — trying bare repo fallback...", pushErr)
+			rigPath := filepath.Join(townRoot, rigName)
+			bareRepoPath := filepath.Join(rigPath, ".repo.git")
+			if _, statErr := os.Stat(bareRepoPath); statErr == nil {
+				bareGit := git.NewGitWithDir(bareRepoPath, "")
+				pushErr = bareGit.Push("origin", refspec, false)
+				if pushErr != nil {
+					style.PrintWarning("bare repo push also failed: %v", pushErr)
+				} else {
+					fmt.Printf("%s Branch pushed via bare repo fallback\n", style.Bold.Render("✓"))
+				}
+			} else {
+				// No bare repo — try mayor/rig as last resort
+				mayorPath := filepath.Join(rigPath, "mayor", "rig")
+				if _, statErr := os.Stat(mayorPath); statErr == nil {
+					mayorGit := git.NewGit(mayorPath)
+					pushErr = mayorGit.Push("origin", refspec, false)
+					if pushErr != nil {
+						style.PrintWarning("mayor/rig push also failed: %v", pushErr)
+					} else {
+						fmt.Printf("%s Branch pushed via mayor/rig fallback\n", style.Bold.Render("✓"))
+					}
+				}
+			}
+		}
+
+		if pushErr != nil {
+			// All push attempts failed
 			pushFailed = true
-			errMsg := fmt.Sprintf("push failed for branch '%s': %v", branch, err)
+			errMsg := fmt.Sprintf("push failed for branch '%s': %v", branch, pushErr)
 			doneErrors = append(doneErrors, errMsg)
 			style.PrintWarning("%s\nCommits exist locally but failed to push. Witness will be notified.", errMsg)
 			goto notifyWitness
+		}
+
+		// Verify the branch actually exists on remote (GH #1348).
+		// Push can return exit 0 without actually pushing (e.g., stale refs,
+		// worktree/bare-repo state mismatch). Verify before creating MR bead.
+		if exists, verifyErr := g.RemoteBranchExists("origin", branch); verifyErr != nil {
+			style.PrintWarning("could not verify push: %v (proceeding optimistically)", verifyErr)
+		} else if !exists {
+			// Push "succeeded" but branch not on remote — try bare repo verification
+			// (worktree git may not see the pushed ref)
+			rigPath := filepath.Join(townRoot, rigName)
+			bareRepoPath := filepath.Join(rigPath, ".repo.git")
+			if _, statErr := os.Stat(bareRepoPath); statErr == nil {
+				bareGit := git.NewGitWithDir(bareRepoPath, "")
+				exists, verifyErr = bareGit.RemoteBranchExists("origin", branch)
+			}
+			if verifyErr != nil || !exists {
+				pushFailed = true
+				errMsg := fmt.Sprintf("push appeared to succeed but branch '%s' not found on remote", branch)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nThis may indicate a stale git context. Witness will be notified.", errMsg)
+				goto notifyWitness
+			}
 		}
 		fmt.Printf("%s Branch pushed to origin\n", style.Bold.Render("✓"))
 
@@ -708,7 +783,7 @@ notifyWitness:
 		// All exit types kill the session - "done means gone"
 		fmt.Printf("%s Terminating session (done means gone)\n", style.Bold.Render("→"))
 		if err := selfKillSession(townRoot, roleInfo); err != nil {
-			// If session kill fails, fall through to os.Exit
+			// If session kill fails, fall through to normal exit
 			style.PrintWarning("session kill failed: %v", err)
 		} else {
 			sessionKilled = true // Prevent deferred kill from double-killing
@@ -723,9 +798,7 @@ notifyWitness:
 		fmt.Printf("  Witness will handle cleanup.\n")
 	}
 	fmt.Printf("  Goodbye!\n")
-	os.Exit(0)
-
-	return nil // unreachable, but keeps compiler happy
+	return NewSilentExit(0)
 }
 
 // setDoneIntentLabel writes a done-intent:<type>:<unix-ts> label on the agent bead

@@ -38,6 +38,12 @@ Auto-Convoy:
   gt sling gt-abc gastown              # Creates "Work: <issue-title>" convoy
   gt sling gt-abc gastown --no-convoy  # Skip auto-convoy creation
 
+Merge Strategy (--merge):
+  Controls how completed work lands. Stored on the auto-convoy.
+  gt sling gt-abc gastown --merge=direct  # Push branch directly to main
+  gt sling gt-abc gastown --merge=mr      # Merge queue (default)
+  gt sling gt-abc gastown --merge=local   # Keep on feature branch
+
 Target Resolution:
   gt sling gt-abc                       # Self (current agent)
   gt sling gt-abc crew                  # Crew worker in current rig
@@ -112,7 +118,9 @@ var (
 	slingAccount       string // --account: Claude Code account handle to use
 	slingAgent         string // --agent: override runtime agent for this sling/spawn
 	slingNoConvoy      bool   // --no-convoy: skip auto-convoy creation
+	slingOwned         bool   // --owned: mark auto-convoy as caller-managed lifecycle
 	slingNoMerge       bool   // --no-merge: skip merge queue on completion (for upstream PRs/human review)
+	slingMerge         string // --merge: merge strategy for convoy (direct/mr/local)
 	slingNoBoot        bool   // --no-boot: skip wakeRigAgents (avoid witness/refinery boot and lock contention)
 	slingMaxConcurrent int    // --max-concurrent: limit concurrent spawns in batch mode
 	slingBaseBranch    string // --base-branch: override base branch for polecat worktree
@@ -133,8 +141,10 @@ func init() {
 	slingCmd.Flags().StringVar(&slingAccount, "account", "", "Claude Code account handle to use")
 	slingCmd.Flags().StringVar(&slingAgent, "agent", "", "Override agent/runtime for this sling (e.g., claude, gemini, codex, or custom alias)")
 	slingCmd.Flags().BoolVar(&slingNoConvoy, "no-convoy", false, "Skip auto-convoy creation for single-issue sling")
+	slingCmd.Flags().BoolVar(&slingOwned, "owned", false, "Mark auto-convoy as caller-managed lifecycle (no automatic witness/refinery registration)")
 	slingCmd.Flags().BoolVar(&slingHookRawBead, "hook-raw-bead", false, "Hook raw bead without default formula (expert mode)")
 	slingCmd.Flags().BoolVar(&slingNoMerge, "no-merge", false, "Skip merge queue on completion (keep work on feature branch for review)")
+	slingCmd.Flags().StringVar(&slingMerge, "merge", "", "Merge strategy: direct (push to main), mr (merge queue, default), local (keep on branch)")
 	slingCmd.Flags().BoolVar(&slingNoBoot, "no-boot", false, "Skip rig boot after polecat spawn (avoids witness/refinery lock contention)")
 	slingCmd.Flags().IntVar(&slingMaxConcurrent, "max-concurrent", 0, "Limit concurrent polecat spawns in batch mode (0 = no limit)")
 	slingCmd.Flags().StringVar(&slingBaseBranch, "base-branch", "", "Override base branch for polecat worktree (e.g., 'develop', 'release/v2')")
@@ -148,11 +158,29 @@ func runSling(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("polecats cannot sling (use gt done for handoff)")
 	}
 
+	// Validate --merge flag if provided
+	if slingMerge != "" {
+		switch slingMerge {
+		case "direct", "mr", "local":
+			// Valid
+		default:
+			return fmt.Errorf("invalid --merge value %q: must be direct, mr, or local", slingMerge)
+		}
+	}
+
 	// Disable Dolt auto-commit for all bd commands run during sling (gt-u6n6a).
 	// Under concurrent load (batch slinging), auto-commits from individual bd writes
 	// cause manifest contention and 'database is read only' errors. The Dolt server
 	// handles commits — individual auto-commits are unnecessary.
+	prevAutoCommit := os.Getenv("BD_DOLT_AUTO_COMMIT")
 	os.Setenv("BD_DOLT_AUTO_COMMIT", "off")
+	defer func() {
+		if prevAutoCommit == "" {
+			os.Unsetenv("BD_DOLT_AUTO_COMMIT")
+		} else {
+			os.Setenv("BD_DOLT_AUTO_COMMIT", prevAutoCommit)
+		}
+	}()
 
 	// Handle --stdin: read message/args from stdin (avoids shell quoting issues)
 	if slingStdin {
@@ -249,14 +277,15 @@ func runSling(cmd *cobra.Command, args []string) error {
 	}
 	originalStatus := info.Status
 	originalAssignee := info.Assignee
-	if (info.Status == "pinned" || info.Status == "hooked") && !slingForce {
+	force := slingForce // local copy to avoid mutating package-level flag
+	if (info.Status == "pinned" || info.Status == "hooked") && !force {
 		// Auto-force when hooked agent's session is confirmed dead (gt-pqf9x).
 		// This eliminates the #1 friction in convoy feeding: stale hooks from
 		// dead polecats blocking re-sling without --force.
 		if info.Status == "hooked" && info.Assignee != "" && isHookedAgentDead(info.Assignee) {
 			fmt.Printf("%s Hooked agent %s has no active session, auto-forcing re-sling...\n",
 				style.Warning.Render("⚠"), info.Assignee)
-			slingForce = true
+			force = true
 		} else {
 			assignee := info.Assignee
 			if assignee == "" {
@@ -273,7 +302,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 	}
 	resolved, err := resolveTarget(target, ResolveTargetOptions{
 		DryRun:     slingDryRun,
-		Force:      slingForce,
+		Force:      force,
 		Create:     slingCreate,
 		Account:    slingAccount,
 		Agent:      slingAgent,
@@ -302,7 +331,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 	// Cross-rig guard: prevent slinging beads to polecats in the wrong rig (gt-myecw).
 	// Polecats work in their rig's worktree and cannot fix code owned by another rig.
 	// Skip for self-sling (user knows what they're doing) and --force overrides.
-	if strings.Contains(targetAgent, "/polecats/") && !slingForce && !isSelfSling {
+	if strings.Contains(targetAgent, "/polecats/") && !force && !isSelfSling {
 		if err := checkCrossRigGuard(beadID, targetAgent, townRoot); err != nil {
 			return err
 		}
@@ -316,7 +345,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 	}
 
 	// Handle --force when bead is already hooked: send shutdown to old polecat and unhook
-	if info.Status == "hooked" && slingForce && info.Assignee != "" {
+	if info.Status == "hooked" && force && info.Assignee != "" {
 		fmt.Printf("%s Bead already hooked to %s, forcing reassignment...\n", style.Warning.Render("⚠"), info.Assignee)
 
 		// Determine requester identity from env vars, fall back to "gt-sling"
@@ -369,14 +398,23 @@ func runSling(cmd *cobra.Command, args []string) error {
 			if slingDryRun {
 				fmt.Printf("Would create convoy 'Work: %s'\n", info.Title)
 				fmt.Printf("Would add tracking relation to %s\n", beadID)
+				if slingMerge != "" {
+					fmt.Printf("Would set convoy merge strategy: %s\n", slingMerge)
+				}
 			} else {
-				convoyID, err := createAutoConvoy(beadID, info.Title)
+				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge)
 				if err != nil {
 					// Log warning but don't fail - convoy is optional
 					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 				} else {
 					fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
 					fmt.Printf("  Tracking: %s\n", beadID)
+					if slingOwned {
+						fmt.Printf("  Lifecycle: caller-managed (owned)\n")
+					}
+					if slingMerge != "" {
+						fmt.Printf("  Merge:    %s\n", slingMerge)
+					}
 				}
 			}
 		} else {
@@ -435,7 +473,7 @@ func runSling(cmd *cobra.Command, args []string) error {
 				rollbackSlingArtifactsFn(newPolecatInfo, beadID, hookWorkDir)
 				// Under --force, if this bead was previously pinned, rollback's unhook would otherwise
 				// clear the pinned state. Restore pinned state so we don't lose the original hook.
-				if slingForce && originalStatus == "pinned" {
+				if force && originalStatus == "pinned" {
 					restorePinnedBead(townRoot, beadID, originalAssignee)
 				}
 			}

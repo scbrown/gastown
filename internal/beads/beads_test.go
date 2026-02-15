@@ -50,6 +50,38 @@ func TestCreateOptions(t *testing.T) {
 	}
 }
 
+// TestIsFlagLikeTitle verifies flag-like title detection (gt-e0kx5).
+func TestIsFlagLikeTitle(t *testing.T) {
+	tests := []struct {
+		title string
+		want  bool
+	}{
+		// Flag-like (should be rejected)
+		{"--help", true},
+		{"--json", true},
+		{"--verbose", true},
+		{"-h", true},
+		{"-v", true},
+		{"--dry-run", true},
+		{"--type=task", true},
+
+		// Normal titles (should be allowed)
+		{"Fix bug in parser", false},
+		{"Add --help flag handling", false},
+		{"Fix --help flag parsing", false},
+		{"", false},
+		{"hello", false},
+		{"- list item", false}, // single dash with space is fine (markdown)
+	}
+
+	for _, tt := range tests {
+		got := IsFlagLikeTitle(tt.title)
+		if got != tt.want {
+			t.Errorf("IsFlagLikeTitle(%q) = %v, want %v", tt.title, got, tt.want)
+		}
+	}
+}
+
 // TestUpdateOptions verifies UpdateOptions pointer fields.
 func TestUpdateOptions(t *testing.T) {
 	status := "in_progress"
@@ -76,11 +108,9 @@ func TestIsBeadsRepo(t *testing.T) {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	b := New(tmpDir)
-	// This should return false since there's no .beads directory
-	// and bd list will fail
+	// Should return false since there's no .beads directory
 	if b.IsBeadsRepo() {
-		// This might pass if bd handles missing .beads gracefully
-		t.Log("IsBeadsRepo returned true for non-beads directory (bd might initialize)")
+		t.Error("IsBeadsRepo returned true for non-beads directory")
 	}
 }
 
@@ -1111,6 +1141,15 @@ func TestParseAgentBeadID(t *testing.T) {
 		{"gt-gastown-polecat-capable", "gastown", "polecat", "capable", true},
 		// Names with hyphens
 		{"gt-gastown-polecat-my-agent", "gastown", "polecat", "my-agent", true},
+		// Worker name collides with role keyword
+		{"gt-gastown-polecat-witness", "gastown", "polecat", "witness", true},
+		{"gt-gastown-polecat-refinery", "gastown", "polecat", "refinery", true},
+		{"gt-gastown-crew-witness", "gastown", "crew", "witness", true},
+		{"gt-gastown-crew-refinery", "gastown", "crew", "refinery", true},
+		{"gt-gastown-polecat-crew", "gastown", "polecat", "crew", true},
+		{"gt-gastown-crew-polecat", "gastown", "crew", "polecat", true},
+		// Worker name collides with role keyword + hyphenated rig
+		{"gt-my-rig-polecat-witness", "my-rig", "polecat", "witness", true},
 		// Parseable but not valid agent roles (IsAgentSessionBead will reject)
 		{"gt-abc123", "", "abc123", "", true}, // Parses as town-level but not valid role
 		// Other prefixes (bd-, hq-)

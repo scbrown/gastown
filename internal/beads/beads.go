@@ -21,7 +21,22 @@ import (
 var (
 	ErrNotInstalled = errors.New("bd not installed: run 'pip install beads-cli' or see https://github.com/anthropics/beads")
 	ErrNotFound     = errors.New("issue not found")
+	ErrFlagTitle    = errors.New("title looks like a CLI flag (starts with '-'); use --title=\"...\" to set flag-like titles intentionally")
 )
+
+// IsFlagLikeTitle returns true if the title looks like it was accidentally set
+// from a CLI flag (e.g., "--help", "--json", "-v"). This catches a common
+// mistake where `bd create --title --help` consumes --help as the title value
+// instead of showing help. Titles with spaces (e.g., "Fix --help handling")
+// are allowed since they're clearly intentional multi-word titles.
+func IsFlagLikeTitle(title string) bool {
+	if !strings.HasPrefix(title, "-") {
+		return false
+	}
+	// Single-word flag-like strings: "--help", "-h", "--json", "--verbose"
+	// Multi-word titles with flags embedded are fine: "Fix --help handling"
+	return !strings.Contains(title, " ")
+}
 
 // Issue represents a beads issue.
 type Issue struct {
@@ -502,6 +517,11 @@ func (b *Beads) Blocked() ([]*Issue, error) {
 // If opts.Actor is empty, it defaults to the BD_ACTOR environment variable.
 // This ensures created_by is populated for issue provenance tracking.
 func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(opts.Title) {
+		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
 	args := []string{"create", "--json"}
 
 	if opts.Title != "" {
@@ -550,6 +570,11 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 // This is useful for agent beads, role beads, and other beads that need
 // deterministic IDs rather than auto-generated ones.
 func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(opts.Title) {
+		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
 	args := []string{"create", "--json", "--id=" + id}
 	if NeedsForceForID(id) {
 		args = append(args, "--force")

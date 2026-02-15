@@ -2,6 +2,7 @@
 package polecat
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,8 @@ func debugSession(context string, err error) {
 		fmt.Fprintf(os.Stderr, "[session-debug] %s: %v\n", context, err)
 	}
 }
+
+const bdCommandTimeout = 30 * time.Second
 
 // Session errors
 var (
@@ -597,7 +600,9 @@ func (m *SessionManager) resolveBeadsDir(issueID, fallbackDir string) string {
 func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	bdWorkDir := m.resolveBeadsDir(issueID, workDir)
 
-	cmd := exec.Command("bd", "show", issueID, "--json") //nolint:gosec
+	ctx, cancel := context.WithTimeout(context.Background(), bdCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", "show", issueID, "--json") //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = bdWorkDir
 	output, err := cmd.Output()
 	if err != nil {
@@ -623,7 +628,9 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 func (m *SessionManager) hookIssue(issueID, agentID, workDir string) error {
 	bdWorkDir := m.resolveBeadsDir(issueID, workDir)
 
-	cmd := exec.Command("bd", "update", issueID, "--status=hooked", "--assignee="+agentID) //nolint:gosec
+	ctx, cancel := context.WithTimeout(context.Background(), bdCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", "update", issueID, "--status=hooked", "--assignee="+agentID) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = bdWorkDir
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

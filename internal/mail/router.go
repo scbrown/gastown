@@ -328,25 +328,45 @@ func agentBeadToAddress(bead *agentBead) string {
 		return parseRigAgentAddress(bead)
 	}
 
+	// Agent bead IDs include the role explicitly: gt-<rig>-<role>[-<name>]
+	// Scan from right for known role markers to handle hyphenated rig names.
 	parts := strings.Split(rest, "-")
 
-	switch len(parts) {
-	case 1:
+	if len(parts) == 1 {
 		// Town-level: gt-mayor, gt-deacon
 		return parts[0] + "/"
-	case 2:
-		// Rig singleton: gt-gastown-witness
-		return parts[0] + "/" + parts[1]
-	default:
-		// Rig named agent: gt-gastown-crew-max, gt-gastown-polecat-Toast
-		// Skip the role part (parts[1]) and use rig/name format
-		if len(parts) >= 3 {
-			// Rejoin if name has hyphens: gt-gastown-polecat-my-agent
-			name := strings.Join(parts[2:], "-")
-			return parts[0] + "/" + name
-		}
-		return ""
 	}
+
+	// Scan from right for known role markers
+	for i := len(parts) - 1; i >= 1; i-- {
+		switch parts[i] {
+		case "witness", "refinery":
+			// Singleton role: rig is everything before the role
+			rig := strings.Join(parts[:i], "-")
+			return rig + "/" + parts[i]
+		case "crew", "polecat":
+			// Named role: rig is before role, name is after (skip role in address)
+			rig := strings.Join(parts[:i], "-")
+			if i+1 < len(parts) {
+				name := strings.Join(parts[i+1:], "-")
+				return rig + "/" + name
+			}
+			return rig + "/"
+		case "dog":
+			// Town-level named: gt-dog-alpha
+			if i+1 < len(parts) {
+				name := strings.Join(parts[i+1:], "-")
+				return "dog/" + name
+			}
+			return "dog/"
+		}
+	}
+
+	// Fallback: assume first part is rig, rest is role/name
+	if len(parts) == 2 {
+		return parts[0] + "/" + parts[1]
+	}
+	return ""
 }
 
 // parseRigAgentAddress extracts address from a rig-prefixed agent bead.
@@ -354,6 +374,7 @@ func agentBeadToAddress(bead *agentBead) string {
 // Examples:
 //   - ppf-pyspark_pipeline_framework-witness → pyspark_pipeline_framework/witness
 //   - ppf-pyspark_pipeline_framework-polecat-Toast → pyspark_pipeline_framework/Toast
+//   - bd-beads-crew-beavis → beads/beavis
 func parseRigAgentAddress(bead *agentBead) string {
 	// Parse rig and role_type from description
 	var roleType, rig string
@@ -367,7 +388,10 @@ func parseRigAgentAddress(bead *agentBead) string {
 	}
 
 	if rig == "" || rig == "null" || roleType == "" || roleType == "null" {
-		return ""
+		// Fallback: parse from bead ID by scanning for known role markers.
+		// ID format: <prefix>-<rig>-<role>[-<name>]
+		// Known rig-level roles: crew, polecat, witness, refinery
+		return parseRigAgentAddressFromID(bead.ID)
 	}
 
 	// For singleton roles (witness, refinery), address is rig/role
@@ -389,6 +413,78 @@ func parseRigAgentAddress(bead *agentBead) string {
 
 	// Fallback: return rig/roleType (may not be correct for all cases)
 	return rig + "/" + roleType
+}
+
+// parseRigAgentAddressFromID extracts a mail address from a rig-prefixed bead ID
+// when the description metadata is missing. Scans for known role markers in the ID
+// to determine the rig name and agent name.
+//
+// ID format: <prefix>-<rig>-<role>[-<name>]
+//
+// Singleton roles (witness, refinery) must NOT have a name segment — IDs like
+// "bd-beads-witness-extra" are malformed and return "".
+//
+// Keep role lists in sync with beads.RigLevelRoles and beads.NamedRoles.
+func parseRigAgentAddressFromID(id string) string {
+	// Singleton roles: no name segment allowed
+	singletonRoles := []string{"witness", "refinery"}
+	// Named roles: require a name segment
+	namedRoles := []string{"crew", "polecat"}
+
+	for _, role := range namedRoles {
+		marker := "-" + role + "-"
+		if idx := strings.Index(id, marker); idx >= 0 {
+			// Everything between prefix- and -role- is the rig name.
+			// The prefix ends at the first hyphen: <prefix>-<rig>-...
+			// But prefix could be multi-char (bd, gt, ppf), so we find
+			// the rig as the substring between the first hyphen and the role marker.
+			firstHyphen := strings.Index(id, "-")
+			if firstHyphen < 0 || firstHyphen >= idx {
+				continue
+			}
+			rig := id[firstHyphen+1 : idx]
+			if rig == "" {
+				continue
+			}
+			name := id[idx+len(marker):]
+			if name != "" {
+				// Named role (crew, polecat): address is rig/name
+				return rig + "/" + name
+			}
+			// crew/polecat without a name — malformed, skip
+			continue
+		}
+	}
+
+	for _, role := range singletonRoles {
+		// Singleton roles match only at end of ID: <prefix>-<rig>-<role>
+		// Reject if a name segment follows (e.g. -witness-extra is malformed).
+		marker := "-" + role + "-"
+		if strings.Contains(id, marker) {
+			// Has a name segment after the role — malformed singleton
+			continue
+		}
+
+		suffix := "-" + role
+		if strings.HasSuffix(id, suffix) {
+			// Find rig between first hyphen and the suffix
+			firstHyphen := strings.Index(id, "-")
+			if firstHyphen < 0 {
+				continue
+			}
+			suffixStart := len(id) - len(suffix)
+			if firstHyphen >= suffixStart {
+				continue
+			}
+			rig := id[firstHyphen+1 : suffixStart]
+			if rig == "" {
+				continue
+			}
+			return rig + "/" + role
+		}
+	}
+
+	return ""
 }
 
 // parseAgentAddressFromDescription extracts agent address from description metadata.
@@ -791,8 +887,10 @@ func (r *Router) sendToSingle(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=<recipient> -d <body> --labels=gt:message,...
-	args := []string{"create", msg.Subject,
+	// Build command: bd create --assignee=<recipient> -d <body> --labels=gt:message,... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags (see web/api.go).
+	args := []string{"create",
 		"--assignee", toIdentity,
 		"-d", msg.Body,
 	}
@@ -813,6 +911,10 @@ func (r *Router) sendToSingle(msg *Message) error {
 	if r.shouldBeWisp(msg) {
 		args = append(args, "--ephemeral")
 	}
+
+	// End flag parsing with --, then add subject as positional argument.
+	// This prevents subjects like "--help" or "--json" from being parsed as flags.
+	args = append(args, "--", msg.Subject)
 
 	beadsDir := r.resolveBeadsDir(msg.To)
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
@@ -903,9 +1005,11 @@ func (r *Router) sendToQueue(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=queue:<name> -d <body>
+	// Build command: bd create --assignee=queue:<name> -d <body> ... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags.
 	// Use queue:<name> as assignee so inbox queries can filter by queue
-	args := []string{"create", msg.Subject,
+	args := []string{"create",
 		"--assignee", msg.To, // queue:name
 		"-d", msg.Body,
 	}
@@ -924,6 +1028,9 @@ func (r *Router) sendToQueue(msg *Message) error {
 
 	// Queue messages are never ephemeral - they need to persist until claimed
 	// (deliberately not checking shouldBeWisp)
+
+	// End flag parsing, then subject as positional argument
+	args = append(args, "--", msg.Subject)
 
 	// Queue messages go to town-level beads (shared location)
 	beadsDir := r.resolveBeadsDir("")
@@ -979,9 +1086,11 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=announce:<name> -d <body>
+	// Build command: bd create --assignee=announce:<name> -d <body> ... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags.
 	// Use announce:<name> as assignee so queries can filter by channel
-	args := []string{"create", msg.Subject,
+	args := []string{"create",
 		"--assignee", msg.To, // announce:name
 		"-d", msg.Body,
 	}
@@ -1000,6 +1109,9 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 
 	// Announce messages are never ephemeral - they need to persist for readers
 	// (deliberately not checking shouldBeWisp)
+
+	// End flag parsing, then subject as positional argument
+	args = append(args, "--", msg.Subject)
 
 	// Announce messages go to town-level beads (shared location)
 	beadsDir := r.resolveBeadsDir("")
@@ -1057,9 +1169,11 @@ func (r *Router) sendToChannel(msg *Message) error {
 		labels = append(labels, "cc:"+ccIdentity)
 	}
 
-	// Build command: bd create <subject> --assignee=channel:<name> -d <body>
+	// Build command: bd create --assignee=channel:<name> -d <body> ... -- <subject>
+	// Flags go first, then -- to end flag parsing, then the positional subject.
+	// This prevents subjects like "--help" from being parsed as flags.
 	// Use channel:<name> as assignee so queries can filter by channel
-	args := []string{"create", msg.Subject,
+	args := []string{"create",
 		"--assignee", msg.To, // channel:name
 		"-d", msg.Body,
 	}
@@ -1078,6 +1192,9 @@ func (r *Router) sendToChannel(msg *Message) error {
 
 	// Channel messages are never ephemeral - they persist according to retention policy
 	// (deliberately not checking shouldBeWisp)
+
+	// End flag parsing, then subject as positional argument
+	args = append(args, "--", msg.Subject)
 
 	// Channel messages go to town-level beads (shared location)
 	beadsDir := r.resolveBeadsDir("")

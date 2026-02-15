@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/claude"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/templates/commands"
 )
 
 // Common errors
@@ -442,26 +444,34 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			fmt.Printf("  Using prefix '%s' for tracked beads (no existing issues to detect from)\n", opts.BeadsPrefix)
 		}
 
-		// Initialize bd database if it doesn't exist.
+		// Initialize bd database if runtime files are missing.
 		// DB files are gitignored so they won't exist after clone — bd init creates them.
 		// bd init --prefix will create the database and auto-import from issues.jsonl.
+		//
+		// Note: bdDatabaseExists checks for metadata.json which may be tracked in git.
+		// When metadata.json exists but the Dolt server database doesn't (fresh clone
+		// to a new workspace), we still need to run bd init to create the server-side
+		// database and set issue_prefix. Always ensure issue_prefix is set afterward.
 		if !bdDatabaseExists(sourceBeadsDir) {
 			cmd := exec.Command("bd", "init", "--prefix", opts.BeadsPrefix, "--backend", "dolt", "--server") // opts.BeadsPrefix validated earlier
 			cmd.Dir = mayorRigPath
 			if output, err := cmd.CombinedOutput(); err != nil {
 				fmt.Printf("  Warning: Could not init bd database: %v (%s)\n", err, strings.TrimSpace(string(output)))
 			}
-			// Configure custom types for Gas Town (beads v0.46.0+)
-			configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
-			configCmd.Dir = mayorRigPath
-			_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
+		}
 
-			// Explicitly set issue_prefix config (bd init --prefix may not persist it in newer versions).
-			prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
-			prefixSetCmd.Dir = mayorRigPath
-			if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
-				fmt.Printf("  Warning: Could not set issue_prefix: %v (%s)\n", prefixErr, strings.TrimSpace(string(prefixOutput)))
-			}
+		// Always ensure issue_prefix and custom types are configured, even when
+		// metadata.json was tracked in git (bdDatabaseExists returned true).
+		// The tracked metadata.json tells bd HOW to connect but doesn't guarantee
+		// the server-side database has issue_prefix set for this workspace.
+		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
+		configCmd.Dir = mayorRigPath
+		_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
+
+		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
+		prefixSetCmd.Dir = mayorRigPath
+		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
+			fmt.Printf("  Warning: Could not set issue_prefix: %v (%s)\n", prefixErr, strings.TrimSpace(string(prefixOutput)))
 		}
 	}
 
@@ -477,14 +487,45 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	}
 	fmt.Printf("   ✓ Initialized beads (prefix: %s)\n", opts.BeadsPrefix)
 
-	// Ensure metadata.json has dolt_mode=server and dolt_database=<rigName>.
+	// Ensure metadata.json has dolt_mode=server and the correct dolt_database.
 	// bd init --server sets dolt_mode but not dolt_database. EnsureMetadata
 	// writes both fields so bd connects to the correct centralized database.
-	if err := doltserver.EnsureMetadata(m.townRoot, opts.Name); err != nil {
+	//
+	// Rigs with tracked beads (redirect to mayor/rig/.beads) get their own database.
+	// Rigs without tracked beads share the HQ database so that beads dispatched
+	// from HQ (e.g., molecules, assigned work) are visible to bd ready/list.
+	// Without this, a new rig's empty database causes hook resolution and
+	// bd ready to fail (see gt-42zaq).
+	redirectPath := filepath.Join(rigPath, ".beads", "redirect")
+	doltDatabase := opts.Name
+	if _, err := os.Stat(redirectPath); os.IsNotExist(err) {
+		// No redirect = no tracked beads from source repo.
+		// Share HQ database so dispatched beads are queryable.
+		doltDatabase = "hq"
+		fmt.Printf("   ℹ No tracked beads — sharing HQ database\n")
+	}
+	if err := doltserver.EnsureMetadataWithDB(m.townRoot, opts.Name, doltDatabase); err != nil {
 		// Non-fatal: daemon's EnsureAllMetadata self-heals on next startup,
 		// or user can run gt doctor --fix to repair manually.
 		fmt.Printf("  Warning: Could not set Dolt server metadata: %v\n", err)
 		fmt.Printf("  Run 'gt doctor --fix' to repair, or it will self-heal on next daemon start.\n")
+	}
+
+	// Auto-create DoltHub remote for the rig's beads database.
+	// Requires DOLTHUB_TOKEN and DOLTHUB_ORG environment variables.
+	// Non-fatal: sync will work without a remote; user can add one manually later.
+	if token := doltserver.DoltHubToken(); token != "" {
+		if org := doltserver.DoltHubOrg(); org != "" {
+			dbName := "beads_" + opts.Name
+			dbDir := doltserver.RigDatabaseDir(m.townRoot, dbName)
+			fmt.Printf("  Setting up DoltHub remote for %s/%s...\n", org, doltserver.DoltHubRepoName(dbName))
+			if err := doltserver.SetupDoltHubRemote(dbDir, org, dbName, token); err != nil {
+				fmt.Printf("  Warning: DoltHub remote setup failed: %v\n", err)
+				fmt.Printf("  You can set up the remote manually later with 'gt dolt sync'.\n")
+			} else {
+				fmt.Printf("   ✓ DoltHub remote configured and initial push complete\n")
+			}
+		}
 	}
 
 	// Provision PRIME.md with Gas Town context for all workers in this rig.
@@ -563,14 +604,46 @@ Use crew for your own workspace. Polecats are for batch work dispatch.
 	// NOTE: Witness hooks are installed by witness/manager.go:Start() via EnsureSettingsForRole.
 	// No need to create patrol hooks here — agents self-install at startup.
 
-	// Create polecats directory (empty)
+	// Create polecats directory with .claude/ settings scaffold.
+	// Settings are passed to Claude Code via --settings flag at session start.
+	// Scaffolding them here ensures the settings file exists before the first
+	// polecat session starts, preventing startup failures from missing hooks.
 	polecatsPath := filepath.Join(rigPath, "polecats")
 	if err := os.MkdirAll(polecatsPath, 0755); err != nil {
 		return nil, fmt.Errorf("creating polecats dir: %w", err)
 	}
-	// NOTE: Runtime settings are installed by each agent in their working directory at startup
-	// via EnsureSettingsForRole. Claude Code does NOT traverse parent directories for settings,
-	// so installing them here (at witness/, refinery/, crew/, polecats/) would create dead files.
+	if err := claude.EnsureSettingsForRole(polecatsPath, "polecat"); err != nil {
+		// Non-fatal: session startup will retry via EnsureSettingsForRole
+		fmt.Printf("  %s Could not scaffold polecat settings: %v\n", "!", err)
+	}
+	if err := commands.ProvisionFor(polecatsPath, "claude"); err != nil {
+		// Non-fatal: commands are convenience, not critical
+		fmt.Printf("  %s Could not scaffold polecat commands: %v\n", "!", err)
+	}
+
+	// Register route in town-level routes.jsonl BEFORE creating agent beads.
+	// initAgentBeads calls ResolveRoutingTarget which needs the route to exist.
+	// Without this, agent bead creation logs "no route found" warnings (#1424).
+	if opts.BeadsPrefix != "" {
+		routePath := opts.Name
+		mayorRigBeads := filepath.Join(rigPath, "mayor", "rig", ".beads")
+		if _, err := os.Stat(mayorRigBeads); err == nil {
+			routePath = opts.Name + "/mayor/rig"
+		}
+		route := beads.Route{
+			Prefix: opts.BeadsPrefix + "-",
+			Path:   routePath,
+		}
+		if err := beads.AppendRoute(m.townRoot, route); err != nil {
+			fmt.Printf("  Warning: Could not update routes.jsonl: %v\n", err)
+		}
+	}
+
+	// Create rig-level settings directory (used by gt config for rig overrides)
+	rigSettingsPath := filepath.Join(rigPath, constants.DirSettings)
+	if err := os.MkdirAll(rigSettingsPath, 0755); err != nil {
+		return nil, fmt.Errorf("creating settings dir: %w", err)
+	}
 
 	// Create rig-level agent beads (witness, refinery) in rig beads.
 	// Town-level agents (mayor, deacon) are created by gt install in town beads.
@@ -923,14 +996,44 @@ func isStandardBeadHash(s string) bool {
 	return true
 }
 
-// bdDatabaseExists checks if a beads directory has an initialized database.
-// Checks for Dolt metadata (the standard backend).
+// bdDatabaseExists checks if a beads directory has an initialized database
+// that is actually usable (not just tracked metadata from another workspace).
+//
+// For Dolt server mode, metadata.json may be tracked in git with dolt_database
+// pointing to a database that doesn't exist on this Dolt server. In that case,
+// we need to run bd init to create the server-side database.
 func bdDatabaseExists(beadsDir string) bool {
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
-	if _, err := os.Stat(metadataPath); err == nil {
-		return true
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return false
 	}
-	return false
+
+	// Parse metadata to check if the referenced Dolt database actually exists.
+	var meta struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return true // Can't parse — assume it exists (backward compat)
+	}
+
+	// For server mode, verify the database exists in .dolt-data/.
+	// metadata.json may be tracked in git from another workspace where
+	// the Dolt server had this database, but this is a fresh server.
+	if meta.DoltMode == "server" && meta.DoltDatabase != "" {
+		// Walk up from beadsDir to find the town root (.dolt-data lives there).
+		townRoot := beads.FindTownRoot(filepath.Dir(beadsDir))
+		if townRoot == "" {
+			return true // Can't find town root — assume it exists
+		}
+		dbDir := filepath.Join(townRoot, ".dolt-data", meta.DoltDatabase)
+		if _, err := os.Stat(dbDir); os.IsNotExist(err) {
+			return false // Database doesn't exist on this server
+		}
+	}
+
+	return true
 }
 
 // When adding a rig from a source repo that has .beads/ tracked in git (like a project

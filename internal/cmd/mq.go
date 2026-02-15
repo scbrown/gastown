@@ -347,11 +347,19 @@ func findCurrentRig(townRoot string) (string, *rig.Rig, error) {
 
 	// The first component of the relative path should be the rig name
 	parts := strings.Split(relPath, string(filepath.Separator))
-	if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
-		return "", nil, fmt.Errorf("not inside a rig directory")
+	rigName := ""
+	if len(parts) > 0 && parts[0] != "" && parts[0] != "." {
+		rigName = parts[0]
 	}
 
-	rigName := parts[0]
+	// When gt is invoked via shell alias (cd ~/gt && gt), cwd is the town
+	// root and relPath is ".". Fall back to GT_RIG env var.
+	if rigName == "" {
+		rigName = os.Getenv("GT_RIG")
+	}
+	if rigName == "" {
+		return "", nil, fmt.Errorf("not inside a rig directory (and GT_RIG not set)")
+	}
 
 	// Load rig manager and get the rig
 	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")

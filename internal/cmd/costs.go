@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -640,50 +641,29 @@ func queryDigestBeads(days int) ([]CostEntry, error) {
 }
 
 // parseSessionName extracts role, rig, and worker from a session name.
-// Session names follow the pattern: gt-<rig>-<worker> or gt-<global-agent>
-// Examples:
-//   - gt-mayor -> role=mayor, rig="", worker="mayor"
-//   - gt-deacon -> role=deacon, rig="", worker="deacon"
-//   - gt-gastown-toast -> role=polecat, rig=gastown, worker=toast
-//   - gt-gastown-witness -> role=witness, rig=gastown, worker=""
-//   - gt-gastown-refinery -> role=refinery, rig=gastown, worker=""
-//   - gt-gastown-crew-joe -> role=crew, rig=gastown, worker=joe
-func parseSessionName(session string) (role, rig, worker string) {
-	// Remove gt- prefix
-	name := strings.TrimPrefix(session, constants.SessionPrefix)
+// Delegates to session.ParseSessionName for correct handling of hyphenated rig names.
+func parseSessionName(sess string) (role, rig, worker string) {
+	identity, err := session.ParseSessionName(sess)
+	if err != nil {
+		return "unknown", "", strings.TrimPrefix(sess, constants.SessionPrefix)
+	}
 
-	// Check for global agents
-	switch name {
-	case "mayor":
+	switch identity.Role {
+	case session.RoleMayor:
 		return constants.RoleMayor, "", "mayor"
-	case "deacon":
+	case session.RoleDeacon:
 		return constants.RoleDeacon, "", "deacon"
+	case session.RoleWitness:
+		return constants.RoleWitness, identity.Rig, ""
+	case session.RoleRefinery:
+		return constants.RoleRefinery, identity.Rig, ""
+	case session.RoleCrew:
+		return constants.RoleCrew, identity.Rig, identity.Name
+	case session.RolePolecat:
+		return constants.RolePolecat, identity.Rig, identity.Name
+	default:
+		return "unknown", identity.Rig, identity.Name
 	}
-
-	// Parse rig-based session: rig-worker or rig-crew-name
-	parts := strings.SplitN(name, "-", 3)
-	if len(parts) < 2 {
-		return "unknown", "", name
-	}
-
-	rig = parts[0]
-	worker = parts[1]
-
-	// Check for crew pattern: rig-crew-name
-	if worker == "crew" && len(parts) >= 3 {
-		return constants.RoleCrew, rig, parts[2]
-	}
-
-	// Check for special workers
-	switch worker {
-	case "witness":
-		return constants.RoleWitness, rig, ""
-	case "refinery":
-		return constants.RoleRefinery, rig, ""
-	}
-
-	// Default to polecat
-	return constants.RolePolecat, rig, worker
 }
 
 // extractCost finds the most recent cost value in pane content.

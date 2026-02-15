@@ -105,7 +105,11 @@ func HandlePolecatDone(workDir, rigName string, msg *mail.Message, router *mail.
 			mailID, err := sendMergeReady(router, rigName, payload)
 			if err != nil {
 				// Non-fatal - Refinery will still pick up work on next patrol cycle
-				result.Error = fmt.Errorf("sending MERGE_READY: %w (non-fatal)", err)
+				if result.Error != nil {
+					result.Error = fmt.Errorf("sending MERGE_READY: %w (also: %v)", err, result.Error)
+				} else {
+					result.Error = fmt.Errorf("sending MERGE_READY: %w (non-fatal)", err)
+				}
 			} else {
 				result.MailSent = mailID
 
@@ -459,6 +463,7 @@ func createCleanupWisp(workDir, polecatName, issueID, branch string) (string, er
 
 	output, err := util.ExecWithOutput(workDir, "bd", "create",
 		"--ephemeral",
+		"--json",
 		"--title", title,
 		"--description", description,
 		"--labels", labels,
@@ -467,21 +472,20 @@ func createCleanupWisp(workDir, polecatName, issueID, branch string) (string, er
 		return "", err
 	}
 
-	// Extract wisp ID from output (bd create outputs "Created: <id>")
+	// Parse JSON output from bd create --json
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(output), &created); err == nil && created.ID != "" {
+		return created.ID, nil
+	}
+
+	// Fallback: extract from "Created: <id>" format
 	if strings.HasPrefix(output, "Created:") {
 		return strings.TrimSpace(strings.TrimPrefix(output, "Created:")), nil
 	}
 
-	// Try to extract ID from output
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		// Look for bead ID pattern (e.g., "gt-abc123")
-		if strings.Contains(line, "-") && len(line) < 20 {
-			return line, nil
-		}
-	}
-
-	return output, nil
+	return "", fmt.Errorf("could not parse bead ID from bd create output: %q", output)
 }
 
 // createSwarmWisp creates a wisp to track swarm (batch) work.
@@ -583,9 +587,10 @@ func getCleanupStatus(workDir, rigName, polecatName string) string {
 	// Description format has "cleanup_status: <value>" line
 	for _, line := range strings.Split(issues[0].Description, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(line), "cleanup_status:") {
-			value := strings.TrimSpace(strings.TrimPrefix(line, "cleanup_status:"))
-			value = strings.TrimSpace(strings.TrimPrefix(value, "Cleanup_status:"))
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "cleanup_status:") {
+			// Use the lowercased version to ensure consistent prefix removal
+			value := strings.TrimSpace(strings.TrimPrefix(lower, "cleanup_status:"))
 			if value != "" && value != "null" {
 				return value
 			}
@@ -939,11 +944,12 @@ func verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 
 // ZombieResult describes a detected zombie polecat and the action taken.
 type ZombieResult struct {
-	PolecatName string
-	AgentState  string
-	HookBead    string
-	Action      string // "auto-nuked", "escalated", "cleanup-wisp-created"
-	Error       error
+	PolecatName   string
+	AgentState    string
+	HookBead      string
+	Action        string // "auto-nuked", "escalated", "cleanup-wisp-created"
+	BeadRecovered bool   // true if hooked bead was reset to open for re-dispatch
+	Error         error
 }
 
 // DetectZombiePolecatsResult contains the results of a zombie detection sweep.
@@ -1044,6 +1050,8 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 				if stuckHookBead != "" && getBeadStatus(workDir, stuckHookBead) == "closed" {
 					convoy.CheckConvoysForIssue(townRoot, stuckHookBead, "witness-zombie", nil)
 				}
+				// Reset abandoned bead for re-dispatch (gt-c3lgp)
+				zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, stuckHookBead, polecatName, router)
 				result.Zombies = append(result.Zombies, zombie)
 				continue
 			}
@@ -1069,6 +1077,8 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 				if deadAgentHookBead != "" && getBeadStatus(workDir, deadAgentHookBead) == "closed" {
 					convoy.CheckConvoysForIssue(townRoot, deadAgentHookBead, "witness-zombie", nil)
 				}
+				// Reset abandoned bead for re-dispatch (gt-c3lgp)
+				zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, deadAgentHookBead, polecatName, router)
 				result.Zombies = append(result.Zombies, zombie)
 			} else {
 				// Agent is alive. Check if the hooked bead has been closed.
@@ -1120,6 +1130,8 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 			if diHookBead != "" && getBeadStatus(workDir, diHookBead) == "closed" {
 				convoy.CheckConvoysForIssue(townRoot, diHookBead, "witness-zombie", nil)
 			}
+			// Reset abandoned bead for re-dispatch (gt-c3lgp)
+			zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, diHookBead, polecatName, router)
 			result.Zombies = append(result.Zombies, zombie)
 			continue
 		}
@@ -1231,6 +1243,9 @@ func DetectZombiePolecats(workDir, rigName string, router *mail.Router) *DetectZ
 			convoy.CheckConvoysForIssue(townRoot, hookBead, "witness-zombie", nil)
 		}
 
+		// Reset abandoned bead for re-dispatch (gt-c3lgp)
+		zombie.BeadRecovered = resetAbandonedBead(workDir, rigName, hookBead, polecatName, router)
+
 		result.Zombies = append(result.Zombies, zombie)
 	}
 
@@ -1274,6 +1289,49 @@ func getBeadStatus(workDir, beadID string) string {
 		return ""
 	}
 	return issues[0].Status
+}
+
+// resetAbandonedBead resets a dead polecat's hooked bead so it can be re-dispatched.
+// If the bead is in "hooked" or "in_progress" status, it:
+// 1. Resets status to open
+// 2. Clears assignee
+// 3. Sends mail to deacon for re-dispatch
+// Returns true if the bead was recovered.
+func resetAbandonedBead(workDir, rigName, hookBead, polecatName string, router *mail.Router) bool {
+	if hookBead == "" {
+		return false
+	}
+	status := getBeadStatus(workDir, hookBead)
+	if status != "hooked" && status != "in_progress" {
+		return false
+	}
+
+	// Reset bead status to open and clear assignee
+	if err := util.ExecRun(workDir, "bd", "update", hookBead, "--status=open", "--assignee="); err != nil {
+		return false
+	}
+
+	// Send mail to deacon for re-dispatch
+	if router != nil {
+		msg := &mail.Message{
+			From:     fmt.Sprintf("%s/witness", rigName),
+			To:       "deacon/",
+			Subject:  fmt.Sprintf("RECOVERED_BEAD %s", hookBead),
+			Priority: mail.PriorityHigh,
+			Body: fmt.Sprintf(`Recovered abandoned bead from dead polecat.
+
+Bead: %s
+Polecat: %s/%s
+Previous Status: %s
+
+The bead has been reset to open with no assignee.
+Please re-dispatch to an available polecat.`,
+				hookBead, rigName, polecatName, status),
+		}
+		_ = router.Send(msg) // Best-effort
+	}
+
+	return true
 }
 
 // DoneIntent represents a parsed done-intent label from an agent bead.

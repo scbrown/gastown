@@ -137,8 +137,15 @@ func convoyTracksBead(beadsDir, convoyID, beadID string) bool {
 }
 
 // createAutoConvoy creates an auto-convoy for a single issue and tracks it.
+// If owned is true, the convoy is marked with the gt:owned label for caller-managed lifecycle.
+// mergeStrategy is optional: "direct", "mr", or "local" (empty = default mr).
 // Returns the created convoy ID.
-func createAutoConvoy(beadID, beadTitle string) (string, error) {
+func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy string) (string, error) {
+	// Guard against flag-like titles propagating into convoy names (gt-e0kx5)
+	if beads.IsFlagLikeTitle(beadTitle) {
+		return "", fmt.Errorf("refusing to create convoy: bead title %q looks like a CLI flag", beadTitle)
+	}
+
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return "", fmt.Errorf("finding town root: %w", err)
@@ -153,6 +160,9 @@ func createAutoConvoy(beadID, beadTitle string) (string, error) {
 	// Create convoy with title "Work: <issue-title>"
 	convoyTitle := fmt.Sprintf("Work: %s", beadTitle)
 	description := fmt.Sprintf("Auto-created convoy tracking %s", beadID)
+	if mergeStrategy != "" {
+		description += fmt.Sprintf("\nMerge: %s", mergeStrategy)
+	}
 
 	createArgs := []string{
 		"create",
@@ -160,6 +170,9 @@ func createAutoConvoy(beadID, beadTitle string) (string, error) {
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
+	}
+	if owned {
+		createArgs = append(createArgs, "--labels=gt:owned")
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")

@@ -24,6 +24,10 @@ var primeState bool
 var primeStateJSON bool
 var primeExplain bool
 
+// primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
+// when running in hook mode. Used to provide lighter output on compaction/resume.
+var primeHookSource string
+
 // Role represents a detected agent role.
 type Role string
 
@@ -133,6 +137,13 @@ func runPrime(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Compact/resume: lighter prime that skips verbose role context.
+	// The agent already has role docs in compressed memory — just restore
+	// identity, hook status, and any new mail.
+	if isCompactResume() {
+		return runPrimeCompactResume(ctx, cwd)
+	}
+
 	if err := outputRoleContext(ctx); err != nil {
 		return err
 	}
@@ -150,6 +161,37 @@ func runPrime(cmd *cobra.Command, args []string) error {
 
 	if !hasSlungWork {
 		explain(true, "Startup directive: normal mode (no hooked work)")
+		outputStartupDirective(ctx)
+	}
+
+	return nil
+}
+
+// runPrimeCompactResume runs a lighter prime after compaction or resume.
+// The agent already has full role context in compressed memory. This just
+// restores identity, checks hook/work status, and injects any new mail.
+func runPrimeCompactResume(ctx RoleContext, cwd string) error {
+	// Brief identity confirmation
+	actor := getAgentIdentity(ctx)
+	fmt.Printf("\n> **Recovery**: Context %s complete. You are **%s** (%s).\n",
+		primeHookSource, actor, ctx.Role)
+
+	// Session metadata for seance
+	outputSessionMetadata(ctx)
+
+	// Check for hooked work — critical for resuming after compaction
+	hasSlungWork := checkSlungWork(ctx)
+
+	// Molecule progress if available
+	outputMoleculeContext(ctx)
+
+	// Inject any mail that arrived during compaction
+	if !primeDryRun {
+		runMailCheckInject(cwd)
+	}
+
+	// Startup directive if no hooked work
+	if !hasSlungWork {
 		outputStartupDirective(ctx)
 	}
 
@@ -204,11 +246,22 @@ func handlePrimeHookMode(townRoot, cwd string) {
 	}
 	_ = os.Setenv("GT_SESSION_ID", sessionID)
 	_ = os.Setenv("CLAUDE_SESSION_ID", sessionID) // Legacy compatibility
+
+	// Store source for compact/resume detection in runPrime
+	primeHookSource = source
+
 	explain(true, "Session beacon: hook mode enabled, session ID from stdin")
 	fmt.Printf("[session:%s]\n", sessionID)
 	if source != "" {
 		fmt.Printf("[source:%s]\n", source)
 	}
+}
+
+// isCompactResume returns true if the current prime is running after compaction or resume.
+// In these cases, the agent already has role context in compressed memory and only needs
+// a brief identity confirmation plus hook/work status.
+func isCompactResume() bool {
+	return primeHookSource == "compact" || primeHookSource == "resume"
 }
 
 // warnRoleMismatch outputs a prominent warning if GT_ROLE disagrees with cwd detection.

@@ -1195,15 +1195,15 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig) error {
 	t := tmux.NewTmux()
 
-	// Step 1: Kill tmux session
+	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
+	// when IsRunning fails to detect the session.
 	sessMgr := polecat.NewSessionManager(t, r)
-	running, _ := sessMgr.IsRunning(polecatName)
-	if running {
-		if err := sessMgr.Stop(polecatName, true); err != nil {
+	if err := sessMgr.Stop(polecatName, true); err != nil {
+		if !errors.Is(err, polecat.ErrSessionNotFound) {
 			fmt.Printf("  %s session kill failed: %v\n", style.Warning.Render("⚠"), err)
-		} else {
-			fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
 		}
+	} else {
+		fmt.Printf("  %s killed session\n", style.Success.Render("✓"))
 	}
 
 	// Step 2: Get polecat info before deletion (for branch name)

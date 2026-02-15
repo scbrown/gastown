@@ -411,10 +411,9 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 		t.Errorf("refinery/rig/.git should be a file (worktree), not a directory")
 	}
 
-	// NOTE: Claude settings are no longer installed by gt rig add.
-	// Settings are now installed at parent directories (e.g., witness/.claude/settings.json)
-	// by each agent at startup time, and passed to Claude via --settings flag.
-	// Verify NO settings exist at parent directories yet (gt rig add doesn't create them).
+	// NOTE: Most agent settings are installed at startup time, not by gt rig add.
+	// Exception: polecats/.claude/ is scaffolded by gt rig add so polecat sessions
+	// don't fail on startup due to missing hooks (gt-ke4mj).
 	parentSettingsThatShouldNotExist := []struct {
 		path string
 		desc string
@@ -422,13 +421,22 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 		{filepath.Join(rigPath, "witness", ".claude", "settings.json"), "witness/.claude/settings.json"},
 		{filepath.Join(rigPath, "refinery", ".claude", "settings.json"), "refinery/.claude/settings.json"},
 		{filepath.Join(rigPath, "crew", ".claude", "settings.json"), "crew/.claude/settings.json"},
-		{filepath.Join(rigPath, "polecats", ".claude", "settings.json"), "polecats/.claude/settings.json"},
 	}
 
 	for _, s := range parentSettingsThatShouldNotExist {
 		if _, err := os.Stat(s.path); err == nil {
 			t.Errorf("%s should NOT exist after gt rig add (agents install settings at startup)", s.desc)
 		}
+	}
+
+	// Polecats settings should be scaffolded by gt rig add (gt-ke4mj).
+	polecatSettings := filepath.Join(rigPath, "polecats", ".claude", "settings.json")
+	if _, err := os.Stat(polecatSettings); os.IsNotExist(err) {
+		t.Errorf("polecats/.claude/settings.json should exist after gt rig add (scaffolded for polecat startup)")
+	}
+	polecatHandoff := filepath.Join(rigPath, "polecats", ".claude", "commands", "handoff.md")
+	if _, err := os.Stat(polecatHandoff); os.IsNotExist(err) {
+		t.Errorf("polecats/.claude/commands/handoff.md should exist after gt rig add (scaffolded for polecat startup)")
 	}
 
 	// NOTE: No per-directory CLAUDE.md/AGENTS.md is created at agent level.
@@ -985,6 +993,7 @@ func TestAgentWorktreesStayClean(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping integration test")
 	}
+	requireDoltServer(t)
 
 	testCases := []struct {
 		name            string

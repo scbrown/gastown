@@ -73,15 +73,16 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
 			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
 				style.Warning.Render("⏳"), slingMaxConcurrent)
-			// Wait with exponential backoff for sessions to settle
+			// Wait for sessions to settle before spawning more
 			for wait := 0; wait < 30; wait++ {
 				time.Sleep(2 * time.Second)
-				// Recount active — in practice, polecats become self-sufficient quickly
-				// so we just use a time-based cooldown rather than precise counting
 				if wait >= 2 {
 					break
 				}
 			}
+			// Reset counter after cooldown — polecats become self-sufficient
+			// quickly, so we use time-based batching rather than precise counting
+			activeCount = 0
 		}
 
 		fmt.Printf("\n[%d/%d] Slinging %s...\n", i+1, len(beadIDs), beadID)
@@ -123,7 +124,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		if !slingNoConvoy {
 			existingConvoy := isTrackedByConvoy(beadID)
 			if existingConvoy == "" {
-				convoyID, err := createAutoConvoy(beadID, info.Title)
+				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge)
 				if err != nil {
 					fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 				} else {
@@ -230,6 +231,13 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 		activeCount++
 		results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: true})
+
+		// Delay between spawns to prevent Dolt lock contention — sequential
+		// spawns without delay cause database lock timeouts when multiple bd
+		// operations (agent bead creation, hook setting) overlap.
+		if i < len(beadIDs)-1 {
+			time.Sleep(2 * time.Second)
+		}
 	}
 
 	if !slingNoBoot {

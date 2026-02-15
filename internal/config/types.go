@@ -78,6 +78,9 @@ type TownSettings struct {
 
 	// FeedCurator configures event deduplication and aggregation windows.
 	FeedCurator *FeedCuratorConfig `json:"feed_curator,omitempty"`
+
+	// Convoy configures convoy behavior settings.
+	Convoy *ConvoyConfig `json:"convoy,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.
@@ -165,6 +168,13 @@ func DefaultFeedCuratorConfig() *FeedCuratorConfig {
 		SlingAggregateWindow: "30s",
 		MinAggregateCount:    3,
 	}
+}
+
+// ConvoyConfig configures convoy behavior settings.
+type ConvoyConfig struct {
+	// NotifyOnComplete controls whether convoy completion pushes a notification
+	// into the active Mayor session (in addition to mail). Opt-in; default false.
+	NotifyOnComplete bool `json:"notify_on_complete,omitempty"`
 }
 
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
@@ -869,6 +879,10 @@ type MergeQueueConfig struct {
 
 	// MaxConcurrent is the maximum number of concurrent merges.
 	MaxConcurrent int `json:"max_concurrent"`
+
+	// StaleClaimTimeout is how long a claimed MR can go without updates before
+	// being considered abandoned and eligible for re-claim (e.g., "30m").
+	StaleClaimTimeout string `json:"stale_claim_timeout,omitempty"`
 }
 
 // OnConflict strategy constants.
@@ -941,6 +955,7 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		RetryFlakyTests:                  1,
 		PollInterval:                     "30s",
 		MaxConcurrent:                    1,
+		StaleClaimTimeout:               "30m",
 	}
 }
 

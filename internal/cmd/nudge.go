@@ -531,42 +531,28 @@ func shouldNudgeTarget(townRoot, targetAddress string, force bool) (bool, string
 //   - "hq-mayor" -> "mayor"
 //   - "hq-deacon" -> "deacon"
 func sessionNameToAddress(sessionName string) string {
-	if sessionName == session.MayorSessionName() {
+	identity, err := session.ParseSessionName(sessionName)
+	if err != nil {
+		return ""
+	}
+
+	// Use short address format: rig/name (not rig/polecats/name)
+	switch identity.Role {
+	case session.RoleMayor:
 		return "mayor"
-	}
-	if sessionName == session.DeaconSessionName() {
+	case session.RoleDeacon:
 		return "deacon"
-	}
-
-	// Expected format: gt-<rig>-<rest>
-	if !strings.HasPrefix(sessionName, "gt-") {
+	case session.RoleWitness:
+		return fmt.Sprintf("%s/witness", identity.Rig)
+	case session.RoleRefinery:
+		return fmt.Sprintf("%s/refinery", identity.Rig)
+	case session.RoleCrew:
+		return fmt.Sprintf("%s/crew/%s", identity.Rig, identity.Name)
+	case session.RolePolecat:
+		return fmt.Sprintf("%s/%s", identity.Rig, identity.Name)
+	default:
 		return ""
 	}
-	rest := strings.TrimPrefix(sessionName, "gt-")
-
-	// Try to split into rig and target components
-	// Format: rig-crew-name or rig-witness or rig-refinery or rig-name
-	parts := strings.SplitN(rest, "-", 2)
-	if len(parts) != 2 {
-		return ""
-	}
-
-	rig := parts[0]
-	target := parts[1]
-
-	// Check for crew prefix: crew-<name>
-	if strings.HasPrefix(target, "crew-") {
-		crewName := strings.TrimPrefix(target, "crew-")
-		return fmt.Sprintf("%s/crew/%s", rig, crewName)
-	}
-
-	// Infrastructure roles
-	if target == "witness" || target == "refinery" {
-		return fmt.Sprintf("%s/%s", rig, target)
-	}
-
-	// Polecat (simple name after rig)
-	return fmt.Sprintf("%s/%s", rig, target)
 }
 
 // addressToAgentBeadID converts a target address to an agent bead ID.

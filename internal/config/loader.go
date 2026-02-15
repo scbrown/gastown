@@ -233,6 +233,17 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 		}
 	}
 
+	// Validate stale_claim_timeout if specified
+	if c.StaleClaimTimeout != "" {
+		dur, err := time.ParseDuration(c.StaleClaimTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid stale_claim_timeout: %w", err)
+		}
+		if dur <= 0 {
+			return fmt.Errorf("stale_claim_timeout must be positive, got %v", dur)
+		}
+	}
+
 	// Validate non-negative values
 	if c.RetryFlakyTests < 0 {
 		return fmt.Errorf("%w: retry_flaky_tests must be non-negative", ErrMissingField)

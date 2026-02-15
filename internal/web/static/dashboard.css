@@ -68,6 +68,19 @@
             font-size: 0.75rem;
         }
 
+        .connection-live {
+            color: var(--green);
+        }
+        .connection-live::before {
+            content: "● ";
+        }
+        .connection-reconnecting {
+            color: var(--yellow);
+        }
+        .connection-reconnecting::before {
+            content: "○ ";
+        }
+
         /* Grid layout for panels - auto-fit responsive */
         .panels {
             display: grid;
@@ -210,6 +223,132 @@
             background: var(--green);
             border-radius: 2px;
             transition: width 0.3s ease;
+        }
+
+        /* Convoy detail view */
+        #convoy-detail {
+            padding: 8px;
+        }
+
+        .convoy-detail-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .convoy-detail-content {
+            margin-top: 12px;
+        }
+
+        .convoy-detail-meta {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+            font-size: 0.85rem;
+        }
+
+        .convoy-detail-section {
+            margin-top: 12px;
+        }
+
+        .convoy-detail-section h4 {
+            margin: 0;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .convoy-issues-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .convoy-add-issue-btn {
+            background: var(--green);
+            border: none;
+            border-radius: 4px;
+            color: #000;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 4px 10px;
+            transition: all 0.15s ease;
+        }
+
+        .convoy-add-issue-btn:hover {
+            background: var(--cyan);
+        }
+
+        .convoy-add-issue-form {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .convoy-add-issue-input {
+            flex: 1;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            font-family: inherit;
+        }
+
+        .convoy-add-issue-input:focus {
+            outline: none;
+            border-color: var(--blue);
+        }
+
+        .convoy-add-issue-submit {
+            padding: 6px 12px;
+            font-size: 0.8rem;
+        }
+
+        .convoy-add-issue-cancel {
+            padding: 6px 12px;
+            font-size: 0.8rem;
+        }
+
+        /* Convoy issue status icons in sub-table */
+        #convoy-issues-table .convoy-issue-status {
+            text-align: center;
+        }
+
+        /* New Convoy button */
+        .new-convoy-btn {
+            background: var(--green);
+            border: none;
+            border-radius: 4px;
+            color: #000;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 4px 10px;
+            margin-right: 8px;
+            transition: all 0.15s ease;
+        }
+
+        .new-convoy-btn:hover {
+            background: var(--cyan);
+            color: #000;
+            transform: scale(1.05);
+        }
+
+        /* New convoy form */
+        .convoy-create-form {
+            padding: 8px;
+        }
+
+        .convoy-create-fields {
+            margin-top: 12px;
         }
 
         /* Expandable issues */
@@ -867,6 +1006,128 @@
             color: var(--orange);
         }
 
+        .hook-detach-btn {
+            background: transparent;
+            border: 1px solid var(--red);
+            border-radius: 3px;
+            color: var(--red);
+            cursor: pointer;
+            font-size: 0.7rem;
+            padding: 2px 8px;
+            transition: all 0.15s ease;
+        }
+
+        .hook-detach-btn:hover {
+            background: rgba(240, 113, 120, 0.15);
+        }
+
+        .hook-detach-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .hook-attach-btn {
+            background: var(--cyan);
+            border: none;
+            border-radius: 4px;
+            color: #000;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 4px 10px;
+            margin-right: 4px;
+            transition: all 0.15s ease;
+        }
+
+        .hook-attach-btn:hover {
+            background: var(--green);
+            transform: scale(1.05);
+        }
+
+        .hook-clear-all-btn {
+            background: transparent;
+            border: 1px solid var(--text-muted);
+            border-radius: 4px;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 0.7rem;
+            padding: 3px 8px;
+            margin-right: 4px;
+            transition: all 0.15s ease;
+        }
+
+        .hook-clear-all-btn:hover {
+            border-color: var(--red);
+            color: var(--red);
+        }
+
+        .hook-attach-form {
+            padding: 8px;
+            margin-bottom: 8px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+        }
+
+        .hook-attach-form-row {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .hook-attach-input {
+            flex: 1;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.8rem;
+            padding: 5px 8px;
+        }
+
+        .hook-attach-input:focus {
+            outline: none;
+            border-color: var(--cyan);
+        }
+
+        .hook-attach-submit {
+            background: var(--cyan);
+            border: none;
+            border-radius: 3px;
+            color: #000;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 5px 12px;
+            transition: all 0.15s ease;
+        }
+
+        .hook-attach-submit:hover {
+            background: var(--green);
+        }
+
+        .hook-attach-submit:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .hook-attach-cancel {
+            background: transparent;
+            border: 1px solid var(--text-muted);
+            border-radius: 3px;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 0.75rem;
+            padding: 5px 10px;
+            transition: all 0.15s ease;
+        }
+
+        .hook-attach-cancel:hover {
+            border-color: var(--text-primary);
+            color: var(--text-primary);
+        }
+
         /* Issue styles */
         .issue-id {
             font-weight: 600;
@@ -988,6 +1249,90 @@
             word-wrap: break-word;
             max-height: 300px;
             overflow-y: auto;
+        }
+
+        /* Issue action buttons */
+        .issue-detail-actions {
+            margin: 12px 0;
+        }
+
+        .issue-actions-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 12px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 6px;
+            flex-wrap: wrap;
+        }
+
+        .issue-action-btn {
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-family: inherit;
+            padding: 6px 14px;
+            transition: all 0.15s ease;
+        }
+
+        .issue-action-btn.close {
+            background: var(--green);
+            color: var(--bg-dark);
+            border-color: var(--green);
+        }
+
+        .issue-action-btn.close:hover {
+            opacity: 0.85;
+        }
+
+        .issue-action-btn.reopen {
+            background: transparent;
+            color: var(--blue);
+            border-color: var(--blue);
+        }
+
+        .issue-action-btn.reopen:hover {
+            background: var(--blue);
+            color: var(--bg-dark);
+        }
+
+        .issue-action-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .issue-action-label {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .issue-action-select {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 5px 28px 5px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-family: inherit;
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236c7680' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+        }
+
+        .issue-action-select:focus {
+            outline: none;
+            border-color: var(--blue);
+        }
+
+        .issue-action-select option {
+            background: var(--bg-card);
+            color: var(--text-primary);
         }
 
         .issue-dep-item {
@@ -1664,6 +2009,38 @@
             margin-right: 4px;
         }
 
+        /* Command palette section headers */
+        .command-section-header {
+            padding: 6px 16px 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-top: 1px solid var(--border);
+            margin-top: 4px;
+        }
+
+        .command-section-header:first-child {
+            border-top: none;
+            margin-top: 0;
+        }
+
+        /* Recent command icon */
+        .command-recent-icon {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            flex-shrink: 0;
+        }
+
+        /* Search match highlight */
+        .command-name mark {
+            background: rgba(255, 196, 0, 0.25);
+            color: var(--text-primary);
+            border-radius: 2px;
+            padding: 0 1px;
+        }
+
         /* Command args hint in list */
         .command-args {
             color: var(--text-muted);
@@ -2258,4 +2635,72 @@
         @keyframes slideIn {
             from { transform: translateX(100%); opacity: 0; }
             to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* Sling button */
+        .sling-btn {
+            background: transparent;
+            border: 1px solid var(--purple);
+            border-radius: 4px;
+            color: var(--purple);
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 3px 8px;
+            transition: all 0.15s ease;
+            white-space: nowrap;
+        }
+
+        .sling-btn:hover {
+            background: var(--purple);
+            color: var(--bg-dark);
+        }
+
+        /* Sling dropdown */
+        .sling-dropdown {
+            background: var(--bg-card);
+            border: 1px solid var(--purple);
+            border-radius: 6px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+            min-width: 160px;
+            overflow: hidden;
+        }
+
+        .sling-dropdown-header {
+            padding: 8px 12px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sling-dropdown-loading,
+        .sling-dropdown-empty {
+            padding: 12px;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .sling-dropdown-item {
+            display: block;
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.85rem;
+            padding: 8px 12px;
+            text-align: left;
+            transition: background 0.1s ease;
+        }
+
+        .sling-dropdown-item:hover {
+            background: var(--purple);
+            color: var(--bg-dark);
+        }
+
+        .sling-dropdown-item + .sling-dropdown-item {
+            border-top: 1px solid var(--border);
         }

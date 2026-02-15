@@ -80,14 +80,35 @@ Example:
 var rigListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all rigs in the workspace",
-	RunE:  runRigList,
+	Long: `List all rigs registered in the Gas Town workspace.
+
+For each rig, displays:
+  - Rig name and operational state (OPERATIONAL, PARKED, DOCKED)
+  - Witness status (running/stopped)
+  - Refinery status (running/stopped)
+  - Number of polecats and crew members
+
+Examples:
+  gt rig list          # List all rigs with status
+  gt rig list --json   # Output as JSON for scripting`,
+	RunE: runRigList,
 }
 
 var rigRemoveCmd = &cobra.Command{
 	Use:   "remove <name>",
 	Short: "Remove a rig from the registry (does not delete files)",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runRigRemove,
+	Long: `Remove a rig from the Gas Town registry.
+
+This only removes the rig entry from mayor/rigs.json and cleans up
+the beads route. The rig's files on disk are NOT deleted.
+
+To fully remove a rig, delete the directory manually after unregistering.
+
+Examples:
+  gt rig remove myproject                    # Unregister the rig
+  gt rig remove myproject && rm -rf myproject # Unregister and delete files`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRigRemove,
 }
 
 var rigResetCmd = &cobra.Command{
@@ -282,6 +303,7 @@ var (
 	rigStopNuclear     bool
 	rigRestartForce    bool
 	rigRestartNuclear  bool
+	rigListJSON        bool
 )
 
 func init() {
@@ -297,6 +319,8 @@ func init() {
 	rigCmd.AddCommand(rigStartCmd)
 	rigCmd.AddCommand(rigStatusCmd)
 	rigCmd.AddCommand(rigStopCmd)
+
+	rigListCmd.Flags().BoolVar(&rigListJSON, "json", false, "Output as JSON")
 
 	rigAddCmd.Flags().StringVar(&rigAddPrefix, "prefix", "", "Beads issue prefix (default: derived from name)")
 	rigAddCmd.Flags().StringVar(&rigAddLocalRepo, "local-repo", "", "Local repo path to share git objects (optional)")
@@ -399,30 +423,15 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s Could not update daemon.json patrols: %v\n", style.Warning.Render("!"), err)
 	}
 
-	// Add route to town-level routes.jsonl for prefix-based routing.
-	// Route points to the canonical beads location:
-	// - If source repo has .beads/ tracked in git, route to mayor/rig
-	// - Otherwise route to rig root (where initBeads creates the database)
-	// The conditional routing is necessary because initBeads creates the database at
-	// "<rig>/.beads", while repos with tracked beads have their database at mayor/rig/.beads.
+	// Route registration is now handled inside AddRig (before agent bead creation)
+	// to avoid "no route found" warnings (#1424). Determine beadsWorkDir for rig identity bead.
 	var beadsWorkDir string
 	if newRig.Config.Prefix != "" {
-		routePath := name
 		mayorRigBeads := filepath.Join(townRoot, name, "mayor", "rig", ".beads")
 		if _, err := os.Stat(mayorRigBeads); err == nil {
-			// Source repo has .beads/ tracked - route to mayor/rig
-			routePath = name + "/mayor/rig"
 			beadsWorkDir = filepath.Join(townRoot, name, "mayor", "rig")
 		} else {
 			beadsWorkDir = filepath.Join(townRoot, name)
-		}
-		route := beads.Route{
-			Prefix: newRig.Config.Prefix + "-",
-			Path:   routePath,
-		}
-		if err := beads.AppendRoute(townRoot, route); err != nil {
-			// Non-fatal: routing will still work, just not from town root
-			fmt.Printf("  %s Could not update routes.jsonl: %v\n", style.Warning.Render("!"), err)
 		}
 	}
 
@@ -467,7 +476,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  ├── refinery/rig/     (worktree: %s, sees polecat branches)\n", defaultBranch)
 	fmt.Printf("  ├── crew/             (empty - add crew with 'gt crew add')\n")
 	fmt.Printf("  ├── witness/\n")
-	fmt.Printf("  └── polecats/\n")
+	fmt.Printf("  └── polecats/         (.claude/ scaffolded for polecat sessions)\n")
 
 	fmt.Printf("\nNext steps:\n")
 	fmt.Printf("  gt crew add <name> --rig %s   # Create your personal workspace\n", name)
@@ -500,33 +509,91 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	// Create rig manager to get details
 	g := git.NewGit(townRoot)
 	mgr := rig.NewManager(townRoot, rigsConfig, g)
+	t := tmux.NewTmux()
 
-	fmt.Printf("Rigs in %s:\n\n", townRoot)
+	type rigInfo struct {
+		Name     string `json:"name"`
+		Status   string `json:"status"`
+		Witness  string `json:"witness"`
+		Refinery string `json:"refinery"`
+		Polecats int    `json:"polecats"`
+		Crew     int    `json:"crew"`
+	}
+
+	var rigs []rigInfo
 
 	for name := range rigsConfig.Rigs {
 		r, err := mgr.GetRig(name)
 		if err != nil {
-			fmt.Printf("  %s %s\n", style.Warning.Render("!"), name)
+			if rigListJSON {
+				rigs = append(rigs, rigInfo{Name: name, Status: "error"})
+			} else {
+				fmt.Printf("  %s %s\n", style.Warning.Render("!"), name)
+			}
 			continue
 		}
 
-		summary := r.Summary()
-		fmt.Printf("  %s\n", style.Bold.Render(name))
-		fmt.Printf("    Polecats: %d  Crew: %d\n", summary.PolecatCount, summary.CrewCount)
+		opState, _ := getRigOperationalState(townRoot, name)
 
-		agents := []string{}
-		if summary.HasRefinery {
-			agents = append(agents, "refinery")
+		witnessSession := fmt.Sprintf("gt-%s-witness", name)
+		refinerySession := fmt.Sprintf("gt-%s-refinery", name)
+		witnessRunning, _ := t.HasSession(witnessSession)
+		refineryRunning, _ := t.HasSession(refinerySession)
+
+		witnessStatus := "stopped"
+		if witnessRunning {
+			witnessStatus = "running"
 		}
-		if summary.HasWitness {
-			agents = append(agents, "witness")
+		refineryStatus := "stopped"
+		if refineryRunning {
+			refineryStatus = "running"
 		}
-		if r.HasMayor {
-			agents = append(agents, "mayor")
+
+		summary := r.Summary()
+		rigs = append(rigs, rigInfo{
+			Name:     name,
+			Status:   strings.ToLower(opState),
+			Witness:  witnessStatus,
+			Refinery: refineryStatus,
+			Polecats: summary.PolecatCount,
+			Crew:     summary.CrewCount,
+		})
+	}
+
+	if rigListJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rigs)
+	}
+
+	fmt.Printf("Rigs in %s:\n\n", townRoot)
+	for _, ri := range rigs {
+		if ri.Status == "error" {
+			fmt.Printf("  %s %s\n", style.Warning.Render("!"), ri.Name)
+			continue
 		}
-		if len(agents) > 0 {
-			fmt.Printf("    Agents: %v\n", agents)
+
+		stateLabel := style.Success.Render(strings.ToUpper(ri.Status))
+		if ri.Status == "parked" {
+			stateLabel = style.Warning.Render("PARKED")
+		} else if ri.Status == "docked" {
+			stateLabel = style.Dim.Render("DOCKED")
 		}
+
+		fmt.Printf("  %s  %s\n", style.Bold.Render(ri.Name), stateLabel)
+
+		witnessIcon := style.Dim.Render("○")
+		if ri.Witness == "running" {
+			witnessIcon = style.Success.Render("●")
+		}
+		refineryIcon := style.Dim.Render("○")
+		if ri.Refinery == "running" {
+			refineryIcon = style.Success.Render("●")
+		}
+
+		fmt.Printf("    Witness: %s %s  Refinery: %s %s\n",
+			witnessIcon, ri.Witness, refineryIcon, ri.Refinery)
+		fmt.Printf("    Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
 		fmt.Println()
 	}
 
@@ -661,9 +728,9 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Detect prefix: try dolt backend first, fall back to issues.jsonl.
-		// With dolt, metadata.json and the database survive clone, so we can
-		// query the prefix directly via "bd config get issue_prefix".
+		// Detect prefix: try dolt backend first, fall back to metadata.json, then issues.jsonl.
+		// With dolt, metadata.json survives clone (dolt/ is gitignored since bd v0.50+).
+		// Try "bd config get issue_prefix", then extract from metadata.json dolt_database name.
 		prefixDetected := false
 		metadataPath := filepath.Join(beadsDir, "metadata.json")
 		if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
@@ -684,6 +751,26 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 							result.BeadsPrefix = detected
 						}
 						prefixDetected = true
+					}
+				}
+				// Fallback: extract prefix from dolt_database name in metadata.json.
+				// Format: "beads_<prefix>" (e.g. "beads_my-project" → "my-project").
+				// This survives clone because metadata.json is tracked by git.
+				if !prefixDetected {
+					var fullMeta struct {
+						DoltDatabase string `json:"dolt_database"`
+					}
+					if json.Unmarshal(metaBytes, &fullMeta) == nil && strings.HasPrefix(fullMeta.DoltDatabase, "beads_") {
+						detected := strings.TrimPrefix(fullMeta.DoltDatabase, "beads_")
+						if detected != "" {
+							if rigAddPrefix != "" && strings.TrimSuffix(rigAddPrefix, "-") != detected {
+								return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
+							}
+							if result.BeadsPrefix == "" {
+								result.BeadsPrefix = detected
+							}
+							prefixDetected = true
+						}
 					}
 				}
 			}
@@ -718,9 +805,24 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			}
 		}
 
-		// Init database if metadata.json is missing (DB files are gitignored)
+		// Init database if metadata.json is missing or dolt/ directory is missing.
+		// Since bd v0.50+, dolt/ is gitignored and won't exist after clone.
 		metadataPath = filepath.Join(beadsDir, "metadata.json")
+		needsInit := false
 		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+			needsInit = true
+		} else if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
+			var meta struct {
+				Backend string `json:"backend"`
+			}
+			if json.Unmarshal(metaBytes, &meta) == nil && meta.Backend == "dolt" {
+				doltDir := filepath.Join(beadsDir, "dolt")
+				if _, statErr := os.Stat(doltDir); os.IsNotExist(statErr) {
+					needsInit = true
+				}
+			}
+		}
+		if needsInit {
 			prefix := result.BeadsPrefix
 			if prefix == "" {
 				break
@@ -734,6 +836,12 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 				fmt.Printf("  %s Could not init bd database: %v (%s)\n", style.Warning.Render("!"), initErr, strings.TrimSpace(string(output)))
 			} else {
 				fmt.Printf("  %s Initialized beads database (Dolt)\n", style.Success.Render("✓"))
+				// Explicitly persist issue_prefix (bd init --prefix may not persist it).
+				prefixCmd := exec.Command("bd", "config", "set", "issue_prefix", prefix)
+				prefixCmd.Dir = workDir
+				if out, err := prefixCmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("setting issue_prefix after bd init: %w (%s)", err, strings.TrimSpace(string(out)))
+				}
 			}
 		}
 		break

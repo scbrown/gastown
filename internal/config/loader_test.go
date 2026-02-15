@@ -339,6 +339,39 @@ func TestRigSettingsValidation(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "invalid stale_claim_timeout",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					StaleClaimTimeout: "not-a-duration",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero stale_claim_timeout",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					StaleClaimTimeout: "0s",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative stale_claim_timeout",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					StaleClaimTimeout: "-5m",
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -384,6 +417,9 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	}
 	if cfg.MaxConcurrent != 1 {
 		t.Errorf("MaxConcurrent = %d, want 1", cfg.MaxConcurrent)
+	}
+	if cfg.StaleClaimTimeout != "30m" {
+		t.Errorf("StaleClaimTimeout = %q, want '30m'", cfg.StaleClaimTimeout)
 	}
 }
 

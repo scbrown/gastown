@@ -466,15 +466,12 @@ func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 		}
 
 		sessionName := parts[0]
-		// Check if it's a polecat session (gt-{rig}-{polecat}, not gt-{rig}-witness/refinery)
-		// Polecat sessions have exactly 3 parts when split by "-" and the middle part is the rig
-		nameParts := strings.Split(sessionName, "-")
-		if len(nameParts) < 3 || nameParts[0] != "gt" {
+		// Check if it's a polecat or crew session (skip infrastructure roles)
+		identity, err := session.ParseSessionName(sessionName)
+		if err != nil {
 			continue
 		}
-		// Skip witness, refinery, mayor, deacon sessions
-		lastPart := nameParts[len(nameParts)-1]
-		if lastPart == "witness" || lastPart == "refinery" || lastPart == "mayor" || lastPart == "deacon" {
+		if identity.Role != session.RolePolecat && identity.Role != session.RoleCrew {
 			continue
 		}
 
@@ -734,17 +731,13 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 		sessionName := parts[0]
 
 		// Filter for gt-<rig>-<polecat> pattern
-		if !strings.HasPrefix(sessionName, "gt-") {
+		// Parse session name using canonical parser
+		identity, err := session.ParseSessionName(sessionName)
+		if err != nil {
 			continue
 		}
 
-		// Parse session name: gt-roxas-dag -> rig=roxas, worker=dag
-		nameParts := strings.SplitN(sessionName, "-", 3)
-		if len(nameParts) != 3 {
-			continue
-		}
-		rig := nameParts[1]
-		workerName := nameParts[2]
+		rig := identity.Rig
 
 		// Skip rigs not registered in this workspace
 		if !registeredRigs[rig] {
@@ -752,13 +745,15 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 		}
 
 		// Skip non-worker sessions (witness, mayor, deacon, boot)
-		if workerName == "witness" || workerName == "mayor" || workerName == "deacon" || workerName == "boot" {
+		switch identity.Role {
+		case session.RoleMayor, session.RoleDeacon, session.RoleWitness:
 			continue
 		}
 
-		// Determine agent type: refinery is its own permanent role, others are polecats (ephemeral sessions)
-		agentType := "polecat"
-		if workerName == "refinery" {
+		// Determine agent type and worker name
+		workerName := identity.Name
+		agentType := "polecat" // Default for ephemeral sessions (polecats, crew)
+		if identity.Role == session.RoleRefinery {
 			agentType = "refinery"
 		}
 
@@ -1357,33 +1352,11 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 			}
 		}
 
-		// Detect role from session name pattern: gt-<rig>-<role>[-<name>]
-		// Examples: gt-gastown-witness, gt-gastown-nux, gt-deacon
-		nameParts := strings.Split(strings.TrimPrefix(name, "gt-"), "-")
-		if len(nameParts) >= 1 {
-			// Check for special roles
-			if nameParts[0] == "deacon" {
-				row.Role = "deacon"
-			} else if len(nameParts) >= 2 {
-				row.Rig = nameParts[0]
-				role := nameParts[1]
-
-				switch role {
-				case "witness":
-					row.Role = "witness"
-				case "refinery":
-					row.Role = "refinery"
-				default:
-					// Assume it's a polecat name
-					row.Role = "polecat"
-					row.Worker = role
-				}
-
-				// Check if there's a worker name after the role (for crew)
-				if len(nameParts) >= 3 && (role == "crew") {
-					row.Worker = nameParts[2]
-				}
-			}
+		// Detect role from session name using canonical parser
+		if identity, err := session.ParseSessionName(name); err == nil {
+			row.Rig = identity.Rig
+			row.Role = string(identity.Role)
+			row.Worker = identity.Name
 		}
 
 		rows = append(rows, row)

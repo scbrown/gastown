@@ -76,19 +76,26 @@ func UnmarshalSettings(data []byte) (*SettingsJSON, error) {
 }
 
 // MarshalSettings serializes a SettingsJSON, preserving unknown fields.
+// Does not mutate the input — works on a copy of Extra.
 func MarshalSettings(s *SettingsJSON) ([]byte, error) {
-	if s.Extra == nil {
-		s.Extra = make(map[string]json.RawMessage)
+	// Copy Extra to avoid mutating the input
+	out := make(map[string]json.RawMessage, len(s.Extra))
+	for k, v := range s.Extra {
+		out[k] = v
 	}
 
-	// Write known fields back into the map
+	// Write known fields back into the map, or delete if zero-valued
 	if s.EditorMode != "" {
 		raw, _ := json.Marshal(s.EditorMode)
-		s.Extra["editorMode"] = raw
+		out["editorMode"] = raw
+	} else {
+		delete(out, "editorMode")
 	}
 	if s.EnabledPlugins != nil {
 		raw, _ := json.Marshal(s.EnabledPlugins)
-		s.Extra["enabledPlugins"] = raw
+		out["enabledPlugins"] = raw
+	} else {
+		delete(out, "enabledPlugins")
 	}
 
 	// Always write hooks (even if empty, it's the managed section)
@@ -96,9 +103,9 @@ func MarshalSettings(s *SettingsJSON) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.Extra["hooks"] = raw
+	out["hooks"] = raw
 
-	return json.MarshalIndent(s.Extra, "", "  ")
+	return json.MarshalIndent(out, "", "  ")
 }
 
 // LoadSettings reads and parses a settings.json file, preserving unknown fields.

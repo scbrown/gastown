@@ -338,12 +338,32 @@ func Start(townRoot string) error {
 	}
 	defer func() { _ = fileLock.Unlock() }()
 
-	// Check if already running
+	// Check if already running (checks both PID file AND port)
 	running, pid, err := IsRunning(townRoot)
 	if err != nil {
 		return fmt.Errorf("checking server status: %w", err)
 	}
 	if running {
+		// Server is running - verify PID file is correct (gm-ouur fix)
+		// If PID file is stale/missing but server is on port, update it
+		pidFromFile := 0
+		if data, err := os.ReadFile(config.PidFile); err == nil {
+			pidFromFile, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+		if pidFromFile != pid {
+			// PID file is stale/wrong - update it
+			fmt.Printf("Updating stale PID file (was %d, actual %d)\n", pidFromFile, pid)
+			if err := os.WriteFile(config.PidFile, []byte(strconv.Itoa(pid)), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not update PID file: %v\n", err)
+			}
+			// Update state too
+			state, _ := LoadState(townRoot)
+			if state != nil && state.PID != pid {
+				state.PID = pid
+				state.Running = true
+				_ = SaveState(townRoot, state)
+			}
+		}
 		return fmt.Errorf("Dolt server already running (PID %d)", pid)
 	}
 
@@ -352,17 +372,8 @@ func Start(townRoot string) error {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
-	// List available databases
-	databases, err := ListDatabases(townRoot)
-	if err != nil {
-		return fmt.Errorf("listing databases: %w", err)
-	}
-
-	if len(databases) == 0 {
-		return fmt.Errorf("no databases found in %s\nInitialize with: gt dolt init-rig <name>", config.DataDir)
-	}
-
 	// Clean up stale Dolt LOCK files in all database directories
+	databases, _ := ListDatabases(townRoot)
 	for _, db := range databases {
 		dbDir := filepath.Join(config.DataDir, db)
 		if err := cleanupStaleDoltLock(dbDir); err != nil {
@@ -985,6 +996,118 @@ type BrokenWorkspace struct {
 	LocalDataPath string
 }
 
+// OrphanedDatabase represents a database in .dolt-data/ that is not referenced
+// by any rig's metadata.json. These are leftover from partial setups, renames,
+// or failed migrations.
+type OrphanedDatabase struct {
+	// Name is the database directory name in .dolt-data/.
+	Name string
+
+	// Path is the full path to the database directory.
+	Path string
+
+	// SizeBytes is the total size of the database directory.
+	SizeBytes int64
+}
+
+// FindOrphanedDatabases scans .dolt-data/ for databases that are not referenced
+// by any rig's metadata.json dolt_database field. These orphans consume disk space
+// and are served by the Dolt server unnecessarily.
+func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
+	databases, err := ListDatabases(townRoot)
+	if err != nil {
+		return nil, fmt.Errorf("listing databases: %w", err)
+	}
+	if len(databases) == 0 {
+		return nil, nil
+	}
+
+	// Collect all referenced database names from metadata.json files
+	referenced := collectReferencedDatabases(townRoot)
+
+	// Find databases that exist on disk but aren't referenced
+	config := DefaultConfig(townRoot)
+	var orphans []OrphanedDatabase
+	for _, dbName := range databases {
+		if referenced[dbName] {
+			continue
+		}
+		dbPath := filepath.Join(config.DataDir, dbName)
+		size := dirSize(dbPath)
+		orphans = append(orphans, OrphanedDatabase{
+			Name:      dbName,
+			Path:      dbPath,
+			SizeBytes: size,
+		})
+	}
+
+	return orphans, nil
+}
+
+// collectReferencedDatabases returns a set of database names referenced by
+// any rig's metadata.json dolt_database field.
+func collectReferencedDatabases(townRoot string) map[string]bool {
+	referenced := make(map[string]bool)
+
+	// Check town-level beads (hq)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if db := readExistingDoltDatabase(townBeadsDir); db != "" {
+		referenced[db] = true
+	}
+
+	// Check all rigs from rigs.json
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	data, err := os.ReadFile(rigsPath)
+	if err != nil {
+		return referenced
+	}
+	var config struct {
+		Rigs map[string]interface{} `json:"rigs"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return referenced
+	}
+
+	for rigName := range config.Rigs {
+		beadsDir := FindRigBeadsDir(townRoot, rigName)
+		if beadsDir == "" {
+			continue
+		}
+		if db := readExistingDoltDatabase(beadsDir); db != "" {
+			referenced[db] = true
+		}
+	}
+
+	return referenced
+}
+
+// RemoveDatabase removes an orphaned database directory from .dolt-data/.
+// The caller should verify the database is actually orphaned before calling this.
+// If the Dolt server is running, it will DROP the database first.
+func RemoveDatabase(townRoot, dbName string) error {
+	config := DefaultConfig(townRoot)
+	dbPath := filepath.Join(config.DataDir, dbName)
+
+	// Verify the directory exists
+	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
+		return fmt.Errorf("database %q not found at %s", dbName, dbPath)
+	}
+
+	// If server is running, DROP the database first
+	running, _, _ := IsRunning(townRoot)
+	if running {
+		// Try to DROP — ignore errors (database might not be loaded)
+		_ = serverExecSQL(townRoot, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
+	}
+
+	// Remove the directory
+	if err := os.RemoveAll(dbPath); err != nil {
+		return fmt.Errorf("removing database directory: %w", err)
+	}
+
+	return nil
+}
+
 // FindBrokenWorkspaces scans all rig metadata.json files for Dolt server
 // configuration where the referenced database doesn't exist in .dolt-data/.
 // These workspaces are broken: bd commands will fail or silently create
@@ -1098,7 +1221,21 @@ func RepairWorkspace(townRoot string, ws BrokenWorkspace) (string, error) {
 //
 // For the "hq" rig, it writes to <townRoot>/.beads/metadata.json.
 // For other rigs, it writes to <townRoot>/<rigName>/mayor/rig/.beads/metadata.json.
+//
+// The dolt_database field is set to rigName, meaning each rig gets its own database.
+// For rigs that should share the HQ database, use EnsureMetadataWithDB instead.
 func EnsureMetadata(townRoot, rigName string) error {
+	return EnsureMetadataWithDB(townRoot, rigName, rigName)
+}
+
+// EnsureMetadataWithDB writes or updates the metadata.json for a rig's beads directory
+// to include proper Dolt server configuration, using the specified doltDatabase name.
+//
+// This is useful for rigs that don't have their own tracked beads and should share
+// the HQ database. For example, a new rig without a source repo's .beads/ directory
+// should use doltDatabase="hq" so that beads dispatched from HQ are visible to
+// bd ready, bd list, and other commands that don't have cross-database routing.
+func EnsureMetadataWithDB(townRoot, rigName, doltDatabase string) error {
 	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
 	// avoiding the TOCTOU race where the directory state changes between
 	// FindRigBeadsDir's Stat check and our subsequent file operations.
@@ -1122,11 +1259,11 @@ func EnsureMetadata(townRoot, rigName string) error {
 		_ = json.Unmarshal(data, &existing) // best effort
 	}
 
-	// Set/update the dolt server fields
+	// Patch dolt server fields: ensure server mode and set database target.
 	existing["database"] = "dolt"
 	existing["backend"] = "dolt"
 	existing["dolt_mode"] = "server"
-	existing["dolt_database"] = rigName
+	existing["dolt_database"] = doltDatabase
 
 	// Always set jsonl_export to the canonical filename.
 	// Historical migrations may have left stale values (e.g., "beads.jsonl").
@@ -1147,14 +1284,34 @@ func EnsureMetadata(townRoot, rigName string) error {
 // EnsureAllMetadata updates metadata.json for all rig databases known to the
 // Dolt server. This is the fix for the split-brain problem where worktrees
 // each have their own isolated database.
+//
+// If a rig's metadata already has dolt_database set to a different valid database
+// (e.g., "hq" for rigs sharing the HQ database), that value is preserved rather
+// than overwritten. This prevents EnsureAllMetadata from breaking rigs that
+// intentionally share a database (see gt-42zaq).
 func EnsureAllMetadata(townRoot string) (updated []string, errs []error) {
 	databases, err := ListDatabases(townRoot)
 	if err != nil {
 		return nil, []error{fmt.Errorf("listing databases: %w", err)}
 	}
 
+	// Build set of valid databases for cross-reference
+	dbSet := make(map[string]bool, len(databases))
+	for _, db := range databases {
+		dbSet[db] = true
+	}
+
 	for _, dbName := range databases {
-		if err := EnsureMetadata(townRoot, dbName); err != nil {
+		// Check if the rig's metadata already points to a different valid database.
+		// This happens when a rig shares the HQ database (dolt_database: "hq").
+		// We preserve that setting instead of overwriting it with the rig's own name.
+		doltDB := dbName
+		beadsDir := FindRigBeadsDir(townRoot, dbName)
+		if existing := readExistingDoltDatabase(beadsDir); existing != "" && existing != dbName && dbSet[existing] {
+			doltDB = existing // Preserve intentional cross-database reference
+		}
+
+		if err := EnsureMetadataWithDB(townRoot, dbName, doltDB); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", dbName, err))
 		} else {
 			updated = append(updated, dbName)
@@ -1162,6 +1319,24 @@ func EnsureAllMetadata(townRoot string) (updated []string, errs []error) {
 	}
 
 	return updated, errs
+}
+
+// readExistingDoltDatabase reads the dolt_database field from an existing metadata.json.
+// Returns empty string if the file doesn't exist or can't be read.
+func readExistingDoltDatabase(beadsDir string) string {
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return ""
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	if db, ok := meta["dolt_database"].(string); ok {
+		return db
+	}
+	return ""
 }
 
 // FindRigBeadsDir returns the .beads directory path for a rig (read-only lookup).
@@ -1175,6 +1350,9 @@ func EnsureAllMetadata(townRoot string) (updated []string, errs []error) {
 // that need the directory to exist, use FindOrCreateRigBeadsDir instead.
 // For read-only operations, handle errors on the returned path gracefully.
 func FindRigBeadsDir(townRoot, rigName string) string {
+	if townRoot == "" || rigName == "" {
+		return ""
+	}
 	if rigName == "hq" {
 		return filepath.Join(townRoot, ".beads")
 	}
@@ -1204,6 +1382,12 @@ func FindRigBeadsDir(townRoot, rigName string) string {
 // exist. Use FindRigBeadsDir for read-only lookups where graceful failure on
 // missing directories is acceptable.
 func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
+	if townRoot == "" {
+		return "", fmt.Errorf("townRoot cannot be empty")
+	}
+	if rigName == "" {
+		return "", fmt.Errorf("rigName cannot be empty")
+	}
 	if rigName == "hq" {
 		dir := filepath.Join(townRoot, ".beads")
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -1212,15 +1396,24 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 		return dir, nil
 	}
 
-	// Check mayor/rig/.beads first (canonical location)
+	// Check mayor/rig/.beads first (canonical location).
+	// Use MkdirAll as an idempotent existence check+create to close the
+	// TOCTOU window between os.Stat and the caller's file operations.
 	mayorBeads := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
 	if _, err := os.Stat(mayorBeads); err == nil {
+		// Ensure it still exists (no-op if present, recreates if deleted)
+		if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+			return "", fmt.Errorf("ensuring mayor beads dir: %w", err)
+		}
 		return mayorBeads, nil
 	}
 
 	// Check rig-root .beads
 	rigBeads := filepath.Join(townRoot, rigName, ".beads")
 	if _, err := os.Stat(rigBeads); err == nil {
+		if err := os.MkdirAll(rigBeads, 0755); err != nil {
+			return "", fmt.Errorf("ensuring rig beads dir: %w", err)
+		}
 		return rigBeads, nil
 	}
 

@@ -758,9 +758,55 @@ func TestAgentBeadToAddress(t *testing.T) {
 			want: "gastown/my-agent",
 		},
 		{
-			name: "non-gt prefix (invalid)",
-			bead: &agentBead{ID: "bd-gastown-witness"},
+			name: "non-gt prefix with description",
+			bead: &agentBead{
+				ID:          "bd-beads-crew-beavis",
+				Description: "Crew worker beavis in beads.\n\nrole_type: crew\nrig: beads\nagent_state: idle",
+			},
+			want: "beads/beavis",
+		},
+		{
+			name: "non-gt prefix singleton with description",
+			bead: &agentBead{
+				ID:          "bd-beads-witness",
+				Description: "Witness for beads.\n\nrole_type: witness\nrig: beads\nagent_state: idle",
+			},
+			want: "beads/witness",
+		},
+		{
+			name: "non-gt prefix no description fallback crew",
+			bead: &agentBead{ID: "bd-beads-crew-beavis"},
+			want: "beads/beavis",
+		},
+		{
+			name: "non-gt prefix no description fallback witness",
+			bead: &agentBead{ID: "bd-beads-witness"},
+			want: "beads/witness",
+		},
+		{
+			name: "non-gt prefix no description fallback refinery",
+			bead: &agentBead{ID: "db-debt_buying-refinery"},
+			want: "debt_buying/refinery",
+		},
+		{
+			name: "non-gt prefix no description fallback polecat",
+			bead: &agentBead{ID: "ppf-pyspark_pipeline_framework-polecat-Toast"},
+			want: "pyspark_pipeline_framework/Toast",
+		},
+		{
+			name: "malformed singleton witness with name segment",
+			bead: &agentBead{ID: "bd-beads-witness-extra"},
 			want: "",
+		},
+		{
+			name: "malformed singleton refinery with name segment",
+			bead: &agentBead{ID: "bd-beads-refinery-extra"},
+			want: "",
+		},
+		{
+			name: "hyphenated agent name via fallback",
+			bead: &agentBead{ID: "bd-beads-crew-my-agent"},
+			want: "beads/my-agent",
 		},
 		{
 			name: "empty ID",

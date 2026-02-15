@@ -919,9 +919,14 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		cwd, cwdErr := os.Getwd()
 		if cwdErr == nil {
 			// Normalize paths for comparison
-			cwdAbs, _ := filepath.Abs(cwd)
-			cloneAbs, _ := filepath.Abs(clonePath)
-			polecatAbs, _ := filepath.Abs(polecatDir)
+			cwdAbs, absErr1 := filepath.Abs(cwd)
+			cloneAbs, absErr2 := filepath.Abs(clonePath)
+			polecatAbs, absErr3 := filepath.Abs(polecatDir)
+
+			if absErr1 != nil || absErr2 != nil || absErr3 != nil {
+				// If we can't resolve paths, refuse to nuke for safety
+				return fmt.Errorf("cannot verify shell safety: failed to resolve paths")
+			}
 
 			if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
 				return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
@@ -1184,17 +1189,9 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		return nil, fmt.Errorf("creating fresh worktree from %s: %w", startPoint, err)
 	}
 
-	// New worktree created successfully — now safe to reset old bead and remove old worktree.
-	// Resetting the bead AFTER creation prevents inconsistent state if creation fails.
-	// NOTE: We use ResetAgentBeadForReuse instead of CloseAndClearAgentBead to avoid
-	// the close/reopen cycle that fails on Dolt backend (gt-14b8o).
-	agentID := m.agentBeadID(name)
-	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat repair"); err != nil {
-		if !errors.Is(err, beads.ErrNotFound) {
-			fmt.Printf("Warning: could not reset old agent bead %s: %v\n", agentID, err)
-		}
-	}
-
+	// New worktree created successfully — now safe to remove old worktree and reset bead.
+	// Remove old worktree BEFORE resetting bead to prevent name collision if a new
+	// spawn sees the clean bead while the old worktree still exists.
 	if err := repoGit.WorktreeRemove(oldClonePath, true); err != nil {
 		// Fall back to direct removal
 		if removeErr := os.RemoveAll(oldClonePath); removeErr != nil {
@@ -1202,6 +1199,16 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 			_ = repoGit.WorktreeRemove(tmpClonePath, true)
 			_ = os.RemoveAll(tmpClonePath)
 			return nil, fmt.Errorf("removing old clone path: %w", removeErr)
+		}
+	}
+
+	// Reset agent bead AFTER old worktree is confirmed removed.
+	// NOTE: We use ResetAgentBeadForReuse instead of CloseAndClearAgentBead to avoid
+	// the close/reopen cycle that fails on Dolt backend (gt-14b8o).
+	agentID := m.agentBeadID(name)
+	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat repair"); err != nil {
+		if !errors.Is(err, beads.ErrNotFound) {
+			fmt.Printf("Warning: could not reset old agent bead %s: %v\n", agentID, err)
 		}
 	}
 
