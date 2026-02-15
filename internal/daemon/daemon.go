@@ -649,8 +649,12 @@ func (d *Daemon) checkDeaconHeartbeat() {
 
 	age := hb.Age()
 
-	// If heartbeat is fresh, nothing to do
-	if !hb.ShouldPoke() {
+	// If heartbeat is fresh (<5 min), nothing to do.
+	// Uses IsFresh() (5m threshold) instead of ShouldPoke() (15m threshold)
+	// so the nudge path (5-10m) is reachable. Previously ShouldPoke() gated
+	// at 15m, making the nudge branch dead code — the daemon went straight
+	// from no-action to restart, never nudging. (gt-kvc)
+	if hb.IsFresh() {
 		return
 	}
 

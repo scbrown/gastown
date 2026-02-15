@@ -107,10 +107,10 @@ func (hb *Heartbeat) IsVeryStale() bool {
 	return hb == nil || hb.Age() >= 15*time.Minute
 }
 
-// ShouldPoke returns true if the daemon should poke the Deacon.
-// The Deacon should be poked if:
-// - No heartbeat exists
-// - Heartbeat is very stale (>5 minutes)
+// ShouldPoke returns true if the heartbeat is very stale (>=15 minutes) or missing.
+// Used by Boot triage for coarse-grained stuck detection. The daemon's own
+// checkDeaconHeartbeat uses IsFresh() (5m threshold) for finer-grained
+// nudge vs restart decisions. (gt-kvc)
 func (hb *Heartbeat) ShouldPoke() bool {
 	return hb.IsVeryStale()
 }

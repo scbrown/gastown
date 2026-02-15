@@ -71,10 +71,20 @@ func (w *ConvoyWatcher) Stop() {
 	w.wg.Wait()
 }
 
+// Convoy watcher backoff parameters (gt-kvc: prevents crash-looping)
+const (
+	convoyWatcherBackoffBase = 5 * time.Second
+	convoyWatcherBackoffMax  = 5 * time.Minute
+	convoyWatcherBackoffMult = 2
+)
+
 // run is the main watcher loop.
+// Uses exponential backoff on repeated failures to prevent crash-looping
+// when bd activity consistently fails (e.g., dolt server down). (gt-kvc)
 func (w *ConvoyWatcher) run() {
 	defer w.wg.Done()
 
+	backoff := convoyWatcherBackoffBase
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -82,14 +92,21 @@ func (w *ConvoyWatcher) run() {
 		default:
 			// Start bd activity --follow --town --json
 			if err := w.watchActivity(); err != nil {
-				w.logger("convoy watcher: bd activity error: %v, restarting in 5s", err)
-				// Wait before retry, but respect context cancellation
+				w.logger("convoy watcher: bd activity error: %v, retrying in %v", err, backoff)
+				// Wait with backoff, but respect context cancellation
 				select {
 				case <-w.ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
-					// Continue to retry
+				case <-time.After(backoff):
+					// Increase backoff for next failure
+					backoff *= time.Duration(convoyWatcherBackoffMult)
+					if backoff > convoyWatcherBackoffMax {
+						backoff = convoyWatcherBackoffMax
+					}
 				}
+			} else {
+				// Successful connection resets backoff
+				backoff = convoyWatcherBackoffBase
 			}
 		}
 	}
