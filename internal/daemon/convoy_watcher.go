@@ -72,8 +72,16 @@ func (w *ConvoyWatcher) Stop() {
 }
 
 // run is the main watcher loop.
+// PATCH-011: Exponential backoff on repeated failures to prevent crash-looping
+// when bd activity keeps failing (e.g., Dolt server down).
 func (w *ConvoyWatcher) run() {
 	defer w.wg.Done()
+
+	const (
+		baseDelay = 5 * time.Second
+		maxDelay  = 5 * time.Minute
+	)
+	delay := baseDelay
 
 	for {
 		select {
@@ -82,14 +90,21 @@ func (w *ConvoyWatcher) run() {
 		default:
 			// Start bd activity --follow --town --json
 			if err := w.watchActivity(); err != nil {
-				w.logger("convoy watcher: bd activity error: %v, restarting in 5s", err)
-				// Wait before retry, but respect context cancellation
+				w.logger("convoy watcher: bd activity error: %v, retrying in %v", err, delay)
+				// Wait before retry with exponential backoff
 				select {
 				case <-w.ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
-					// Continue to retry
+				case <-time.After(delay):
+					// Increase delay for next failure
+					delay *= 2
+					if delay > maxDelay {
+						delay = maxDelay
+					}
 				}
+			} else {
+				// Successful connection (clean exit) — reset backoff
+				delay = baseDelay
 			}
 		}
 	}

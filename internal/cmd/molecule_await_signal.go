@@ -182,7 +182,16 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	result, err := waitForActivitySignal(ctx, workDir)
 	if err != nil {
-		return fmt.Errorf("feed subscription failed: %w", err)
+		// PATCH-011: Degrade feed failure to timeout instead of hard error.
+		// This allows the patrol loop to continue even when bd activity is broken
+		// (e.g., Dolt server down). The Deacon will retry on the next cycle.
+		if !awaitSignalQuiet {
+			fmt.Printf("%s Feed subscription failed (treating as timeout): %v\n",
+				style.Warning.Render("⚠"), err)
+		}
+		result = &AwaitSignalResult{
+			Reason: "timeout",
+		}
 	}
 
 	result.Elapsed = time.Since(startTime)
@@ -286,6 +295,11 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 
 // waitForActivitySignal starts bd activity --follow and waits for any output.
 // Returns immediately when a line is received, or when context is canceled.
+//
+// PATCH-011: Detect immediate process exit (e.g., Dolt server down) to avoid
+// waiting the full timeout when the feed subscription is broken. If bd exits
+// within 2 seconds without producing output, return an error immediately so the
+// Deacon can proceed to the next patrol cycle instead of sleeping.
 func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalResult, error) {
 	// Start bd activity --follow
 	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
@@ -303,6 +317,8 @@ func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalRes
 	// Channel for results
 	signalCh := make(chan string, 1)
 	errCh := make(chan error, 1)
+	// eofCh fires when scanner.Scan returns false with no error (clean EOF / process exit)
+	eofCh := make(chan struct{}, 1)
 
 	// Read lines in goroutine
 	go func() {
@@ -312,10 +328,14 @@ func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalRes
 			signalCh <- scanner.Text()
 		} else if err := scanner.Err(); err != nil {
 			errCh <- err
+		} else {
+			// scanner.Scan returned false with nil error — clean EOF.
+			// This happens when bd activity exits immediately (e.g., Dolt down).
+			eofCh <- struct{}{}
 		}
 	}()
 
-	// Wait for signal, error, or timeout
+	// Wait for signal, error, EOF, or timeout
 	select {
 	case signal := <-signalCh:
 		// Got activity signal - kill the process and return
@@ -330,6 +350,11 @@ func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalRes
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return nil, fmt.Errorf("reading from feed: %w", err)
+
+	case <-eofCh:
+		// Process exited without producing output — feed subscription broken
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("bd activity exited immediately (feed subscription failed)")
 
 	case <-ctx.Done():
 		// Timeout - kill process and return timeout result
