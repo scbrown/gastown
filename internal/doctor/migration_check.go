@@ -227,6 +227,18 @@ func loadRigNames(rigsPath string) map[string]struct{} {
 	return rigs
 }
 
+// rigServerConfig holds a rig's Dolt server connection details from metadata.json.
+type rigServerConfig struct {
+	RigName string
+	Host    string
+	Port    int
+}
+
+// addr returns the host:port string for this rig's configured server.
+func (r rigServerConfig) addr() string {
+	return fmt.Sprintf("%s:%d", r.Host, r.Port)
+}
+
 // DoltServerReachableCheck detects the split-brain risk: metadata.json says
 // dolt_mode=server but the Dolt server is not actually accepting connections.
 // In this state, bd commands may silently create isolated local databases
@@ -248,7 +260,7 @@ func NewDoltServerReachableCheck() *DoltServerReachableCheck {
 
 // Run checks if any rig has server-mode metadata but the server is unreachable.
 func (c *DoltServerReachableCheck) Run(ctx *CheckContext) *CheckResult {
-	// Find rigs configured for server mode
+	// Find rigs configured for server mode, with their host/port from metadata
 	serverRigs := c.findServerModeRigs(ctx.TownRoot)
 	if len(serverRigs) == 0 {
 		return &CheckResult{
@@ -259,26 +271,41 @@ func (c *DoltServerReachableCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	// Server mode is configured — check if the server is actually reachable
-	port := 3307 // default Dolt server port
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
+	// Group rigs by unique address to avoid redundant connectivity checks
+	addrToRigs := make(map[string][]string)
+	for _, rig := range serverRigs {
+		addrToRigs[rig.addr()] = append(addrToRigs[rig.addr()], rig.RigName)
+	}
+
+	// Check each unique address
+	var unreachable []string
+	var reachableCount int
+	for addr, rigNames := range addrToRigs {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			unreachable = append(unreachable,
+				fmt.Sprintf("%s (rigs: %s)", addr, strings.Join(rigNames, ", ")))
+		} else {
+			_ = conn.Close()
+			reachableCount += len(rigNames)
+		}
+	}
+
+	if len(unreachable) > 0 {
+		details := append(unreachable,
+			"bd commands will fail or create isolated local databases",
+			"This is the split-brain scenario — data written now may be invisible to the server later",
+		)
 		return &CheckResult{
 			Name:   c.Name(),
 			Status: StatusError,
-			Message: fmt.Sprintf("SPLIT-BRAIN RISK: %d rig(s) configured for Dolt server mode but server unreachable at %s",
-				len(serverRigs), addr),
-			Details: []string{
-				fmt.Sprintf("Rigs expecting server: %s", strings.Join(serverRigs, ", ")),
-				"bd commands will fail or create isolated local databases",
-				"This is the split-brain scenario — data written now may be invisible to the server later",
-			},
-			FixHint:  "Run 'gt dolt start' to start the Dolt server",
+			Message: fmt.Sprintf("SPLIT-BRAIN RISK: %d server address(es) unreachable for %d rig(s)",
+				len(unreachable), len(serverRigs)-reachableCount),
+			Details:  details,
+			FixHint:  "Verify dolt_server_host and dolt_server_port in metadata.json, or run 'gt dolt start'",
 			Category: c.CheckCategory,
 		}
 	}
-	_ = conn.Close()
 
 	return &CheckResult{
 		Name:     c.Name(),
@@ -288,45 +315,61 @@ func (c *DoltServerReachableCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// findServerModeRigs returns rig names whose metadata.json has dolt_mode=server.
-func (c *DoltServerReachableCheck) findServerModeRigs(townRoot string) []string {
-	var serverRigs []string
+// findServerModeRigs returns rigs whose metadata.json has dolt_mode=server,
+// along with their configured server host and port.
+func (c *DoltServerReachableCheck) findServerModeRigs(townRoot string) []rigServerConfig {
+	var serverRigs []rigServerConfig
 
 	// Check town-level beads (hq)
 	townBeadsDir := filepath.Join(townRoot, ".beads")
-	if c.hasServerModeMetadata(townBeadsDir) {
-		serverRigs = append(serverRigs, "hq")
+	if cfg, ok := c.readServerConfig(townBeadsDir, "hq"); ok {
+		serverRigs = append(serverRigs, cfg)
 	}
 
 	// Check rig-level beads
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
 	rigs := loadRigNames(rigsPath)
 	for rigName := range rigs {
-		// Check mayor/rig/.beads first (canonical), then rig/.beads
-		beadsDir := filepath.Join(townRoot, rigName, "mayor", "rig", ".beads")
-		if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
-			beadsDir = filepath.Join(townRoot, rigName, ".beads")
+		beadsDir := doltserver.FindRigBeadsDir(townRoot, rigName)
+		if beadsDir == "" {
+			continue
 		}
-		if c.hasServerModeMetadata(beadsDir) {
-			serverRigs = append(serverRigs, rigName)
+		if cfg, ok := c.readServerConfig(beadsDir, rigName); ok {
+			serverRigs = append(serverRigs, cfg)
 		}
 	}
 
 	return serverRigs
 }
 
-// hasServerModeMetadata reads metadata.json and checks if dolt_mode is "server".
-func (c *DoltServerReachableCheck) hasServerModeMetadata(beadsDir string) bool {
+// readServerConfig reads metadata.json and returns the server config if dolt_mode is "server".
+// Falls back to 127.0.0.1:3307 for host/port if not specified in metadata.
+func (c *DoltServerReachableCheck) readServerConfig(beadsDir, rigName string) (rigServerConfig, bool) {
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
-		return false
+		return rigServerConfig{}, false
 	}
 	var metadata struct {
-		DoltMode string `json:"dolt_mode"`
+		DoltMode       string `json:"dolt_mode"`
+		DoltServerHost string `json:"dolt_server_host"`
+		DoltServerPort int    `json:"dolt_server_port"`
 	}
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return false
+		return rigServerConfig{}, false
 	}
-	return metadata.DoltMode == "server"
+	if metadata.DoltMode != "server" {
+		return rigServerConfig{}, false
+	}
+
+	host := metadata.DoltServerHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := metadata.DoltServerPort
+	if port == 0 {
+		port = doltserver.DefaultPort
+	}
+
+	return rigServerConfig{RigName: rigName, Host: host, Port: port}, true
 }
