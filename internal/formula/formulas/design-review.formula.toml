@@ -1,0 +1,374 @@
+# Design Review Convoy Formula
+#
+# A convoy-style formula that spawns multiple polecats in parallel,
+# each reviewing a design document against a different aegis principle.
+# Results are synthesized into a unified review with pass/fail/warn.
+#
+# Usage:
+#   gt formula run design-review --doc="docs/designs/human-input-lineage.md"
+#   gt formula run design-review --doc="docs/designs/async-decision-queue.md" --preset=zfc-focused
+
+description = """
+Principles-based design review via parallel specialized reviewers.
+
+Each leg evaluates the design against a specific aegis principle. The review
+is ZFC-compliant: each leg is a model call, no framework heuristics.
+
+## Legs (parallel execution)
+- **zfc**: Zero Framework Cognition compliance
+- **charter**: Alignment with aegis charter principles
+- **lineage**: Human input provenance and enforcement
+- **security**: Trust boundaries, sovereignty, attack surface
+- **feasibility**: Buildable with current system
+- **iac**: IaC-first compliance
+
+## Output
+A .reviews/<review-id>/ directory containing:
+- Individual principle reviews
+- review-summary.md with unified assessment and action items
+"""
+formula = "design-review"
+type = "convoy"
+version = 1
+
+# Input variables - provided at runtime
+[inputs]
+[inputs.doc]
+description = "Path to the design document to review"
+type = "string"
+required = true
+
+[inputs.bead]
+description = "Related bead ID for the design being reviewed"
+type = "string"
+required = false
+
+[inputs.context]
+description = "Additional context (why this review, what to focus on)"
+type = "string"
+required = false
+
+# Base prompt template - injected into all leg prompts
+[prompts]
+base = """
+# Design Review Assignment
+
+You are a specialized design reviewer participating in a convoy review.
+Your job is to evaluate a design document against a specific aegis principle.
+
+## Important: ZFC Compliance
+
+This review itself must be ZFC-compliant. You are a model making judgments —
+do NOT produce findings that recommend hardcoded rules, pattern matching, or
+heuristic classification in the reviewed design. If the design proposes such
+mechanisms, flag them as ZFC violations.
+
+## Context
+- **Formula**: {{.formula_name}}
+- **Document**: {{.doc}}
+- **Your principle**: {{.leg.focus}}
+- **Leg ID**: {{.leg.id}}
+
+{{if .bead}}
+## Related Bead
+{{.bead}}
+{{end}}
+
+{{if .context}}
+## Additional Context
+{{.context}}
+{{end}}
+
+## Aegis Principles Reference
+
+Read these before reviewing:
+- charter.md — who we are, what we value
+- docs/principles/zfc.md — Zero Framework Cognition
+- guardrails.md — what we MUST NOT do
+
+## Your Task
+{{.leg.description}}
+
+## Output Requirements
+Write your review to: **{{.output_path}}**
+
+Structure your output as:
+```markdown
+# {{.leg.title}} Review
+
+## Verdict: PASS | WARN | FAIL
+
+## Summary
+(1-2 paragraph assessment)
+
+## Findings
+
+### Compliant
+(What the design gets right for this principle)
+
+### Violations
+(Specific violations with quotes from the design and explanation)
+- **Location**: Where in the doc
+- **Issue**: What's wrong
+- **Principle**: Which specific principle is violated
+- **Suggestion**: How to fix it (delegate to a model, not add a rule)
+
+### Warnings
+(Areas that could become violations, or need clarification)
+
+## Recommendations
+(Prioritized list of changes needed)
+```
+
+Be thorough but actionable. Quote specific passages from the design.
+"""
+
+# Output configuration
+[output]
+directory = ".reviews/{{.review_id}}"
+leg_pattern = "{{.leg.id}}-review.md"
+synthesis = "review-summary.md"
+
+# Leg definitions - each spawns a parallel polecat
+
+[[legs]]
+id = "zfc"
+title = "Zero Framework Cognition Review"
+focus = "ZFC compliance — all decisions delegated to models"
+description = """
+Review the design for Zero Framework Cognition compliance.
+
+**Read first:** docs/principles/zfc.md
+
+**ZFC violations to look for:**
+- Any mechanism that makes decisions via hardcoded rules, case/switch, or if/else
+- Pattern matching on natural language text (regex, keyword lists)
+- Heuristic classification (routing based on labels, keywords, or scores)
+- Ranking or scoring algorithms that choose among alternatives
+- Semantic analysis done by code instead of delegated to a model
+- Quality judgments embedded in framework code
+
+**ZFC-compliant patterns to verify:**
+- Decision points clearly delegate to model calls
+- Framework code is pure IO, plumbing, structural safety, policy enforcement
+- AI output is never parsed with regex — structured output or model re-evaluation
+- The cognitive pyramid is considered (Haiku/Sonnet/Opus routing)
+
+**Key question:** At every decision point in this design, is the decision
+made by a model or by framework code? If by framework code, it's a ZFC violation.
+
+**Deliverable:** zfc-review.md with specific violations quoted from the design.
+"""
+
+[[legs]]
+id = "charter"
+title = "Charter Alignment Review"
+focus = "Alignment with aegis charter principles"
+description = """
+Review the design for alignment with aegis charter principles.
+
+**Read first:** charter.md
+
+**Charter principles to check:**
+- Autonomy with accountability — does this design enable autonomous operation
+  while maintaining traceability?
+- Proactive > reactive — does it prevent problems or just detect them?
+- Minimal blast radius — are changes small, tested, reversible?
+- Observable everything — is the design observable? Can you tell if it's working?
+- Continuous improvement — does the system get better over time?
+- Boring technology — are we using proven tools or introducing unnecessary novelty?
+- Agent legibility — can agents understand and operate this design?
+- Mission-first resource discipline — does this advance homelab outcomes?
+- Upstream alignment — does it stay close to upstream tools?
+
+**Key question:** Would the aegis charter authors recognize this design as
+consistent with their stated principles?
+
+**Deliverable:** charter-review.md with principle-by-principle assessment.
+"""
+
+[[legs]]
+id = "lineage"
+title = "Human Input Lineage Review"
+focus = "Human input provenance and enforcement"
+description = """
+Review the design for human input lineage considerations.
+
+**Read first:** docs/designs/human-input-lineage.md
+
+**Lineage questions:**
+- Does this design produce artifacts (files, configs, beads)? If so, how will
+  their origin be tracked?
+- Does it modify existing artifacts? If so, how will it respect human-originated
+  content?
+- Does it create decision points? Are those decisions traceable to human input?
+- Does it enforce Human Input Sovereignty (Golden Rule 16)?
+- Can a future reviewer trace any output of this design back to what caused it?
+
+**Enforcement questions:**
+- If this design modifies human-originated content, what prevents silent overwrite?
+- Is the enforcement mechanism ZFC-compliant (model-based, not rule-based)?
+
+**Key question:** After this design is implemented, can we answer "who asked
+for this and why?" for every artifact it produces?
+
+**Deliverable:** lineage-review.md with provenance assessment.
+"""
+
+[[legs]]
+id = "security"
+title = "Security Review"
+focus = "Trust boundaries, sovereignty, attack surface"
+description = """
+Review the design for security considerations.
+
+**Read first:** guardrails.md
+
+**Security questions:**
+- What are the trust boundaries? Who trusts whom?
+- What new attack surface does this create?
+- How are human identities verified?
+- Are secrets handled correctly (no hardcoding, proper rotation)?
+- Does it respect authority levels (overseer/operator/observer)?
+- What happens if a component is compromised?
+- Are there defense-in-depth layers?
+
+**Sovereignty questions:**
+- Can agents escalate their own privileges through this design?
+- Can agents fabricate human attribution?
+- Are audit trails immutable?
+
+**Key question:** What's the worst case if an agent or external attacker
+exploits this design?
+
+**Deliverable:** security-review.md with threat assessment.
+"""
+
+[[legs]]
+id = "feasibility"
+title = "Feasibility Review"
+focus = "Buildable with current system, dependencies mapped"
+description = """
+Review the design for implementation feasibility.
+
+**Feasibility questions:**
+- Can this be built with existing tools and infrastructure?
+- What new dependencies does it introduce?
+- What's the implementation complexity (phases, person-effort)?
+- Are there blocking dependencies on incomplete work?
+- Does it require changes to multiple repos/services simultaneously?
+- What's the rollback plan if implementation fails?
+- Does it work with our current scale (~20 containers, ~6 agents, 1 human)?
+
+**Resource questions:**
+- Does it add operational burden? New services to maintain?
+- Does it increase Claude token usage significantly?
+- Does it require new infrastructure (containers, databases)?
+
+**Key question:** Can a polecat implement phase 1 of this design in a single
+session, or does it need a multi-session coordination plan?
+
+**Deliverable:** feasibility-review.md with implementation assessment.
+"""
+
+[[legs]]
+id = "iac"
+title = "IaC-First Review"
+focus = "Infrastructure as Code compliance"
+description = """
+Review the design for IaC-first compliance.
+
+**Read:** The goldblum IaC repo structure (ansible/, terraform/)
+
+**IaC-first questions:**
+- Does this design create or modify infrastructure? If so, is it through
+  goldblum repo (Ansible roles, Terraform plans)?
+- Does it require ad-hoc SSH or manual configuration?
+- Are all config changes captured in templates, not applied by hand?
+- Can the infrastructure be reproduced from code alone?
+- Does it add new services? If so, is there an Ansible role for deployment?
+
+**Standing directives to verify:**
+- Services go into Proxmox LXC containers, NOT luvu (unless AVX2 needed)
+- koror: no direct SSH/API, but Terraform container creation is allowed
+- kota: additive changes only, don't disturb Plex/Jellyfin
+- All infra changes through goldblum repo
+
+**Key question:** If we nuked the infrastructure tomorrow, could we rebuild
+this design entirely from the goldblum repo?
+
+**Deliverable:** iac-review.md with IaC compliance assessment.
+"""
+
+# Presets
+[presets]
+[presets.full]
+description = "Full principles review — all legs"
+legs = ["zfc", "charter", "lineage", "security", "feasibility", "iac"]
+
+[presets.zfc-focused]
+description = "ZFC and charter focus — for design patterns"
+legs = ["zfc", "charter", "feasibility"]
+
+[presets.infra]
+description = "Infrastructure focus — IaC, security, feasibility"
+legs = ["iac", "security", "feasibility"]
+
+[presets.gate]
+description = "Light review — ZFC and security only"
+legs = ["zfc", "security"]
+
+# Synthesis step
+[synthesis]
+title = "Design Review Synthesis"
+description = """
+Combine all principle reviews into a unified assessment.
+
+**Your input:**
+All principle reviews from: {{.output.directory}}/
+
+**Your output:**
+A synthesized review at: {{.output.directory}}/{{.output.synthesis}}
+
+**Structure:**
+```markdown
+# Design Review: {{.doc}}
+
+## Overall Verdict: PASS | CONDITIONAL PASS | FAIL
+
+## Executive Summary
+(2-3 paragraph overview: what the design does, how it fares against principles)
+
+## Principle Verdicts
+
+| Principle | Verdict | Key Finding |
+|-----------|---------|-------------|
+| ZFC | PASS/WARN/FAIL | One-line summary |
+| Charter | PASS/WARN/FAIL | One-line summary |
+| Lineage | PASS/WARN/FAIL | One-line summary |
+| Security | PASS/WARN/FAIL | One-line summary |
+| Feasibility | PASS/WARN/FAIL | One-line summary |
+| IaC | PASS/WARN/FAIL | One-line summary |
+
+## Critical Issues (must fix before implementation)
+(Deduplicated from all legs, prioritized by impact)
+
+## Warnings (should address)
+(Non-blocking but important)
+
+## Commendations
+(What the design gets right — reinforce good patterns)
+
+## Recommended Actions
+1. (Most important fix)
+2. (Second most important)
+...
+
+## Decision Points for Human
+(Questions that need Stiwi's input before proceeding)
+```
+
+Deduplicate issues found by multiple legs. Prioritize by impact.
+A single FAIL on any critical principle = overall FAIL.
+"""
+depends_on = ["zfc", "charter", "lineage", "security", "feasibility", "iac"]
