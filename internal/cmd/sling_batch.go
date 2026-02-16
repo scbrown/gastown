@@ -69,20 +69,21 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 	// Spawn a polecat for each bead and sling it
 	for i, beadID := range beadIDs {
-		// Admission control: throttle spawns when --max-concurrent is set
+		// Admission control: throttle spawns when --max-concurrent is set (aegis-greg).
+		// Count actual live tmux sessions instead of using a naive counter reset.
 		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
 			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
 				style.Warning.Render("⏳"), slingMaxConcurrent)
-			// Wait for sessions to settle before spawning more
-			for wait := 0; wait < 30; wait++ {
-				time.Sleep(2 * time.Second)
-				if wait >= 2 {
+			// Poll every 5s for up to 60s waiting for sessions to finish
+			t := tmux.NewTmux()
+			for wait := 0; wait < 12; wait++ {
+				time.Sleep(5 * time.Second)
+				liveSessions, _ := t.ListSessions()
+				activeCount = len(liveSessions)
+				if activeCount < slingMaxConcurrent {
 					break
 				}
 			}
-			// Reset counter after cooldown — polecats become self-sufficient
-			// quickly, so we use time-based batching rather than precise counting
-			activeCount = 0
 		}
 
 		fmt.Printf("\n[%d/%d] Slinging %s...\n", i+1, len(beadIDs), beadID)
@@ -216,27 +217,32 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 		// Start polecat session now that molecule/bead is attached.
 		// This ensures polecat sees its work when gt prime runs on session start.
+		// Retry once on failure (aegis-greg): concurrent Claude API connections can
+		// cause rate limits that kill sessions during startup.
 		pane, err := spawnInfo.StartSession()
 		if err != nil {
-			fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
+			fmt.Printf("  %s Session start failed: %v, retrying in 10s...\n", style.Warning.Render("⚠"), err)
+			time.Sleep(10 * time.Second)
+			pane, err = spawnInfo.StartSession()
+		}
+		if err != nil {
+			fmt.Printf("  %s Could not start session after retry: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
 			rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir)
 			results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: false})
 			continue
-		} else {
-			fmt.Printf("  %s Session started for %s\n", style.Bold.Render("▶"), spawnInfo.PolecatName)
-			// Fresh polecats get StartupNudge from SessionManager.Start(),
-			// so no need to inject a start prompt here.
-			_ = pane
 		}
+		fmt.Printf("  %s Session started for %s\n", style.Bold.Render("▶"), spawnInfo.PolecatName)
+		_ = pane
 
 		activeCount++
 		results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: true})
 
-		// Delay between spawns to prevent Dolt lock contention — sequential
-		// spawns without delay cause database lock timeouts when multiple bd
-		// operations (agent bead creation, hook setting) overlap.
+		// Stagger session starts to avoid Claude API rate limits (aegis-greg).
+		// The previous 2s delay between spawns was insufficient because the delay
+		// was between spawn operations, not between session starts. Now we add a
+		// 5s cooldown after each successful session start to let the API settle.
 		if i < len(beadIDs)-1 {
-			time.Sleep(2 * time.Second)
+			time.Sleep(5 * time.Second)
 		}
 	}
 
