@@ -77,16 +77,42 @@ var branchCheckExemptCommands = map[string]bool{
 	"git-init":   true, // Git setup
 }
 
+// Commands exempt from the BuiltProperly fatal check.
+// These diagnostic/setup commands should work even with an improperly built binary
+// so users can identify and fix the problem.
+var buildCheckExemptCommands = map[string]bool{
+	"version":    true,
+	"help":       true,
+	"completion": true,
+	"doctor":     true,
+	"install":    true,
+}
+
 // persistentPreRun runs before every command.
 func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Check if binary was built properly (via make build, not raw go build).
-	// Raw go build produces unsigned binaries that macOS may kill.
-	// Warning only - doesn't block execution.
+	// Raw go build skips ldflags, producing a binary with broken mail subsystem
+	// and missing version info. This is a FATAL error for most commands.
+	// Diagnostic commands (version, help, doctor, install) are exempt so users
+	// can identify and fix the problem.
 	if BuiltProperly == "" {
-		fmt.Fprintln(os.Stderr, "WARNING: This binary was built with 'go build' directly.")
-		fmt.Fprintln(os.Stderr, "         Use 'make build' to create a properly signed binary.")
-		if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
-			fmt.Fprintf(os.Stderr, "         Run from: %s\n", gtRoot)
+		cmdName := cmd.Name()
+		if buildCheckExemptCommands[cmdName] {
+			fmt.Fprintln(os.Stderr, "WARNING: This binary was built with 'go build' directly.")
+			fmt.Fprintln(os.Stderr, "         Use 'make build' or 'make install' for a working binary.")
+		} else {
+			fmt.Fprintln(os.Stderr, "FATAL: This gt binary was NOT built with 'make build'.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "  Raw 'go build' and 'go install' skip critical build flags,")
+			fmt.Fprintln(os.Stderr, "  producing a binary with a broken mail subsystem and no version info.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "  Fix: cd to the gastown repo and run 'make install'")
+			if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
+				fmt.Fprintf(os.Stderr, "  Repo: %s\n", gtRoot)
+			}
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "  Allowed commands with this binary: gt version, gt help, gt doctor, gt install")
+			return fmt.Errorf("binary not built with 'make build' — refusing to run")
 		}
 	}
 

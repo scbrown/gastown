@@ -1,4 +1,4 @@
-.PHONY: build install clean test test-e2e-container generate check-up-to-date
+.PHONY: build install clean test test-e2e-container generate check-up-to-date install-hooks
 
 BINARY := gt
 BUILD_DIR := .
@@ -61,3 +61,9 @@ test:
 test-e2e-container:
 	docker build -f Dockerfile.e2e -t gastown-test .
 	docker run --rm gastown-test
+
+install-hooks:
+	@mkdir -p .git/hooks
+	@cp scripts/pre-commit-build-check.sh .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "Installed pre-commit hook (build guardrail check)"
