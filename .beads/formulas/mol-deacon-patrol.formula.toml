@@ -495,9 +495,85 @@ gt mail send mayor/ -s "Health: <rig> <component> unresponsive" \\
 Reset unresponsive_cycles to 0 when component responds normally."""
 
 [[steps]]
+id = "stuck-session-detection"
+title = "Detect stuck sessions and stalled dispatch"
+needs = ["health-scan"]
+description = """
+Detect sessions that are alive but unproductive (aegis-5y7ne).
+
+The Witness tracks output freshness, but the Deacon provides backup detection
+and handles the mayor-specific dispatch stall scenario.
+
+**Step 1: Mayor Dispatch Check**
+
+If mayor session is alive, check if work is accumulating with no polecats:
+```bash
+# Count ready beads (available for dispatch)
+bd ready --count 2>/dev/null || bd list --status=open --label=ready --count 2>/dev/null
+# Count active polecats
+gt status --json | jq '.polecats | length'
+```
+
+**If ready beads > 3 AND active polecats = 0 AND mayor alive:**
+Mayor is likely stuck (not dispatching work). Action:
+```bash
+gt mail send mayor/ -s "DISPATCH_STALL: ready beads accumulating" \\
+  -m "Ready beads: <count>
+Active polecats: 0
+Mayor appears alive but not dispatching.
+
+Consider restarting mayor session if this persists."
+```
+
+If this condition persists for 2+ patrol cycles, restart the mayor:
+```bash
+gt session restart mayor
+```
+
+**Step 2: Bead Staleness Check (all hooked agents)**
+
+For each agent (crew, polecats) with a hooked bead:
+```bash
+bd list --status=hooked --json
+# For each: check Updated timestamp
+bd show <bead-id> --json
+```
+
+**Assessment matrix:**
+
+| Bead untouched for | Session alive? | Action |
+|-------------------|----------------|--------|
+| < 30 min | Yes | Normal — agent working |
+| 30-60 min | Yes | Note in patrol log |
+| 1-2 hours | Yes | Nudge session: gt nudge <session> "Status check" |
+| 2+ hours | Yes | **Restart session** |
+| Any duration | No | ZOMBIE — handled by zombie-scan step |
+
+```bash
+# Nudge a stale session
+gt nudge <session> "HEALTH_CHECK: Your hooked bead <bead-id> hasn't been updated in <duration>. Are you stuck? Report status."
+```
+
+**Step 3: Cross-reference with Witness stuck reports**
+
+Check for STUCK_SESSION mail from Witness:
+```bash
+gt mail inbox | grep STUCK_SESSION
+```
+
+If Witness has already flagged a session, confirm and take action:
+- First report: Nudge the session
+- Second report (same session): Restart the session
+- Persistent stuck: Escalate to Mayor
+
+**ZFC Principle**: You (Claude) decide what constitutes "stuck" based on
+context. A crew session working on a complex investigation may legitimately
+go 1+ hours without updating its bead. A polecat should update more frequently."""
+
+[[steps]]
 id = "zombie-scan"
 title = "Detect zombie polecats (NO KILL AUTHORITY)"
-needs = ["health-scan"]
+needs = ["stuck-session-detection"]
 description = """
 Defense-in-depth DETECTION of zombie polecats that Witness should have cleaned.
 
