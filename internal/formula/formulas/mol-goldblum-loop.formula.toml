@@ -1,0 +1,270 @@
+description = """
+Strategic orchestration cycle for goldblum (planner/orchestrator).
+
+Goldblum is the rig's strategic brain. With warden (maldoon) handling crew
+monitoring and QA handling verification, goldblum focuses on synthesis and
+strategy: reading briefings, reviewing PO reports, updating the plan,
+coordinating cross-rig work, and verifying that dispatched work actually lands.
+
+## When to Use
+
+This is goldblum's primary operating loop. When goldblum has no specific
+hooked work, this formula drives the strategic cycle.
+
+## Design Principles
+
+- **Synthesis over observation**: Warden observes crew, PO crew probes domains.
+  Goldblum synthesizes those inputs into strategic direction.
+- **rig-plans.md is the source of truth**: All strategic decisions are reflected
+  in rig-plans.md. If it's not in the plan, it's not planned.
+- **Dispatch and verify**: Filing beads isn't enough. Verify work lands.
+- **Cross-rig awareness**: Goldblum coordinates with other rigs via mayor.
+"""
+formula = "mol-goldblum-loop"
+version = 1
+
+[vars]
+[vars.rig]
+description = "Rig name"
+default = "gastown"
+
+[[steps]]
+id = "ingest-briefing"
+title = "Read warden/maldoon briefing"
+description = """
+Ingest the latest crew status briefing from the warden (maldoon).
+
+**Step 1: Check mail for warden briefing**
+```bash
+gt mail inbox
+```
+
+Look for mail from maldoon/warden with subject containing "briefing" or
+"crew status". This is the structured output of maldoon's patrol cycle.
+
+**Step 2: Parse the briefing**
+
+The warden briefing contains:
+- Crew member status: who's working, stuck, idle, or offline
+- Progress assessment: are in-progress beads moving?
+- Stuck analysis: why is this crew member not progressing?
+- Recommendations: suggested interventions
+
+**Step 3: Note action items**
+
+From the briefing, identify:
+- Crew members needing intervention (reassignment, unblocking)
+- Beads that are stuck and need priority change
+- Resource allocation issues (too many/few workers on a problem)
+
+**Step 4: If no briefing available**
+
+If maldoon hasn't sent a briefing yet, run a quick crew survey yourself:
+```bash
+bd list --status=in_progress    # What's being worked on
+bd list --label stuck           # What's stuck
+gt crew list {{rig}}            # Who's online
+```
+
+**Exit criteria:** Current crew status understood. Action items noted."""
+
+[[steps]]
+id = "review-po-reports"
+title = "Synthesize crew PO reports"
+needs = ["ingest-briefing"]
+description = """
+Read and synthesize PO reports from all crew members.
+
+**Step 1: Check mail for PO reports**
+```bash
+gt mail inbox
+```
+
+Look for mail with subject containing "PO report" from crew members.
+Each crew member runs a mol-crew-po cycle that generates these.
+
+**Step 2: Synthesize across domains**
+
+For each PO report:
+- What's the domain health? (healthy/degraded/broken)
+- What new gaps were filed?
+- What cross-cutting concerns emerge?
+- What needs goldblum's prioritization?
+
+**Step 3: Identify cross-domain patterns**
+
+Look for themes:
+- Multiple domains reporting similar issues (systemic problem)
+- Dependencies between domains (one fix unblocks several)
+- Conflicting priorities (two domains need the same resource)
+
+**Step 4: If no PO reports available**
+
+Check recent bead activity for domain health signals:
+```bash
+bd list --type=bug --since 24h       # Recent bugs filed
+bd list --label desire-path          # Agent ergonomic issues
+```
+
+**Exit criteria:** PO reports synthesized. Cross-domain patterns identified."""
+
+[[steps]]
+id = "strategic-planning"
+title = "Update rig-plans.md and identify gaps"
+needs = ["review-po-reports"]
+description = """
+Update the strategic plan based on current intelligence.
+
+**Step 1: Read current plan**
+```bash
+cat docs/plans/rig-plans.md
+```
+
+**Step 2: Update state sections**
+
+For each section in rig-plans.md:
+- Update "Current State" with today's date
+- Incorporate PO report findings
+- Mark completed items
+- Adjust priorities based on new intelligence
+
+**Step 3: Identify strategic gaps**
+
+Beyond what individual PO reports found, look for:
+- Capability gaps: what can't the rig do that it should?
+- Architecture gaps: are we building on sand anywhere?
+- Process gaps: are workflows breaking down?
+- People gaps: do we need new crew roles?
+
+**Step 4: Rebalance priorities**
+
+With full picture in hand:
+- Are P1 items still P1? Should anything be promoted/demoted?
+- Is work distributed well across crew members?
+- Are any epic arcs stalled?
+
+**Step 5: Commit plan updates**
+```bash
+git add docs/plans/rig-plans.md
+git commit -m "docs: rig-plans.md — goldblum strategic update"
+```
+
+**Exit criteria:** rig-plans.md reflects current reality and strategic direction."""
+
+[[steps]]
+id = "cross-rig-coordination"
+title = "Dispatch work and resolve blockers"
+needs = ["strategic-planning"]
+description = """
+Dispatch work to polecats, coordinate across rigs, resolve blockers.
+
+**Step 1: Review unassigned beads**
+```bash
+bd ready                       # Available work
+bd list --status=open --no-assignee  # Unassigned items
+```
+
+**Step 2: Assign and dispatch**
+
+For each high-priority unassigned bead:
+- Is it ready for a polecat? (clear acceptance criteria, no blockers)
+- Sling to appropriate rig:
+  ```bash
+  gt sling <bead-id> {{rig}}
+  ```
+- Or assign to a specific crew member if it needs design first
+
+**Step 3: Resolve blockers**
+
+From the warden briefing and PO reports, address blockers:
+- Unblock stuck beads: remove dependencies, clarify requirements
+- Reassign stalled work: if someone's stuck, consider reassignment
+- Escalate to Stiwi: if human input needed
+  ```bash
+  gt mail send --human -s "Decision needed: ..." -m "..."
+  ```
+
+**Step 4: Cross-rig coordination**
+
+If work spans multiple rigs:
+- Mail mayor with coordination request
+  ```bash
+  gt mail send mayor/ -s "Cross-rig: ..." -m "..."
+  ```
+- Create cross-rig beads in HQ
+  ```bash
+  bd create --prefix hq- "Cross-rig: ..."
+  ```
+
+**Exit criteria:** High-priority work dispatched. Blockers addressed or escalated."""
+
+[[steps]]
+id = "verify-landing"
+title = "Verify dispatched work landed"
+needs = ["cross-rig-coordination"]
+description = """
+Check that previously dispatched work actually landed.
+
+**Step 1: Check recent merge activity**
+```bash
+git log --oneline -20 origin/main    # Recent merges
+```
+
+**Step 2: Cross-reference with dispatched beads**
+
+For beads you dispatched in previous cycles:
+```bash
+bd list --status=closed --since 7d   # Recently closed
+bd list --status=in_progress         # Still in flight
+```
+
+**Step 3: Verify quality**
+
+For recently landed work:
+- Did it actually fix the problem? (spot-check via MCP tools, curl, etc.)
+- Were acceptance criteria met?
+- Any regressions introduced?
+
+**Step 4: Handle non-landing**
+
+If dispatched work didn't land:
+- Is the polecat still working? → Check with warden
+- Did it fail review? → Read review comments, refile if needed
+- Was it abandoned? → Re-dispatch or deprioritize
+
+**Exit criteria:** Dispatched work verified or re-dispatched."""
+
+[[steps]]
+id = "commit-and-iterate"
+title = "Commit changes and loop or handoff"
+needs = ["verify-landing"]
+description = """
+Finalize the cycle.
+
+**Step 1: Commit any remaining changes**
+```bash
+git add -A
+git diff --cached --quiet || git commit -m "ops: goldblum strategic cycle"
+git push
+```
+
+**Step 2: Decide: loop or handoff**
+
+If context is LOW and there's more to do:
+- Squash current wisp and create fresh one
+- Continue from ingest-briefing
+
+If context is HIGH:
+```bash
+gt handoff -s "Goldblum loop handoff" -m "
+Completed: <what was done>
+Dispatched: <beads slung>
+Pending: <what needs follow-up>
+"
+```
+
+If all strategic work is current and no urgency:
+- Wait for next PO report or warden briefing
+- Or pick up a specific bead to work on directly
+
+**Exit criteria:** Changes pushed. Either looping or handed off."""
