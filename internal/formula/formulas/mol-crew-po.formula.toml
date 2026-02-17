@@ -1,0 +1,290 @@
+description = """
+Product Owner session workflow for crew members.
+
+Every crew member owns PO domains (defined in their CLAUDE.md). This formula
+drives a structured PO assessment: probe live systems, study upstream for new
+patterns, compare reality to the vision in rig-plans.md, generate work as beads,
+and report findings to goldblum for prioritization.
+
+## When to Use
+
+Run this molecule when a crew member's session has no hooked work and no urgent
+mail. The PO cycle ensures domain health is continuously assessed and gaps are
+caught before they become incidents.
+
+## Design Principles
+
+- **Discovery over assumption**: Probe live systems every time. Don't assume
+  yesterday's state is today's state.
+- **Beads over prose**: Findings become beads with acceptance criteria, not
+  free-form notes that get lost.
+- **UNASSIGNED for polecats**: Work generation creates beads that polecats can
+  pick up. The PO designs, polecats execute.
+- **Report to goldblum**: The planner needs synthesized PO reports to make
+  strategic decisions across the rig.
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| crew_name | hook context | Name of the crew member running this PO cycle |
+| rig | hook context | Rig this crew member belongs to |
+"""
+formula = "mol-crew-po"
+version = 1
+
+[[steps]]
+id = "domain-probe"
+title = "Probe PO domain systems live"
+description = """
+Test every system in your PO domain. Don't trust cached state — probe live.
+
+**Step 1: Identify your domains**
+
+Read your CLAUDE.md PO Domain Check section. It lists what you own.
+Each crew member's PO domains are different.
+
+**Step 2: Smoke-test each system**
+
+For each system in your domain, run the minimal test that proves it's alive
+and responding correctly. Use MCP tools, curl, CLI commands — whatever gives
+you ground truth.
+
+Examples by domain type:
+- **MCP tools**: Call each tool with a basic query, verify response
+- **Services**: Check systemd status, test HTTP endpoints
+- **CI/CD**: Check recent runs, verify runners are registered
+- **Monitoring**: Query Prometheus, check Alertmanager
+- **Git/Forgejo**: List repos, check API health
+
+**Step 3: Record findings**
+
+For each system, record:
+- Status: healthy / degraded / broken
+- Evidence: what you tested and what you saw
+- Delta: changed since last check? (compare to known issues in CLAUDE.md)
+
+**Step 4: Handle critical findings immediately**
+
+If anything is BROKEN (P0/P1):
+- File a bead immediately: `bd create --type bug --priority 1 "..."`
+- If it affects other agents, mail them: `gt mail send <target> -s "NOTICE: ..." -m "..."`
+- Don't wait for the report step — broken things get filed now
+
+**Exit criteria:** All PO domain systems probed. Findings recorded. Critical issues filed."""
+
+[[steps]]
+id = "upstream-study"
+title = "Study upstream repos for patterns and changes"
+needs = ["domain-probe"]
+description = """
+Check upstream sources for new patterns, features, or changes relevant to your domain.
+
+**Step 1: Identify upstream repos**
+
+Your CLAUDE.md lists the repos you own or monitor. For each:
+```bash
+# Check recent commits you haven't seen
+git log --oneline -10 origin/main
+# Or for repos you don't have cloned:
+# Use Forgejo API or gt worktree
+```
+
+**Step 2: Look for**
+
+- New features or capabilities added by other agents/humans
+- Configuration changes that affect your domain
+- README/doc updates with new patterns
+- Closed issues that change the landscape
+- Open PRs that might affect your systems
+
+**Step 3: Note patterns**
+
+Record anything that:
+- Changes how your domain systems should be configured
+- Introduces new capabilities you should leverage
+- Deprecates approaches you're currently using
+- Suggests architectural shifts
+
+**Step 4: Skip if no upstream repos**
+
+Some PO domains are purely operational (no code repos to study).
+In that case, check for relevant bead activity instead:
+```bash
+bd list --label <your-domain> --since 7d
+```
+
+**Exit criteria:** Upstream repos reviewed. New patterns noted for gap analysis."""
+
+[[steps]]
+id = "gap-analysis"
+title = "Compare state to rig-plans.md vision"
+needs = ["upstream-study"]
+description = """
+Compare current reality (from domain-probe) against the planned vision.
+
+**Step 1: Read the vision**
+```bash
+# Read your sections in rig-plans.md
+cat docs/plans/rig-plans.md
+```
+
+Find the sections relevant to your PO domains. Note:
+- Current State descriptions
+- Planned improvements / gaps listed
+- Priority items marked
+
+**Step 2: Reality vs Plan**
+
+For each planned item:
+- Is it done? → Mark it in rig-plans.md
+- Is it in progress? → Who's working on it? Is it stuck?
+- Is it not started? → Should it be? What's blocking it?
+- Is it obsolete? → Has the landscape changed?
+
+**Step 3: Identify NEW gaps**
+
+From your domain-probe findings:
+- Systems that are degraded but not in the plan
+- Capabilities agents need but don't have
+- Reliability issues not yet tracked
+- Performance or token efficiency improvements
+
+**Step 4: Prioritize gaps**
+
+Rank new gaps by impact:
+- P1: Broken or blocking other agents
+- P2: Degraded or missing important capability
+- P3: Nice-to-have improvement
+
+**Exit criteria:** Gap list with priorities. Plan sections reviewed against reality."""
+
+[[steps]]
+id = "work-generation"
+title = "File beads with acceptance criteria"
+needs = ["gap-analysis"]
+description = """
+Convert gap analysis findings into actionable beads.
+
+**Principle: UNASSIGNED for polecats.** You design the work, polecats execute.
+Every bead must have clear acceptance criteria so a polecat can pick it up
+without needing to ask questions.
+
+**Step 1: For each gap identified, create a bead**
+```bash
+bd create --type task --priority <1-3> "<descriptive title>"
+```
+
+**Step 2: Write clear acceptance criteria**
+
+Each bead description MUST include:
+- **Context**: Why this matters (1-2 sentences)
+- **Acceptance criteria**: Specific, testable conditions for "done"
+- **Scope**: What's in/out of scope
+- **Dependencies**: What must exist first (link as bd dep if needed)
+
+Example:
+```
+Context: prometheus_query tool returns 401 on authenticated endpoints.
+Agents cannot query Prometheus metrics, degrading observability.
+
+Acceptance criteria:
+- [ ] prometheus_query returns data for `up` query
+- [ ] prometheus_query returns data for `node_memory_MemAvailable_bytes` query
+- [ ] Error message includes actionable next steps on auth failure
+
+Scope: Fix auth in homelab-mcp prometheus_query tool only.
+Not in scope: Adding new Prometheus query tools.
+```
+
+**Step 3: Label appropriately**
+```bash
+bd update <id> --label <domain>,<type>
+```
+
+**Step 4: Do NOT assign beads**
+
+Leave assignee empty. Goldblum or the witness will assign to polecats.
+Exception: If you know a specific crew member should own this, assign to them.
+
+**Exit criteria:** All gaps filed as beads with acceptance criteria. No gap left as prose-only."""
+
+[[steps]]
+id = "update-plans"
+title = "Update rig-plans.md with current state"
+needs = ["work-generation"]
+description = """
+Update rig-plans.md to reflect what you found.
+
+**Step 1: Update your sections**
+
+For each section you own in `docs/plans/rig-plans.md`:
+- Update "Current State" with today's date and findings
+- Mark completed items as done
+- Add newly discovered gaps
+- Adjust priorities based on current reality
+
+**Step 2: Commit the update**
+```bash
+git add docs/plans/rig-plans.md
+git commit -m "docs: update rig-plans.md — {{crew_name}} PO assessment"
+```
+
+**Step 3: Update your CLAUDE.md known issues table**
+
+If your CLAUDE.md has a known issues table, update it:
+- Mark resolved issues
+- Add newly discovered issues
+- Update status of in-progress items
+
+```bash
+git add CLAUDE.md
+git commit -m "docs: update {{crew_name}} known issues table"
+```
+
+**Exit criteria:** rig-plans.md and CLAUDE.md reflect current reality. Changes committed."""
+
+[[steps]]
+id = "report"
+title = "Mail goldblum with PO findings"
+needs = ["update-plans"]
+description = """
+Send a structured PO report to goldblum for strategic synthesis.
+
+**Report format:**
+
+```bash
+gt mail send {{rig}}/crew/goldblum -s "{{crew_name}} PO report" -m "
+## Domain Health
+<for each system: status emoji + one-line summary>
+
+## Changes Since Last Check
+<what improved, what degraded, what's new>
+
+## Gaps Filed
+<list of new bead IDs with titles>
+
+## Recommendations
+<what goldblum should prioritize, what needs cross-crew coordination>
+
+## Blockers
+<anything you can't fix alone>
+"
+```
+
+**Key principles:**
+- Be concise — goldblum synthesizes reports from ALL crew members
+- Lead with status, not process — goldblum doesn't need to know HOW you checked
+- Highlight cross-cutting concerns — things that affect multiple domains
+- Flag anything that needs human (Stiwi) input
+
+**Exit criteria:** Report mailed to goldblum. PO cycle complete."""
+
+[vars]
+[vars.crew_name]
+description = "Name of the crew member (e.g., arnold, sentinel, ellie)"
+required = true
+
+[vars.rig]
+description = "Rig name (e.g., gastown, aegis, pixelsrc)"
+required = true
