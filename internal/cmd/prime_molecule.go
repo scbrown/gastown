@@ -345,21 +345,14 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 	vars = append(vars, fmt.Sprintf("integration_branch_refinery_enabled=%t", mq.IsRefineryIntegrationEnabled()))
 	vars = append(vars, fmt.Sprintf("integration_branch_auto_land=%t", mq.IsIntegrationBranchAutoLandEnabled()))
 	vars = append(vars, fmt.Sprintf("run_tests=%t", mq.IsRunTestsEnabled()))
-	if mq.SetupCommand != "" {
-		vars = append(vars, fmt.Sprintf("setup_command=%s", mq.SetupCommand))
-	}
-	if mq.TypecheckCommand != "" {
-		vars = append(vars, fmt.Sprintf("typecheck_command=%s", mq.TypecheckCommand))
-	}
-	if mq.LintCommand != "" {
-		vars = append(vars, fmt.Sprintf("lint_command=%s", mq.LintCommand))
-	}
-	if mq.TestCommand != "" {
-		vars = append(vars, fmt.Sprintf("test_command=%s", mq.TestCommand))
-	}
-	if mq.BuildCommand != "" {
-		vars = append(vars, fmt.Sprintf("build_command=%s", mq.BuildCommand))
-	}
+	// Always pass all command vars, even when empty. When bd receives
+	// explicit --var args it treats any unset formula vars as "missing
+	// required" rather than falling back to defaults.
+	vars = append(vars, fmt.Sprintf("setup_command=%s", mq.SetupCommand))
+	vars = append(vars, fmt.Sprintf("typecheck_command=%s", mq.TypecheckCommand))
+	vars = append(vars, fmt.Sprintf("lint_command=%s", mq.LintCommand))
+	vars = append(vars, fmt.Sprintf("test_command=%s", mq.TestCommand))
+	vars = append(vars, fmt.Sprintf("build_command=%s", mq.BuildCommand))
 	vars = append(vars, fmt.Sprintf("delete_merged_branches=%t", mq.IsDeleteMergedBranchesEnabled()))
 	return vars
 }

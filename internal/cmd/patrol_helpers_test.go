@@ -118,12 +118,17 @@ func TestBuildRefineryPatrolVars_FullConfig(t *testing.T) {
 
 	// DefaultMergeQueueConfig: refinery_enabled=true, auto_land=false, run_tests=true,
 	// test_command="go test ./...", target_branch="main" (from rig config), delete_merged_branches=true
-	// New commands (setup, typecheck, lint, build) default to empty = omitted
+	// All command vars are always included (even when empty) so bd doesn't
+	// treat them as "missing required variables".
 	expected := map[string]string{
 		"integration_branch_refinery_enabled": "true",
 		"integration_branch_auto_land":        "false",
 		"run_tests":                           "true",
+		"setup_command":                       "",
+		"typecheck_command":                   "",
+		"lint_command":                        "",
 		"test_command":                        "go test ./...",
+		"build_command":                       "",
 		"target_branch":                       "main",
 		"delete_merged_branches":              "true",
 	}
@@ -144,13 +149,6 @@ func TestBuildRefineryPatrolVars_FullConfig(t *testing.T) {
 		}
 		if got != want {
 			t.Errorf("var %q = %q, want %q", key, got, want)
-		}
-	}
-
-	// Verify empty commands are NOT included
-	for _, shouldBeAbsent := range []string{"setup_command", "typecheck_command", "lint_command", "build_command"} {
-		if _, ok := varMap[shouldBeAbsent]; ok {
-			t.Errorf("%q should be omitted when empty", shouldBeAbsent)
 		}
 	}
 
@@ -256,15 +254,14 @@ func TestBuildRefineryPatrolVars_EmptyTestCommand(t *testing.T) {
 		}
 	}
 
-	// test_command should not be present when empty
-	if _, ok := varMap["test_command"]; ok {
-		t.Error("test_command should be omitted when empty")
-	}
-
-	// All command vars should be omitted when empty
-	for _, cmd := range []string{"setup_command", "typecheck_command", "lint_command", "build_command"} {
-		if _, ok := varMap[cmd]; ok {
-			t.Errorf("%q should be omitted when empty", cmd)
+	// All command vars are always included (even when empty) so bd doesn't
+	// treat them as "missing required variables".
+	for _, cmd := range []string{"setup_command", "typecheck_command", "lint_command", "test_command", "build_command"} {
+		got, ok := varMap[cmd]
+		if !ok {
+			t.Errorf("missing var %q (should be present even when empty)", cmd)
+		} else if got != "" {
+			t.Errorf("var %q = %q, want empty", cmd, got)
 		}
 	}
 
