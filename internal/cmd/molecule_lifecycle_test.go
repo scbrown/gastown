@@ -540,7 +540,7 @@ exit /b 0
 
 	// Call the unexported function directly (same package)
 	// updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
-	updateAgentStateOnDone(rigPath, townRoot, ExitCompleted, "")
+	updateAgentStateOnDone(rigPath, townRoot, ExitCompleted, "", 1)
 
 	// Read the close log to see what got closed
 	closesBytes, err := os.ReadFile(closesPath)

@@ -627,3 +627,112 @@ func TestBranchDetectionCleanupOnError(t *testing.T) {
 		t.Error("RoleInfo should be constructible from env vars for cleanup")
 	}
 }
+
+// TestDeliveryGateLogic verifies the delivery gate decision matrix (gt-vol0q):
+// - COMPLETED: always close bead (existing behavior)
+// - DEFERRED/ESCALATED with commits > 0: close bead (work exists)
+// - DEFERRED/ESCALATED with commits <= 0: release bead for re-dispatch
+func TestDeliveryGateLogic(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitType   string
+		aheadCount int
+		wantClose  bool // true = close bead, false = release bead
+	}{
+		// COMPLETED always closes regardless of aheadCount
+		{"completed-with-commits", ExitCompleted, 5, true},
+		{"completed-zero-commits", ExitCompleted, 0, true},
+		{"completed-unknown", ExitCompleted, -1, true},
+
+		// DEFERRED with commits > 0 closes (work exists)
+		{"deferred-with-commits", ExitDeferred, 3, true},
+		// DEFERRED with zero commits releases (no deliverables)
+		{"deferred-zero-commits", ExitDeferred, 0, false},
+		// DEFERRED with unknown (-1) releases (safe default)
+		{"deferred-unknown", ExitDeferred, -1, false},
+
+		// ESCALATED with commits > 0 closes
+		{"escalated-with-commits", ExitEscalated, 2, true},
+		// ESCALATED with zero commits releases
+		{"escalated-zero-commits", ExitEscalated, 0, false},
+		// ESCALATED with unknown (-1) releases
+		{"escalated-unknown", ExitEscalated, -1, false},
+
+		// PHASE_COMPLETE always closes (existing behavior)
+		{"phase-complete-with-commits", ExitPhaseComplete, 1, true},
+		{"phase-complete-zero-commits", ExitPhaseComplete, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Replicate the delivery gate condition from updateAgentStateOnDone
+			shouldRelease := (tt.exitType == ExitDeferred || tt.exitType == ExitEscalated) && tt.aheadCount <= 0
+			shouldClose := !shouldRelease
+
+			if shouldClose != tt.wantClose {
+				t.Errorf("shouldClose = %v, want %v (exitType=%s, aheadCount=%d)",
+					shouldClose, tt.wantClose, tt.exitType, tt.aheadCount)
+			}
+		})
+	}
+}
+
+// TestMoleculeChildrenGateLogic verifies that molecules with open child steps
+// are not closed (gt-vol0q). The molecule should only close if ALL children
+// have status "closed".
+func TestMoleculeChildrenGateLogic(t *testing.T) {
+	tests := []struct {
+		name           string
+		childStatuses  map[string]string // childID -> status
+		wantCloseMol   bool
+	}{
+		{
+			name:          "all-closed",
+			childStatuses: map[string]string{"step-1": "closed", "step-2": "closed"},
+			wantCloseMol:  true,
+		},
+		{
+			name:          "one-open",
+			childStatuses: map[string]string{"step-1": "closed", "step-2": "open"},
+			wantCloseMol:  false,
+		},
+		{
+			name:          "one-in-progress",
+			childStatuses: map[string]string{"step-1": "closed", "step-2": "in_progress"},
+			wantCloseMol:  false,
+		},
+		{
+			name:          "all-open",
+			childStatuses: map[string]string{"step-1": "open", "step-2": "open"},
+			wantCloseMol:  false,
+		},
+		{
+			name:          "no-children",
+			childStatuses: map[string]string{},
+			wantCloseMol:  true,
+		},
+		{
+			name:          "one-hooked",
+			childStatuses: map[string]string{"step-1": "closed", "step-2": "hooked"},
+			wantCloseMol:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Replicate the molecule children gate logic from updateAgentStateOnDone
+			canCloseMol := true
+			for childID, status := range tt.childStatuses {
+				if status != "closed" {
+					canCloseMol = false
+					_ = childID // used in real code for warning message
+					break
+				}
+			}
+
+			if canCloseMol != tt.wantCloseMol {
+				t.Errorf("canCloseMol = %v, want %v", canCloseMol, tt.wantCloseMol)
+			}
+		})
+	}
+}

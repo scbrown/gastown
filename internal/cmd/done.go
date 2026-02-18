@@ -342,6 +342,21 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		defaultBranch = rigCfg.DefaultBranch
 	}
 
+	// Delivery gate (gt-vol0q): compute commits ahead of default branch.
+	// Used by COMPLETED (skip MR if 0) and DEFERRED/ESCALATED (decide bead closure).
+	// -1 means unknown (e.g., working directory not available).
+	originDefault := "origin/" + defaultBranch
+	aheadCount := -1
+	if cwdAvailable {
+		if ac, err := g.CommitsAhead(originDefault, "HEAD"); err == nil {
+			aheadCount = ac
+		} else if ac, err := g.CommitsAhead(defaultBranch, branch); err == nil {
+			aheadCount = ac
+		} else {
+			style.PrintWarning("could not check commits ahead of %s: %v", defaultBranch, err)
+		}
+	}
+
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
 	var pushFailed bool
@@ -372,18 +387,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot complete: uncommitted changes would be lost\nCommit your changes first, or use --status DEFERRED to exit without completing\nUncommitted: %s", workStatus.String())
 		}
 
-		// Check if branch has commits ahead of origin/default
-		// If not, work may have been pushed directly to main - that's fine, just skip MR
-		originDefault := "origin/" + defaultBranch
-		aheadCount, err := g.CommitsAhead(originDefault, "HEAD")
-		if err != nil {
-			// Fallback to local branch comparison if origin not available
-			aheadCount, err = g.CommitsAhead(defaultBranch, branch)
-			if err != nil {
-				// Can't determine - assume work exists and continue
-				style.PrintWarning("could not check commits ahead of %s: %v", defaultBranch, err)
-				aheadCount = 1
-			}
+		// Check if branch has commits ahead of origin/default (computed earlier for delivery gate).
+		// For COMPLETED, if unknown (-1), assume work exists and proceed with MR.
+		if aheadCount < 0 {
+			style.PrintWarning("could not determine commits ahead of %s, assuming work exists", defaultBranch)
+			aheadCount = 1
 		}
 
 		// If no commits ahead, work was likely pushed directly to main (or already merged)
@@ -756,7 +764,7 @@ notifyWitness:
 	}
 
 	// Update agent bead state (ZFC: self-report completion)
-	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+	updateAgentStateOnDone(cwd, townRoot, exitType, issueID, aheadCount)
 
 	// Self-cleaning: Nuke our own sandbox and session (if we're a polecat)
 	// This is the self-cleaning model - polecats clean up after themselves
@@ -860,7 +868,7 @@ func clearDoneIntentLabel(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unused but kept for future audit logging
+func updateAgentStateOnDone(cwd, townRoot, exitType, _ string, aheadCount int) { // issueID unused but kept for future audit logging
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -936,42 +944,76 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unus
 
 	if agentBead.HookBead != "" {
 		hookedBeadID := agentBead.HookBead
-		// Only close if the hooked bead exists and is still in "hooked" status
+		// Only act if the hooked bead exists and is still in "hooked" status
 		if hookedBead, err := bd.Show(hookedBeadID); err == nil && hookedBead.Status == beads.StatusHooked {
-			// BUG FIX: Close attached molecule (wisp) BEFORE closing hooked bead.
-			// When using formula-on-bead (gt sling formula --on bead), the base bead
-			// has attached_molecule pointing to the wisp. Without this fix, gt done
-			// only closed the hooked bead, leaving the wisp orphaned.
-			// Order matters: wisp closes -> unblocks base bead -> base bead closes.
-			attachment := beads.ParseAttachmentFields(hookedBead)
-			if attachment != nil && attachment.AttachedMolecule != "" {
-				// Retry molecule close with exponential backoff. Transient failures
-				// can leave wisps orphaned, blocking the work bead from closing.
-				var moleculeClosed bool
-				var lastErr error
-				for attempt := 0; attempt < 3; attempt++ {
-					if err := bd.Close(attachment.AttachedMolecule); err == nil {
-						moleculeClosed = true
-						break
-					} else {
-						lastErr = err
-						if attempt < 2 {
-							time.Sleep(time.Duration(100<<attempt) * time.Millisecond) // 100ms, 200ms
+			// Delivery gate (gt-vol0q): For DEFERRED/ESCALATED with no commits ahead
+			// of main, release the bead instead of closing it so it can be re-dispatched.
+			if (exitType == ExitDeferred || exitType == ExitEscalated) && aheadCount <= 0 {
+				reason := fmt.Sprintf("polecat exited without deliverables (exit: %s)", exitType)
+				if err := bd.ReleaseWithReason(hookedBeadID, reason); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: couldn't release hooked bead %s: %v\n", hookedBeadID, err)
+				}
+			} else {
+				// Close attached molecule (wisp) BEFORE closing hooked bead.
+				// When using formula-on-bead (gt sling formula --on bead), the base bead
+				// has attached_molecule pointing to the wisp. Without this fix, gt done
+				// only closed the hooked bead, leaving the wisp orphaned.
+				// Order matters: wisp closes -> unblocks base bead -> base bead closes.
+				shouldCloseHookedBead := true
+				attachment := beads.ParseAttachmentFields(hookedBead)
+				if attachment != nil && attachment.AttachedMolecule != "" {
+					// Verify all molecule child steps are closed before closing molecule (gt-vol0q).
+					// If any steps are still open, skip molecule close to avoid data loss.
+					canCloseMol := true
+					if molBead, molErr := bd.Show(attachment.AttachedMolecule); molErr == nil && len(molBead.Children) > 0 {
+						if childIssues, childErr := bd.ShowMultiple(molBead.Children); childErr == nil {
+							for _, childID := range molBead.Children {
+								if child, ok := childIssues[childID]; ok && child.Status != "closed" {
+									canCloseMol = false
+									fmt.Fprintf(os.Stderr, "Warning: molecule step %s still %s — skipping molecule close\n", childID, child.Status)
+									break
+								}
+							}
 						}
 					}
-				}
-				if !moleculeClosed {
-					// All retries failed - skip closing hooked bead (it's blocked by the molecule)
-					fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s after 3 attempts: %v\n", attachment.AttachedMolecule, lastErr)
-					// Don't try to close hookedBeadID - it will fail because it's still blocked
-					// The Witness will clean up orphaned state
-					return
-				}
-			}
 
-			if err := bd.Close(hookedBeadID); err != nil {
-				// Non-fatal: warn but continue
-				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+					if canCloseMol {
+						// Retry molecule close with exponential backoff. Transient failures
+						// can leave wisps orphaned, blocking the work bead from closing.
+						var moleculeClosed bool
+						var lastErr error
+						for attempt := 0; attempt < 3; attempt++ {
+							if err := bd.Close(attachment.AttachedMolecule); err == nil {
+								moleculeClosed = true
+								break
+							} else {
+								lastErr = err
+								if attempt < 2 {
+									time.Sleep(time.Duration(100<<attempt) * time.Millisecond) // 100ms, 200ms
+								}
+							}
+						}
+						if !moleculeClosed {
+							// All retries failed - skip closing hooked bead (it's blocked by the molecule)
+							fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s after 3 attempts: %v\n", attachment.AttachedMolecule, lastErr)
+							// Don't try to close hookedBeadID - it will fail because it's still blocked
+							// The Witness will clean up orphaned state
+							return
+						}
+					} else {
+						// Can't close molecule (open steps) so can't close hooked bead either.
+						// Leave both open for Witness cleanup or re-dispatch.
+						shouldCloseHookedBead = false
+						fmt.Fprintf(os.Stderr, "Warning: molecule has open steps — hooked bead %s left open\n", hookedBeadID)
+					}
+				}
+
+				if shouldCloseHookedBead {
+					if err := bd.Close(hookedBeadID); err != nil {
+						// Non-fatal: warn but continue
+						fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+					}
+				}
 			}
 		}
 	}
