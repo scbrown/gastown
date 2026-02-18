@@ -296,16 +296,23 @@ func runDaemonLogs(cmd *cobra.Command, args []string) error {
 func runDaemonRun(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
+		// Write to stderr explicitly so it appears in journalctl
+		fmt.Fprintf(os.Stderr, "DAEMON FATAL: not in a Gas Town workspace: %v\n", err)
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
 	config := daemon.DefaultConfig(townRoot)
 	d, err := daemon.New(config)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "DAEMON FATAL: creating daemon: %v\n", err)
 		return fmt.Errorf("creating daemon: %w", err)
 	}
 
-	return d.Run()
+	if err := d.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "DAEMON FATAL: %v\n", err)
+		return err
+	}
+	return nil
 }
 
 func runDaemonEnableSupervisor(cmd *cobra.Command, args []string) error {

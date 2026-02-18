@@ -9,8 +9,11 @@ WorkingDirectory={{.TownRoot}}
 Restart=always
 RestartSec=5s
 Environment="GT_TOWN_ROOT={{.TownRoot}}"
-StandardOutput=append:{{.TownRoot}}/daemon/daemon.log
-StandardError=append:{{.TownRoot}}/daemon/daemon.log
+# Use journal for stdout/stderr so errors are visible in journalctl.
+# The daemon manages its own log file (daemon/daemon.log) separately.
+# Previously both were redirected to daemon.log, which meant 'journalctl'
+# showed only systemd start/stop messages — making crash-loop diagnosis
+# impossible without knowing to check the file directly.
 
 [Install]
 WantedBy=default.target

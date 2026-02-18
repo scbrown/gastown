@@ -161,15 +161,41 @@ func (rt *RestartTracker) RecordSuccess(agentID string) {
 }
 
 // IsInCrashLoop returns true if the agent is detected as crash-looping.
+// Crash loop state auto-expires after stabilityPeriod to prevent permanent
+// lockout. Without auto-expiry, a dead agent in crash loop state can never
+// recover because RecordSuccess is only called when the agent is found
+// already running, creating a deadlock.
 func (rt *RestartTracker) IsInCrashLoop(agentID string) bool {
 	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
 	info, exists := rt.state.Agents[agentID]
 	if !exists {
+		rt.mu.RUnlock()
 		return false
 	}
-	return !info.CrashLoopSince.IsZero()
+	if info.CrashLoopSince.IsZero() {
+		rt.mu.RUnlock()
+		return false
+	}
+
+	// Auto-expire: if crash loop has been active longer than stabilityPeriod,
+	// the environment may have changed (e.g., daemon itself was restarted,
+	// config was fixed, tmux recovered). Allow retry.
+	if time.Since(info.CrashLoopSince) > stabilityPeriod {
+		rt.mu.RUnlock()
+		// Upgrade to write lock to clear stale state
+		rt.mu.Lock()
+		// Re-check under write lock (another goroutine may have cleared it)
+		if !info.CrashLoopSince.IsZero() && time.Since(info.CrashLoopSince) > stabilityPeriod {
+			info.CrashLoopSince = time.Time{}
+			info.RestartCount = 0
+			info.BackoffUntil = time.Time{}
+		}
+		rt.mu.Unlock()
+		return false
+	}
+
+	rt.mu.RUnlock()
+	return true
 }
 
 // GetBackoffRemaining returns how long until the agent can be restarted.
@@ -187,6 +213,30 @@ func (rt *RestartTracker) GetBackoffRemaining(agentID string) time.Duration {
 		return 0
 	}
 	return remaining
+}
+
+// ClearStaleEntries resets crash loop and backoff state for agents whose
+// last restart was more than stabilityPeriod ago. This is called at daemon
+// startup to prevent permanent lockout from crash loops that occurred in
+// previous daemon runs (possibly hours or days ago). Returns the number
+// of entries cleared.
+func (rt *RestartTracker) ClearStaleEntries() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	cleared := 0
+	for _, info := range rt.state.Agents {
+		if info.CrashLoopSince.IsZero() && info.RestartCount == 0 {
+			continue
+		}
+		if time.Since(info.LastRestart) > stabilityPeriod {
+			info.CrashLoopSince = time.Time{}
+			info.RestartCount = 0
+			info.BackoffUntil = time.Time{}
+			cleared++
+		}
+	}
+	return cleared
 }
 
 // ClearCrashLoop manually clears the crash loop state for an agent.

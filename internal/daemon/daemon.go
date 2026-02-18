@@ -137,6 +137,16 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: failed to load restart state: %v", err)
 	}
 
+	// Clear stale crash loop state from previous daemon runs.
+	// Without this, a dead agent marked as crash-looping is permanently
+	// locked out because RecordSuccess is only called for running agents.
+	if cleared := restartTracker.ClearStaleEntries(); cleared > 0 {
+		logger.Printf("Cleared %d stale crash loop state(s) from previous run", cleared)
+		if err := restartTracker.Save(); err != nil {
+			logger.Printf("Warning: failed to save restart state after clearing stale entries: %v", err)
+		}
+	}
+
 	return &Daemon{
 		config:         config,
 		patrolConfig:   patrolConfig,
@@ -154,6 +164,8 @@ func New(config *Config) (*Daemon, error) {
 // Run starts the daemon main loop.
 func (d *Daemon) Run() error {
 	d.logger.Printf("Daemon starting (PID %d)", os.Getpid())
+	// Echo critical startup to stderr for journalctl visibility
+	fmt.Fprintf(os.Stderr, "gastown-daemon starting (PID %d)\n", os.Getpid())
 
 	// Acquire exclusive lock to prevent multiple daemons from running.
 	// This prevents the TOCTOU race condition where multiple concurrent starts
@@ -172,10 +184,11 @@ func (d *Daemon) Run() error {
 	}
 	defer func() { _ = fileLock.Unlock() }()
 
-	// Pre-flight check: all rigs must be on Dolt backend.
-	if err := d.checkAllRigsDolt(); err != nil {
-		return err
-	}
+	// Pre-flight check: warn about rigs not on Dolt backend.
+	// This is non-fatal to prevent crash-looping under systemd.
+	// The daemon should degrade gracefully (skip unhealthy rigs) rather
+	// than refuse to start and cause 10k+ restart cycles.
+	d.checkAllRigsDolt()
 
 	// Repair metadata.json for all rigs on startup.
 	// This auto-fixes stale jsonl_export values (e.g., "beads.jsonl" → "issues.jsonl")
@@ -212,6 +225,7 @@ func (d *Daemon) Run() error {
 	defer timer.Stop()
 
 	d.logger.Printf("Daemon running, recovery heartbeat interval %v", recoveryHeartbeatInterval)
+	fmt.Fprintf(os.Stderr, "gastown-daemon running, heartbeat every %v\n", recoveryHeartbeatInterval)
 
 	// Start feed curator goroutine
 	d.curator = feed.NewCurator(d.config.TownRoot)
@@ -453,16 +467,18 @@ func (d *Daemon) ensureDoltServerRunning() {
 	}
 }
 
-// checkAllRigsDolt verifies all rigs are using the Dolt backend.
-func (d *Daemon) checkAllRigsDolt() error {
-	var problems []string
-
+// checkAllRigsDolt warns about rigs not using the Dolt backend.
+// Previously this was fatal (returned error), which caused crash-looping
+// under systemd supervision (10k+ restarts before resolving).
+// Now it logs warnings and continues — the daemon degrades gracefully.
+func (d *Daemon) checkAllRigsDolt() {
 	// Check town-level beads
 	townBeadsDir := filepath.Join(d.config.TownRoot, ".beads")
 	if backend := readBeadsBackend(townBeadsDir); backend != "" && backend != "dolt" {
-		problems = append(problems, fmt.Sprintf(
-			"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
-			"town-root", backend, d.config.TownRoot))
+		d.logger.Printf("WARNING: town-root beads using %s backend (expected dolt). Run: cd %s && bd migrate dolt",
+			backend, d.config.TownRoot)
+		// Also write to stderr for journalctl visibility
+		fmt.Fprintf(os.Stderr, "WARNING: town-root beads using %s backend (expected dolt)\n", backend)
 	}
 
 	// Check each registered rig
@@ -470,18 +486,11 @@ func (d *Daemon) checkAllRigsDolt() error {
 		rigBeadsDir := filepath.Join(d.config.TownRoot, rigName, "mayor", "rig", ".beads")
 		if backend := readBeadsBackend(rigBeadsDir); backend != "" && backend != "dolt" {
 			rigPath := filepath.Join(d.config.TownRoot, rigName)
-			problems = append(problems, fmt.Sprintf(
-				"Rig %q is using %s backend.\n  Gas Town requires Dolt. Run: cd %s && bd migrate dolt",
-				rigName, backend, rigPath))
+			d.logger.Printf("WARNING: rig %q using %s backend (expected dolt). Run: cd %s && bd migrate dolt",
+				rigName, backend, rigPath)
+			fmt.Fprintf(os.Stderr, "WARNING: rig %q using %s backend (expected dolt)\n", rigName, backend)
 		}
 	}
-
-	if len(problems) == 0 {
-		return nil
-	}
-
-	return fmt.Errorf("daemon startup blocked: %d rig(s) not on Dolt backend\n\n  %s",
-		len(problems), strings.Join(problems, "\n\n  "))
 }
 
 // readBeadsBackend reads the backend field from metadata.json in a beads directory.
