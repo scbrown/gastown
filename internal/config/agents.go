@@ -331,18 +331,14 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ResumeFlag:          "",    // No resume support yet
 		ResumeStyle:         "",
 		SupportsHooks:       true,  // Uses .pi/extensions/gastown-hooks.js
+		HooksProvider:       "pi",
+		HooksDir:            ".pi/extensions",
+		HooksSettingsFile:   "gastown-hooks.js",
 		SupportsForkSession: false,
 		NonInteractive: &NonInteractiveConfig{
 			PromptFlag: "-p",
 			OutputFlag: "--no-session",
 		},
-		// Runtime defaults
-		PromptMode:        "arg",
-		HooksProvider:     "pi",
-		HooksDir:          ".pi/extensions",
-		HooksSettingsFile: "gastown-hooks.js",
-		ReadyDelayMs:      3000,
-		InstructionsFile:  "AGENTS.md",
 	},
 }
 

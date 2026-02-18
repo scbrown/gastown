@@ -1088,3 +1088,24 @@ func TestPiRuntimeConfigFromPreset(t *testing.T) {
 		t.Errorf("Expected nil/empty Env for Pi preset, got %v", rc.Env)
 	}
 }
+
+// TestAllHookSupportingAgentsHaveHookFields enforces the invariant that every
+// built-in preset with SupportsHooks=true has the three hook fields populated.
+// Without all three, fillRuntimeDefaults() silently skips hooks auto-fill.
+func TestAllHookSupportingAgentsHaveHookFields(t *testing.T) {
+	t.Parallel()
+	for name, preset := range builtinPresets {
+		if !preset.SupportsHooks {
+			continue
+		}
+		if preset.HooksProvider == "" {
+			t.Errorf("agent %q: SupportsHooks=true but HooksProvider is empty", name)
+		}
+		if preset.HooksDir == "" {
+			t.Errorf("agent %q: SupportsHooks=true but HooksDir is empty", name)
+		}
+		if preset.HooksSettingsFile == "" {
+			t.Errorf("agent %q: SupportsHooks=true but HooksSettingsFile is empty", name)
+		}
+	}
+}
