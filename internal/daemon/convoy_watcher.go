@@ -71,11 +71,42 @@ func (w *ConvoyWatcher) Stop() {
 	w.wg.Wait()
 }
 
+// errBdActivityNotFound is a sentinel error indicating 'bd activity' subcommand doesn't exist.
+var errBdActivityNotFound = fmt.Errorf("bd activity subcommand not available")
+
+// probeBdActivity checks whether the 'bd activity' subcommand exists.
+// Returns nil if available, errBdActivityNotFound if the subcommand is missing.
+func (w *ConvoyWatcher) probeBdActivity() error {
+	cmd := exec.CommandContext(w.ctx, w.bdPath, "activity", "--help")
+	cmd.Dir = w.townRoot
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Check for "unknown command" in the output — this means the subcommand
+		// doesn't exist, as opposed to a transient failure.
+		if strings.Contains(string(output), "unknown command") {
+			return errBdActivityNotFound
+		}
+		return err
+	}
+	return nil
+}
+
 // run is the main watcher loop.
 // PATCH-011: Exponential backoff on repeated failures to prevent crash-looping
 // when bd activity keeps failing (e.g., Dolt server down).
+// gt-5cs: Probe for 'bd activity' availability before entering the loop.
+// If the subcommand doesn't exist, log once and exit instead of retrying forever.
 func (w *ConvoyWatcher) run() {
 	defer w.wg.Done()
+
+	// Probe whether 'bd activity' subcommand exists before entering the retry loop.
+	// This prevents spamming the daemon log with "unknown command" errors every 5s-5m
+	// when the subcommand hasn't been implemented yet (gt-5cs).
+	if err := w.probeBdActivity(); err == errBdActivityNotFound {
+		w.logger("convoy watcher: 'bd activity' subcommand not available in bd CLI, disabling convoy watcher")
+		return
+	}
 
 	const (
 		baseDelay = 5 * time.Second
@@ -90,6 +121,11 @@ func (w *ConvoyWatcher) run() {
 		default:
 			// Start bd activity --follow --town --json
 			if err := w.watchActivity(); err != nil {
+				// If bd activity was removed/uninstalled, stop retrying.
+				if err == errBdActivityNotFound {
+					w.logger("convoy watcher: 'bd activity' subcommand not available, disabling convoy watcher")
+					return
+				}
 				w.logger("convoy watcher: bd activity error: %v, retrying in %v", err, delay)
 				// Wait before retry with exponential backoff
 				select {
@@ -121,6 +157,9 @@ func (w *ConvoyWatcher) watchActivity() error {
 		return fmt.Errorf("creating stdout pipe: %w", err)
 	}
 
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting bd activity: %w", err)
 	}
@@ -142,7 +181,15 @@ func (w *ConvoyWatcher) watchActivity() error {
 		return fmt.Errorf("reading bd activity: %w", err)
 	}
 
-	return cmd.Wait()
+	waitErr := cmd.Wait()
+
+	// Detect "unknown command" in stderr — the subcommand may have been
+	// removed between the startup probe and this invocation.
+	if waitErr != nil && strings.Contains(stderr.String(), "unknown command") {
+		return errBdActivityNotFound
+	}
+
+	return waitErr
 }
 
 // processLine processes a single line from bd activity (NDJSON format).
