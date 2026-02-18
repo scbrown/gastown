@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -808,43 +809,35 @@ func (r *Router) sendToGroup(msg *Message) error {
 
 // validateRecipient checks that the recipient identity corresponds to an existing agent.
 // Returns an error if the recipient is invalid or doesn't exist.
-// Queries agents from town-level beads AND all rig-level beads via routes.jsonl.
+// Uses fast directory-based validation for well-known address patterns,
+// falling back to beads query only when necessary.
 func (r *Router) validateRecipient(identity string) error {
 	// Overseer is the human operator, not an agent bead
 	if identity == "overseer" {
 		return nil
 	}
 
-	// Query agents from town-level beads
-	agents := r.queryAgents("")
-
-	for _, agent := range agents {
-		if agentBeadToAddress(agent) == identity {
-			return nil // Found matching agent
+	// Fast path: validate well-known address patterns via directory existence.
+	// Addresses like "rig/role" or "rig/crew/name" are valid if the rig directory exists.
+	if r.townRoot != "" {
+		parts := strings.SplitN(identity, "/", 2)
+		if len(parts) == 2 {
+			rigDir := filepath.Join(r.townRoot, parts[0])
+			if info, err := os.Stat(rigDir); err == nil && info.IsDir() {
+				return nil // Rig directory exists, address is plausible
+			}
+		}
+		// Also accept "mayor/" which lives at town root
+		if strings.HasPrefix(identity, "mayor") {
+			return nil
 		}
 	}
 
-	// Query agents from rig-level beads via routes.jsonl
-	if r.townRoot != "" {
-		townBeadsDir := filepath.Join(r.townRoot, ".beads")
-		routes, err := beads.LoadRoutes(townBeadsDir)
-		if err == nil {
-			for _, route := range routes {
-				// Skip hq- routes (town-level, already queried)
-				if strings.HasPrefix(route.Prefix, "hq-") {
-					continue
-				}
-				rigBeadsDir := filepath.Join(r.townRoot, route.Path, ".beads")
-				rigAgents, err := r.queryAgentsFromDir(rigBeadsDir)
-				if err != nil {
-					continue // Skip rigs with errors
-				}
-				for _, agent := range rigAgents {
-					if agentBeadToAddress(agent) == identity {
-						return nil // Found matching agent
-					}
-				}
-			}
+	// Slow path: full beads query (queryAgents already covers town + all rig routes)
+	agents := r.queryAgents("")
+	for _, agent := range agents {
+		if agentBeadToAddress(agent) == identity {
+			return nil
 		}
 	}
 

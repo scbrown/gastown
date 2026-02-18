@@ -13,7 +13,6 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 func runMailSend(cmd *cobra.Command, args []string) error {
@@ -29,6 +28,12 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		mailBody = strings.TrimRight(string(data), "\n")
 	}
 
+	// Find town root once — used for identity detection, mail routing, and resolver
+	workDir, err := findMailWorkDir()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
 	var to string
 
 	if mailSendSelf {
@@ -37,11 +42,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("getting current directory: %w", err)
 		}
-		townRoot, err := workspace.FindFromCwd()
-		if err != nil || townRoot == "" {
-			return fmt.Errorf("not in a Gas Town workspace")
-		}
-		roleInfo, err := GetRoleWithContext(cwd, townRoot)
+		roleInfo, err := GetRoleWithContext(cwd, workDir)
 		if err != nil {
 			return fmt.Errorf("detecting role: %w", err)
 		}
@@ -49,7 +50,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			Role:     roleInfo.Role,
 			Rig:      roleInfo.Rig,
 			Polecat:  roleInfo.Polecat,
-			TownRoot: townRoot,
+			TownRoot: workDir,
 			WorkDir:  cwd,
 		}
 		to = buildAgentIdentity(ctx)
@@ -60,12 +61,6 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		to = args[0]
 	} else {
 		return fmt.Errorf("address required (or use --self)")
-	}
-
-	// All mail uses town beads (two-level architecture)
-	workDir, err := findMailWorkDir()
-	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
 	// Determine sender
@@ -126,9 +121,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	}
 
 	// Use address resolver for new address types
-	townRoot, _ := workspace.FindFromCwd()
-	b := beads.New(townRoot)
-	resolver := mail.NewResolver(b, townRoot)
+	b := beads.New(workDir)
+	resolver := mail.NewResolver(b, workDir)
 
 	recipients, err := resolver.Resolve(to)
 	if err != nil {
