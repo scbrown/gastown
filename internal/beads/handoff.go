@@ -108,11 +108,12 @@ type ClearMailResult struct {
 // Non-pinned messages are closed with the given reason.
 // Pinned messages have their description cleared but remain open.
 func (b *Beads) ClearMail(reason string) (*ClearMailResult, error) {
-	// List all open messages
+	// List all open messages (including wisps so they get cleared too)
 	issues, err := b.List(ListOptions{
-		Status:   "open",
-		Label:    "gt:message",
-		Priority: -1,
+		Status:       "open",
+		Label:        "gt:message",
+		Priority:     -1,
+		IncludeWisps: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing messages: %w", err)

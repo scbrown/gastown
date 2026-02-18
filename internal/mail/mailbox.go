@@ -135,8 +135,13 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	// then filter client-side for assignee/CC match. Process-spawn overhead
 	// dominates query time, so 1 broad call beats N narrow calls.
 	// NOTE: Uses --label instead of --type per migration in 221ff022.
+	// NOTE: --include-wisps is required so that ephemeral messages (wisps)
+	// appear in the inbox. Without this flag, bd list hides wisps by default,
+	// which causes messages sent with --ephemeral to silently vanish from
+	// the inbox even though they are addressed to the recipient.
 	args := []string{"list",
 		"--label", "gt:message",
+		"--include-wisps",
 		"--json",
 		"--limit", "0",
 	}
