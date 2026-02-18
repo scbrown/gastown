@@ -262,7 +262,8 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 
 // runHandoffAuto saves state without cycling the session.
 // Used by the PreCompact hook to preserve context before compaction.
-// No tmux required — just collects state, sends handoff mail, and writes marker.
+// No tmux required — commits uncommitted work, pushes, records bead comment,
+// sends handoff mail, and writes marker.
 func runHandoffAuto() error {
 	// Build subject
 	subject := handoffSubject
@@ -281,12 +282,25 @@ func runHandoffAuto() error {
 	}
 
 	if handoffDryRun {
+		fmt.Printf("[auto-handoff] Would commit uncommitted work\n")
+		fmt.Printf("[auto-handoff] Would push to remote\n")
 		fmt.Printf("[auto-handoff] Would send mail: subject=%q\n", subject)
 		fmt.Printf("[auto-handoff] Would write handoff marker\n")
 		return nil
 	}
 
-	// Send handoff mail to self
+	// Step 1: Commit any uncommitted work
+	commitSHA := autoCommitWork(subject)
+
+	// Step 2: Push to remote (if we're in a git repo with a remote)
+	if commitSHA != "" {
+		autoPushToRemote()
+	}
+
+	// Step 3: Record session summary as bead comment on hooked work
+	autoRecordBeadComment(message, commitSHA)
+
+	// Step 4: Send handoff mail to self
 	beadID, err := sendHandoffMail(subject, message)
 	if err != nil {
 		// Non-fatal — log and continue
@@ -295,7 +309,7 @@ func runHandoffAuto() error {
 		fmt.Fprintf(os.Stderr, "auto-handoff: saved state to %s\n", beadID)
 	}
 
-	// Write handoff marker so post-compact prime knows it's post-handoff
+	// Step 5: Write handoff marker so post-compact prime knows it's post-handoff
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
 		_ = os.MkdirAll(runtimeDir, 0755)
@@ -309,7 +323,7 @@ func runHandoffAuto() error {
 		_ = os.WriteFile(markerPath, []byte(sessionName), 0644)
 	}
 
-	// Log handoff event
+	// Step 6: Log handoff event
 	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
 		agent := detectSender()
 		if agent == "" || agent == "overseer" {
@@ -319,6 +333,124 @@ func runHandoffAuto() error {
 	}
 
 	return nil
+}
+
+// autoCommitWork commits any uncommitted changes with a [handoff] prefix.
+// Returns the commit SHA if a commit was made, empty string otherwise.
+func autoCommitWork(context string) string {
+	// Check if we're in a git repo
+	if err := exec.Command("git", "rev-parse", "--git-dir").Run(); err != nil {
+		return "" // Not in a git repo
+	}
+
+	// Check for uncommitted changes (staged + unstaged + untracked)
+	out, err := exec.Command("git", "status", "--porcelain").Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return "" // No changes
+	}
+
+	// Stage all changes
+	if err := exec.Command("git", "add", "-A").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "auto-handoff: git add failed: %v\n", err)
+		return ""
+	}
+
+	// Build commit message
+	commitMsg := fmt.Sprintf("[handoff] %s", context)
+
+	// Commit
+	cmd := exec.Command("git", "commit", "-m", commitMsg, "--no-verify")
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "auto-handoff: git commit failed: %v\n", err)
+		return ""
+	}
+
+	// Get the commit SHA
+	shaOut, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	sha := strings.TrimSpace(string(shaOut))
+	fmt.Fprintf(os.Stderr, "auto-handoff: committed work (%s)\n", sha)
+	return sha
+}
+
+// autoPushToRemote pushes the current branch to its tracking remote.
+func autoPushToRemote() {
+	// Check if there's a remote configured
+	out, err := exec.Command("git", "remote").Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return // No remote
+	}
+
+	// Push current branch
+	cmd := exec.Command("git", "push")
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "auto-handoff: git push failed: %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "auto-handoff: pushed to remote\n")
+}
+
+// autoRecordBeadComment records a session summary as a comment on hooked work.
+func autoRecordBeadComment(summary, commitSHA string) {
+	// Get the hooked bead ID from gt hook
+	out, err := exec.Command("gt", "hook", "--json").Output()
+	if err != nil {
+		return // No hook or gt hook failed
+	}
+
+	hookStr := strings.TrimSpace(string(out))
+	if hookStr == "" || hookStr == "null" || hookStr == "{}" {
+		return
+	}
+
+	// Extract bead ID — gt hook --json returns {"bead":"<id>",...}
+	// Simple extraction: find "bead":"<value>"
+	beadID := extractJSONField(hookStr, "bead")
+	if beadID == "" {
+		return
+	}
+
+	// Build comment
+	comment := "auto-handoff state snapshot"
+	if commitSHA != "" {
+		comment = fmt.Sprintf("auto-handoff (commit %s)", commitSHA)
+	}
+	if summary != "" {
+		// Truncate summary for comment (keep first 500 chars)
+		s := summary
+		if len(s) > 500 {
+			s = s[:500] + "..."
+		}
+		comment = comment + "\n\n" + s
+	}
+
+	cmd := exec.Command("bd", "comment", beadID, "-m", comment)
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "auto-handoff: could not add bead comment: %v\n", err)
+	}
+}
+
+// extractJSONField extracts a string value for a key from a JSON string.
+// Simple extraction without importing encoding/json for minimal overhead.
+func extractJSONField(jsonStr, key string) string {
+	pattern := fmt.Sprintf(`"%s":"`, key)
+	idx := strings.Index(jsonStr, pattern)
+	if idx == -1 {
+		// Try with space after colon
+		pattern = fmt.Sprintf(`"%s": "`, key)
+		idx = strings.Index(jsonStr, pattern)
+		if idx == -1 {
+			return ""
+		}
+	}
+	start := idx + len(pattern)
+	end := strings.Index(jsonStr[start:], `"`)
+	if end == -1 {
+		return ""
+	}
+	return jsonStr[start : start+end]
 }
 
 // getCurrentTmuxSession returns the current tmux session name.
