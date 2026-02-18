@@ -63,6 +63,7 @@ var beadsExemptCommands = map[string]bool{
 	"dnd":        true,
 	"signal":        true, // Hook signal handlers must be fast, handle beads internally
 	"krc":           true, // KRC doesn't require beads
+	"pane":           true, // Pane operations don't require beads
 	"quorum":        true, // Quorum handles beads internally
 	"run-migration": true, // Migration orchestrator handles its own beads checks
 }
