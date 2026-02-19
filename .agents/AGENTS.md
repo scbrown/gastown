@@ -33,7 +33,3 @@ ln -s ../../../.agents/skills/my-feature/SKILL.md docs/skills/my-feature/SKILL.m
 # 3. Folder-symlink into .claude/skills/ for Claude Code discovery
 ln -s ../../.agents/skills/my-feature .claude/skills/my-feature
 ```
-
-## TODO
-
-- [ ] Add `gt doctor` check for skills
