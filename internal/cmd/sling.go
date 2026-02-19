@@ -667,7 +667,26 @@ func restorePinnedBead(townRoot, beadID, assignee string) {
 func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir string) {
 	townRoot, err := workspace.FindFromCwdOrError()
 
-	// 1. Unhook the bead (set status back to open so it can be re-slung).
+	// 1. Close attached molecule/wisp before unhooking bead (gt-r8wpj).
+	// When InstantiateFormulaOnBead created a wisp bonded to the base bead,
+	// the attached_molecule field points to the wisp. Without closing it,
+	// the orphaned wisp remains open and blocks the parent bead.
+	if beadID != "" && err == nil {
+		unhookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
+		bd := beads.New(unhookDir)
+		if issue, showErr := bd.Show(beadID); showErr == nil {
+			attachment := beads.ParseAttachmentFields(issue)
+			if attachment != nil && attachment.AttachedMolecule != "" {
+				if closeErr := bd.Close(attachment.AttachedMolecule); closeErr != nil {
+					fmt.Printf("  %s Could not close attached molecule %s: %v\n", style.Dim.Render("Warning:"), attachment.AttachedMolecule, closeErr)
+				} else {
+					fmt.Printf("  %s Closed attached molecule %s\n", style.Dim.Render("○"), attachment.AttachedMolecule)
+				}
+			}
+		}
+	}
+
+	// 2. Unhook the bead (set status back to open so it can be re-slung).
 	// Some failure modes happen before any bead is hooked (e.g., wisp creation fails).
 	if beadID != "" {
 		if err != nil {
@@ -684,11 +703,11 @@ func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir s
 		}
 	}
 
-	// 2. Clean up Dolt branch if it was created
+	// 3. Clean up Dolt branch if it was created
 	if err == nil && spawnInfo.DoltBranch != "" && townRoot != "" {
 		doltserver.DeletePolecatBranch(townRoot, spawnInfo.RigName, spawnInfo.DoltBranch)
 	}
 
-	// 3. Clean up the spawned polecat (worktree, agent bead, etc.)
+	// 4. Clean up the spawned polecat (worktree, agent bead, etc.)
 	cleanupSpawnedPolecat(spawnInfo, spawnInfo.RigName)
 }

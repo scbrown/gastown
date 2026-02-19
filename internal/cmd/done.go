@@ -949,6 +949,14 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string, aheadCount int) {
 			// Delivery gate (gt-vol0q): For DEFERRED/ESCALATED with no commits ahead
 			// of main, release the bead instead of closing it so it can be re-dispatched.
 			if (exitType == ExitDeferred || exitType == ExitEscalated) && aheadCount <= 0 {
+				// Close attached molecule/wisp before releasing bead (gt-r8wpj).
+				// Without this, orphaned wisps remain as open beads blocking the parent.
+				attachment := beads.ParseAttachmentFields(hookedBead)
+				if attachment != nil && attachment.AttachedMolecule != "" {
+					if err := bd.Close(attachment.AttachedMolecule); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s on release: %v\n", attachment.AttachedMolecule, err)
+					}
+				}
 				reason := fmt.Sprintf("polecat exited without deliverables (exit: %s)", exitType)
 				if err := bd.ReleaseWithReason(hookedBeadID, reason); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: couldn't release hooked bead %s: %v\n", hookedBeadID, err)
