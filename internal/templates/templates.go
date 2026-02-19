@@ -113,6 +113,7 @@ type HandoffData struct {
 type SupervisorData struct {
 	GTPath   string // Path to the gt binary
 	TownRoot string // Path to the Gas Town workspace
+	BinDir   string // Directory containing gt/bd binaries (for PATH)
 }
 
 // New creates a new Templates instance.
@@ -280,6 +281,7 @@ func ProvisionSupervisor(townRoot string) (string, error) {
 	data := SupervisorData{
 		GTPath:   gtPath,
 		TownRoot: townRoot,
+		BinDir:   filepath.Dir(gtPath),
 	}
 
 	switch runtime.GOOS {

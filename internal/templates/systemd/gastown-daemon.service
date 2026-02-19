@@ -9,6 +9,7 @@ WorkingDirectory={{.TownRoot}}
 Restart=always
 RestartSec=5s
 Environment="GT_TOWN_ROOT={{.TownRoot}}"
+Environment="PATH={{.BinDir}}:/usr/local/bin:/usr/bin:/bin"
 # Use journal for stdout/stderr so errors are visible in journalctl.
 # The daemon manages its own log file (daemon/daemon.log) separately.
 # Previously both were redirected to daemon.log, which meant 'journalctl'
