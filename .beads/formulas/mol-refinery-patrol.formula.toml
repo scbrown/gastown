@@ -669,7 +669,7 @@ gt mol step await-signal --agent-bead gt-<rig>-refinery \
 ```
 
 This command:
-1. Subscribes to `bd activity --follow` (beads activity feed)
+1. Subscribes to `bd feed --follow` (beads activity feed)
 2. Returns IMMEDIATELY when any beads activity occurs (e.g., MR submission)
 3. If no activity, times out with exponential backoff:
    - First timeout: 30s

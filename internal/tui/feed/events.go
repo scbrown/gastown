@@ -21,7 +21,7 @@ type EventSource interface {
 	Close() error
 }
 
-// BdActivitySource reads events from bd activity --follow
+// BdActivitySource reads events from bd feed --follow
 type BdActivitySource struct {
 	cmd     *exec.Cmd
 	events  chan Event
@@ -29,11 +29,11 @@ type BdActivitySource struct {
 	workDir string
 }
 
-// NewBdActivitySource creates a new source that tails bd activity
+// NewBdActivitySource creates a new source that tails bd feed
 func NewBdActivitySource(workDir string) (*BdActivitySource, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
+	cmd := exec.CommandContext(ctx, "bd", "feed", "--follow")
 	cmd.Dir = workDir
 
 	stdout, err := cmd.StdoutPipe()
@@ -83,10 +83,10 @@ func (s *BdActivitySource) Close() error {
 	return s.cmd.Wait()
 }
 
-// bd activity line pattern: [HH:MM:SS] SYMBOL BEAD_ID action · description
+// bd feed line pattern: [HH:MM:SS] SYMBOL BEAD_ID action · description
 var bdActivityPattern = regexp.MustCompile(`^\[(\d{2}:\d{2}:\d{2})\]\s+([+→✓✗⊘📌])\s+(\S+)?\s*(\w+)?\s*·?\s*(.*)$`)
 
-// parseBdActivityLine parses a line from bd activity output
+// parseBdActivityLine parses a line from bd feed output
 func parseBdActivityLine(line string) *Event {
 	matches := bdActivityPattern.FindStringSubmatch(line)
 	if matches == nil {

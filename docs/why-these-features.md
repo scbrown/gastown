@@ -205,7 +205,7 @@ happening until it's done (or failed).
 **The solution:** Work state as a real-time stream:
 
 ```bash
-bd activity --follow
+bd feed --follow
 
 [14:32:08] + patrol-x7k.arm-ace bonded (5 steps)
 [14:32:09] → patrol-x7k.arm-ace.capture in_progress

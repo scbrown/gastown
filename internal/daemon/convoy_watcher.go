@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// ConvoyWatcher monitors bd activity for issue closes and triggers convoy completion checks.
+// ConvoyWatcher monitors bd feed for issue closes and triggers convoy completion checks.
 // When an issue closes, it checks if the issue is tracked by any convoy and runs the
 // completion check if all tracked issues are now closed.
 type ConvoyWatcher struct {
@@ -28,7 +28,7 @@ type ConvoyWatcher struct {
 	bdPath string
 }
 
-// bdActivityEvent represents an event from bd activity --json.
+// bdActivityEvent represents an event from bd feed --json.
 type bdActivityEvent struct {
 	Timestamp string `json:"timestamp"`
 	Type      string `json:"type"`
@@ -71,13 +71,13 @@ func (w *ConvoyWatcher) Stop() {
 	w.wg.Wait()
 }
 
-// errBdActivityNotFound is a sentinel error indicating 'bd activity' subcommand doesn't exist.
-var errBdActivityNotFound = fmt.Errorf("bd activity subcommand not available")
+// errBdActivityNotFound is a sentinel error indicating 'bd feed' subcommand doesn't exist.
+var errBdActivityNotFound = fmt.Errorf("bd feed subcommand not available")
 
-// probeBdActivity checks whether the 'bd activity' subcommand exists.
+// probeBdActivity checks whether the 'bd feed' subcommand exists.
 // Returns nil if available, errBdActivityNotFound if the subcommand is missing.
 func (w *ConvoyWatcher) probeBdActivity() error {
-	cmd := exec.CommandContext(w.ctx, w.bdPath, "activity", "--help")
+	cmd := exec.CommandContext(w.ctx, w.bdPath, "feed", "--help")
 	cmd.Dir = w.townRoot
 	cmd.Env = os.Environ()
 	output, err := cmd.CombinedOutput()
@@ -94,17 +94,17 @@ func (w *ConvoyWatcher) probeBdActivity() error {
 
 // run is the main watcher loop.
 // PATCH-011: Exponential backoff on repeated failures to prevent crash-looping
-// when bd activity keeps failing (e.g., Dolt server down).
-// gt-5cs: Probe for 'bd activity' availability before entering the loop.
+// when bd feed keeps failing (e.g., Dolt server down).
+// gt-5cs: Probe for 'bd feed' availability before entering the loop.
 // If the subcommand doesn't exist, log once and exit instead of retrying forever.
 func (w *ConvoyWatcher) run() {
 	defer w.wg.Done()
 
-	// Probe whether 'bd activity' subcommand exists before entering the retry loop.
+	// Probe whether 'bd feed' subcommand exists before entering the retry loop.
 	// This prevents spamming the daemon log with "unknown command" errors every 5s-5m
 	// when the subcommand hasn't been implemented yet (gt-5cs).
 	if err := w.probeBdActivity(); err == errBdActivityNotFound {
-		w.logger("convoy watcher: 'bd activity' subcommand not available in bd CLI, disabling convoy watcher")
+		w.logger("convoy watcher: 'bd feed' subcommand not available in bd CLI, disabling convoy watcher")
 		return
 	}
 
@@ -119,14 +119,14 @@ func (w *ConvoyWatcher) run() {
 		case <-w.ctx.Done():
 			return
 		default:
-			// Start bd activity --follow --town --json
+			// Start bd feed --follow --town --json
 			if err := w.watchActivity(); err != nil {
-				// If bd activity was removed/uninstalled, stop retrying.
+				// If bd feed was removed/uninstalled, stop retrying.
 				if err == errBdActivityNotFound {
-					w.logger("convoy watcher: 'bd activity' subcommand not available, disabling convoy watcher")
+					w.logger("convoy watcher: 'bd feed' subcommand not available, disabling convoy watcher")
 					return
 				}
-				w.logger("convoy watcher: bd activity error: %v, retrying in %v", err, delay)
+				w.logger("convoy watcher: bd feed error: %v, retrying in %v", err, delay)
 				// Wait before retry with exponential backoff
 				select {
 				case <-w.ctx.Done():
@@ -146,9 +146,9 @@ func (w *ConvoyWatcher) run() {
 	}
 }
 
-// watchActivity starts bd activity and processes events until error or context cancellation.
+// watchActivity starts bd feed and processes events until error or context cancellation.
 func (w *ConvoyWatcher) watchActivity() error {
-	cmd := exec.CommandContext(w.ctx, w.bdPath, "activity", "--follow", "--town", "--json")
+	cmd := exec.CommandContext(w.ctx, w.bdPath, "feed", "--follow", "--town", "--json")
 	cmd.Dir = w.townRoot
 	cmd.Env = os.Environ() // Inherit PATH to find bd executable
 
@@ -161,7 +161,7 @@ func (w *ConvoyWatcher) watchActivity() error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting bd activity: %w", err)
+		return fmt.Errorf("starting bd feed: %w", err)
 	}
 
 	scanner := bufio.NewScanner(stdout)
@@ -178,7 +178,7 @@ func (w *ConvoyWatcher) watchActivity() error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("reading bd activity: %w", err)
+		return fmt.Errorf("reading bd feed: %w", err)
 	}
 
 	waitErr := cmd.Wait()
@@ -192,7 +192,7 @@ func (w *ConvoyWatcher) watchActivity() error {
 	return waitErr
 }
 
-// processLine processes a single line from bd activity (NDJSON format).
+// processLine processes a single line from bd feed (NDJSON format).
 func (w *ConvoyWatcher) processLine(line string) {
 	line = strings.TrimSpace(line)
 	if line == "" {

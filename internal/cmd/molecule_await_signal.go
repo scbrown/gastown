@@ -29,7 +29,7 @@ var moleculeAwaitSignalCmd = &cobra.Command{
 	Long: `Wait for any activity on the beads feed, with optional backoff.
 
 This command is the primary wake mechanism for patrol agents. It subscribes
-to 'bd activity --follow' and returns immediately when any line of output
+to 'bd feed --follow' and returns immediately when any line of output
 is received (indicating beads activity).
 
 If no activity occurs within the timeout, the command returns with exit code 0
@@ -176,14 +176,14 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 
-	// Start bd activity --follow
+	// Start bd feed --follow
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	result, err := waitForActivitySignal(ctx, workDir)
 	if err != nil {
 		// PATCH-011: Degrade feed failure to timeout instead of hard error.
-		// This allows the patrol loop to continue even when bd activity is broken
+		// This allows the patrol loop to continue even when bd feed is broken
 		// (e.g., Dolt server down). The Deacon will retry on the next cycle.
 		if !awaitSignalQuiet {
 			fmt.Printf("%s Feed subscription failed (treating as timeout): %v\n",
@@ -293,7 +293,7 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 	return time.ParseDuration(awaitSignalTimeout)
 }
 
-// waitForActivitySignal starts bd activity --follow and waits for any output.
+// waitForActivitySignal starts bd feed --follow and waits for any output.
 // Returns immediately when a line is received, or when context is canceled.
 //
 // PATCH-011: Detect immediate process exit (e.g., Dolt server down) to avoid
@@ -301,8 +301,8 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 // within 2 seconds without producing output, return an error immediately so the
 // Deacon can proceed to the next patrol cycle instead of sleeping.
 func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalResult, error) {
-	// Start bd activity --follow
-	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
+	// Start bd feed --follow
+	cmd := exec.CommandContext(ctx, "bd", "feed", "--follow")
 	cmd.Dir = workDir
 
 	stdout, err := cmd.StdoutPipe()
@@ -311,7 +311,7 @@ func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalRes
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting bd activity: %w", err)
+		return nil, fmt.Errorf("starting bd feed: %w", err)
 	}
 
 	// Channel for results
@@ -330,7 +330,7 @@ func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalRes
 			errCh <- err
 		} else {
 			// scanner.Scan returned false with nil error — clean EOF.
-			// This happens when bd activity exits immediately (e.g., Dolt down).
+			// This happens when bd feed exits immediately (e.g., Dolt down).
 			eofCh <- struct{}{}
 		}
 	}()
@@ -354,7 +354,7 @@ func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalRes
 	case <-eofCh:
 		// Process exited without producing output — feed subscription broken
 		_ = cmd.Wait()
-		return nil, fmt.Errorf("bd activity exited immediately (feed subscription failed)")
+		return nil, fmt.Errorf("bd feed exited immediately (feed subscription failed)")
 
 	case <-ctx.Done():
 		// Timeout - kill process and return timeout result

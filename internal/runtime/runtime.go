@@ -98,7 +98,7 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 	}
 	// NOTE: session-started nudge to deacon removed — it interrupted
 	// the deacon's await-signal backoff (exponential sleep). The deacon
-	// already wakes on beads activity via bd activity --follow.
+	// already wakes on beads activity via bd feed --follow.
 
 	return []string{command}
 }

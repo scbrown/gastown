@@ -55,7 +55,7 @@ bd list --type=event --event-type=patrol.muted
 bd list --type=event --event-type=patrol.unmuted
 
 # Events in the activity feed
-bd activity --follow --type=event
+bd feed --follow --type=event
 ```
 
 ## Labels-as-State Pattern

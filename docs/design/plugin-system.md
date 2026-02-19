@@ -31,7 +31,7 @@ The Deacon (agent) evaluates gates and decides whether to dispatch. Go code prov
 |-------|---------------|
 | **M**olecule | `plugin.md` - work template with TOML frontmatter |
 | **E**phemeral | Plugin-run wisps - high-volume, digestible |
-| **O**bservable | Plugin runs appear in `bd activity` feed |
+| **O**bservable | Plugin runs appear in `bd feed` feed |
 | **W**orkflow | Gate → Dispatch → Execute → Record → Digest |
 
 ---
