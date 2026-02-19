@@ -68,6 +68,11 @@ type ConvoyManager struct {
 	// lastEventIDs tracks per-store high-water marks for event polling.
 	// Key matches stores map keys ("hq", "gastown", etc.).
 	lastEventIDs sync.Map // map[string]int64
+
+	// seeded is true once the first poll cycle has run (warm-up).
+	// The first cycle advances high-water marks without processing events,
+	// preventing a burst of historical event replay on daemon restart.
+	seeded bool
 }
 
 // NewConvoyManager creates a new convoy manager.
@@ -120,8 +125,11 @@ func (m *ConvoyManager) Stop() {
 	// Close stores (whether eagerly passed or lazily opened)
 	for name, store := range m.stores {
 		if store != nil {
-			_ = store.Close()
-			m.logger("Convoy: closed beads store (%s)", name)
+			if err := store.Close(); err != nil {
+				m.logger("Convoy: error closing beads store (%s): %v", name, err)
+			} else {
+				m.logger("Convoy: closed beads store (%s)", name)
+			}
 		}
 	}
 	m.stores = nil
@@ -136,12 +144,6 @@ func (m *ConvoyManager) runEventPoll() {
 	if len(m.stores) == 0 && m.openStores == nil {
 		m.logger("Convoy: no beads stores and no opener, event polling disabled")
 		return
-	}
-
-	// Seed high-water marks if stores are already available so the first
-	// poll tick only sees new events.
-	if len(m.stores) > 0 {
-		m.seedHighWaterMarks()
 	}
 
 	ticker := time.NewTicker(eventPollInterval)
@@ -160,42 +162,24 @@ func (m *ConvoyManager) runEventPoll() {
 				if len(m.stores) == 0 {
 					continue // still not ready, try next tick
 				}
-				m.seedHighWaterMarks()
 			}
 			m.pollAllStores()
 		}
 	}
 }
 
-// seedHighWaterMarks queries the latest event ID from each store so the
-// first poll tick only sees truly new events instead of replaying the
-// entire history.  Called once when stores first become available.
-func (m *ConvoyManager) seedHighWaterMarks() {
-	for name, store := range m.stores {
-		events, err := store.GetAllEventsSince(m.ctx, 0)
-		if err != nil {
-			m.logger("Convoy: seed high-water mark failed (%s): %v", name, err)
-			continue
-		}
-		if len(events) > 0 {
-			maxID := events[len(events)-1].ID
-			for _, e := range events {
-				if e.ID > maxID {
-					maxID = e.ID
-				}
-			}
-			m.lastEventIDs.Store(name, maxID)
-		}
-	}
-}
-
 // pollAllStores polls events from all non-parked stores.
+// The first call is a warm-up: it advances high-water marks without
+// processing events, preventing a burst of historical replay on restart.
 func (m *ConvoyManager) pollAllStores() {
 	for name, store := range m.stores {
 		if name != "hq" && m.isRigParked(name) {
 			continue
 		}
 		m.pollStore(name, store)
+	}
+	if !m.seeded {
+		m.seeded = true
 	}
 }
 
@@ -214,6 +198,20 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage) {
 		return
 	}
 
+	// Advance high-water mark from all events
+	for _, e := range events {
+		if e.ID > highWater {
+			highWater = e.ID
+		}
+	}
+	m.lastEventIDs.Store(name, highWater)
+
+	// First poll cycle is warm-up only: advance marks, skip processing.
+	// This prevents replaying the entire event history on daemon restart.
+	if !m.seeded {
+		return
+	}
+
 	// Use hq store for convoy lookups (convoys are hq-* prefixed)
 	hqStore := m.stores["hq"]
 	if hqStore == nil {
@@ -222,11 +220,6 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage) {
 	}
 
 	for _, e := range events {
-		// Update high-water mark
-		if e.ID > highWater {
-			highWater = e.ID
-		}
-
 		// Only interested in status changes to closed (EventStatusChanged with new_value=closed)
 		// or explicit close events (EventClosed)
 		isClose := e.EventType == beadsdk.EventClosed
@@ -245,8 +238,6 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage) {
 		m.logger("Convoy: close detected: %s", issueID)
 		convoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, "Convoy", m.logger, m.gtPath, m.isRigParked)
 	}
-
-	m.lastEventIDs.Store(name, highWater)
 }
 
 // runStrandedScan is the periodic stranded convoy scan loop.

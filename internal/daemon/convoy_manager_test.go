@@ -148,6 +148,7 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {
 	}
 
 	m := NewConvoyManager(townRoot, logger, "gt", 10*time.Minute, map[string]beadsdk.Storage{"hq": store}, nil, nil)
+	m.seeded = true
 	m.pollAllStores()
 
 	// Should have logged the close detection
@@ -1291,6 +1292,7 @@ func TestPollAllStores_MultiRig_DetectsCloseFromNonHqStore(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+	m.seeded = true
 	m.pollAllStores()
 
 	// The close event from the rig store should be detected
@@ -1353,6 +1355,7 @@ func TestPollAllStores_MultiRig_BothStoresPolled(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+	m.seeded = true
 	m.pollAllStores()
 
 	// Both close events should be detected
@@ -1426,6 +1429,7 @@ func TestPollAllStores_SkipsParkedRigs(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, isParked)
+	m.seeded = true
 	m.pollAllStores()
 
 	// Active rig's close event should be detected
@@ -1478,6 +1482,7 @@ func TestPollAllStores_HqNeverSkippedEvenIfParkedCallbackReturnsTrue(t *testing.
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, alwaysParked)
+	m.seeded = true
 	m.pollAllStores()
 
 	found := false
@@ -1523,6 +1528,7 @@ func TestPollAllStores_HighWaterMark_NoReprocessing(t *testing.T) {
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
 
 	// First poll: should detect the close
+	m.seeded = true
 	m.pollAllStores()
 
 	closeCount := 0
@@ -1663,6 +1669,7 @@ exit 0
 	}
 
 	m := NewConvoyManager(townRoot, logger, filepath.Join(binDir, "gt"), 10*time.Minute, map[string]beadsdk.Storage{"hq": store}, nil, nil)
+	m.seeded = true
 	m.pollAllStores()
 
 	for _, s := range logged {
@@ -1718,6 +1725,7 @@ func TestPollStore_NilHqStore_LogsWarningAndSkips(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+	m.seeded = true
 	m.pollAllStores()
 
 	// Should log the nil hq warning

@@ -44,7 +44,7 @@ func CheckConvoysForIssue(ctx context.Context, store beadsdk.Storage, townRoot, 
 	}
 
 	// Find convoys tracking this issue
-	convoyIDs := getTrackingConvoys(ctx, store, issueID)
+	convoyIDs := getTrackingConvoys(ctx, store, issueID, logger)
 	if len(convoyIDs) == 0 {
 		return nil
 	}
@@ -77,9 +77,12 @@ func CheckConvoysForIssue(ctx context.Context, store beadsdk.Storage, townRoot, 
 
 // getTrackingConvoys returns convoy IDs that track the given issue.
 // Uses SDK GetDependentsWithMetadata filtered by type "tracks".
-func getTrackingConvoys(ctx context.Context, store beadsdk.Storage, issueID string) []string {
+func getTrackingConvoys(ctx context.Context, store beadsdk.Storage, issueID string, logger func(format string, args ...interface{})) []string {
 	dependents, err := store.GetDependentsWithMetadata(ctx, issueID)
 	if err != nil {
+		if logger != nil {
+			logger("Convoy: getTrackingConvoys(%s) store error: %v", issueID, err)
+		}
 		return nil
 	}
 
