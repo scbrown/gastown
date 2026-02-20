@@ -797,13 +797,8 @@ func (m *Manager) InitBeads(rigPath, prefix string) error {
 	cmd.Env = filteredEnv
 	_, bdInitErr := cmd.CombinedOutput()
 	if bdInitErr != nil {
-		// bd might not be installed or failed, create minimal structure
-		// Note: beads currently expects YAML format for config
-		configPath := filepath.Join(beadsDir, "config.yaml")
-		configContent := fmt.Sprintf("prefix: %s\nissue-prefix: %s\n", prefix, prefix)
-		if writeErr := os.WriteFile(configPath, []byte(configContent), 0644); writeErr != nil {
-			return writeErr
-		}
+		// bd might not be installed or failed — the shared helper below will
+		// create config.yaml with the required defaults as a fallback.
 	} else {
 		// bd init succeeded - configure the Dolt database
 
@@ -823,6 +818,19 @@ func (m *Manager) InitBeads(rigPath, prefix string) error {
 		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
 			return fmt.Errorf("bd config set issue_prefix failed: %s", strings.TrimSpace(string(prefixOutput)))
 		}
+
+		// Default to Dolt-native sync mode for new Gas Town rig beads.
+		// Non-fatal: the shared helper below will persist sync.mode to config.yaml.
+		syncModeCmd := exec.Command("bd", "config", "set", "sync.mode", "dolt-native")
+		syncModeCmd.Dir = rigPath
+		syncModeCmd.Env = filteredEnv
+		if syncModeOutput, syncModeErr := syncModeCmd.CombinedOutput(); syncModeErr != nil {
+			fmt.Printf("   ⚠ Could not set sync.mode via bd: %s\n", strings.TrimSpace(string(syncModeOutput)))
+		}
+	}
+
+	if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
+		return fmt.Errorf("ensuring config.yaml: %w", err)
 	}
 
 	// Ensure database has repository fingerprint (GH #25).

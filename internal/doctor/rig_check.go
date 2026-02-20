@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
@@ -1022,10 +1023,8 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 		cmd := exec.Command("bd", "init", "--prefix", prefix, "--server")
 		cmd.Dir = rigPath
 		if output, err := cmd.CombinedOutput(); err != nil {
-			// bd might not be installed - create minimal config.yaml
-			configPath := filepath.Join(rigBeadsDir, "config.yaml")
-			configContent := fmt.Sprintf("prefix: %s\n", prefix)
-			if writeErr := os.WriteFile(configPath, []byte(configContent), 0644); writeErr != nil {
+			// bd might not be installed — create config.yaml via shared helper.
+			if writeErr := beads.EnsureConfigYAML(rigBeadsDir, prefix); writeErr != nil {
 				return fmt.Errorf("bd init failed (%v) and fallback config creation failed: %w", err, writeErr)
 			}
 			// Continue - minimal config created
@@ -1255,8 +1254,8 @@ func (c *DefaultBranchExistsCheck) Run(ctx *CheckContext) *CheckResult {
 	cmd := exec.Command("git", "-C", bareRepoPath, "rev-parse", "--verify", ref)
 	if err := cmd.Run(); err != nil {
 		return &CheckResult{
-			Name:   c.Name(),
-			Status: StatusError,
+			Name:    c.Name(),
+			Status:  StatusError,
 			Message: fmt.Sprintf("default_branch %q not found on remote", cfg.DefaultBranch),
 			Details: []string{
 				fmt.Sprintf("Ref %s does not exist in bare repo", ref),

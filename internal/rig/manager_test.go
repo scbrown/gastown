@@ -452,7 +452,7 @@ exit 1
 	if err != nil {
 		t.Fatalf("reading config.yaml: %v", err)
 	}
-	want := "prefix: gt\nissue-prefix: gt\n"
+	want := "prefix: gt\nissue-prefix: gt\nsync.mode: dolt-native\n"
 	if string(config) != want {
 		t.Fatalf("config.yaml = %q, want %q", string(config), want)
 	}
@@ -498,6 +498,10 @@ exit 0
 	// Verify bd config set issue_prefix was called with the correct prefix
 	if !strings.Contains(cmds, "config set issue_prefix myrig") {
 		t.Errorf("expected 'bd config set issue_prefix myrig' in commands log, got:\n%s", cmds)
+	}
+	// Verify sync mode is explicitly set to dolt-native for new rig beads.
+	if !strings.Contains(cmds, "config set sync.mode dolt-native") {
+		t.Errorf("expected 'bd config set sync.mode dolt-native' in commands log, got:\n%s", cmds)
 	}
 }
 
