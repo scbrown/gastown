@@ -694,10 +694,8 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		AgentName:        name,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.ClaudeConfigDir,
+		Agent:            opts.AgentOverride,
 	})
-	if opts.AgentOverride != "" {
-		envVars["GT_AGENT"] = opts.AgentOverride
-	}
 
 	// Build startup command (also includes env vars via 'exec env' for
 	// WaitForCommand detection — belt and suspenders with -e flags)

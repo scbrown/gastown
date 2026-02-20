@@ -73,6 +73,11 @@ type SessionStartOptions struct {
 	// DoltBranch is the polecat-specific Dolt branch for write isolation.
 	// If set, BD_BRANCH env var is injected into the polecat session.
 	DoltBranch string
+
+	// Agent is the agent override for this polecat session (e.g., "codex", "gemini").
+	// If set, GT_AGENT is written to the tmux session environment table so that
+	// IsAgentAlive and waitForPolecatReady read the correct process names.
+	Agent string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -308,6 +313,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		AgentName:        polecat,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.RuntimeConfigDir,
+		Agent:            opts.Agent,
 	})
 	for k, v := range envVars {
 		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(sessionID, k, v))
@@ -330,13 +336,6 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Disable Dolt auto-commit in tmux session environment (gt-5cc2p).
 	// This ensures respawned processes also inherit the setting.
 	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(sessionID, "BD_DOLT_AUTO_COMMIT", "off"))
-
-	// Set GT_AGENT in tmux session environment so IsAgentAlive can detect
-	// the running process. BuildStartupCommand sets it via exec env (process env),
-	// but IsAgentAlive reads from tmux show-environment (session env).
-	if runtimeConfig.ResolvedAgent != "" {
-		debugSession("SetEnvironment GT_AGENT", m.tmux.SetEnvironment(sessionID, "GT_AGENT", runtimeConfig.ResolvedAgent))
-	}
 
 	// Hook the issue to the polecat if provided via --issue flag
 	if opts.Issue != "" {
