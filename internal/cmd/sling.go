@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -285,6 +286,14 @@ func runSling(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+
+	// Serialize assignment writes per bead to prevent concurrent sling races from
+	// producing conflicting assignee/metadata updates.
+	releaseSlingLock, err := tryAcquireSlingBeadLock(townRoot, beadID)
+	if err != nil {
+		return err
+	}
+	defer releaseSlingLock()
 
 	// Check if bead is already assigned (guard against accidental re-sling).
 	// This must happen before resolveTarget(), since rig targets can spawn/hook a new polecat as a side-effect.
@@ -757,6 +766,25 @@ func restorePinnedBead(townRoot, beadID, assignee string) {
 	} else {
 		fmt.Printf("  %s Restored pinned state for bead %s\n", style.Dim.Render("○"), beadID)
 	}
+}
+
+func tryAcquireSlingBeadLock(townRoot, beadID string) (func(), error) {
+	lockDir := filepath.Join(townRoot, ".runtime", "locks", "sling")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating sling lock dir: %w", err)
+	}
+
+	safeBeadID := strings.NewReplacer("/", "_", ":", "_").Replace(beadID)
+	lockPath := filepath.Join(lockDir, safeBeadID+".flock")
+	release, locked, err := lock.FlockTryAcquire(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring sling lock for bead %s: %w", beadID, err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("bead %s is already being slung; retry after the current assignment completes", beadID)
+	}
+
+	return release, nil
 }
 
 // rollbackSlingArtifacts cleans up artifacts left by a partial sling when session start fails.
