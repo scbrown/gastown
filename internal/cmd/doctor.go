@@ -41,13 +41,15 @@ Town root protection:
 
 Infrastructure checks:
   - stale-binary             Check if gt binary is up to date with repo
+  - beads-binary             Check that beads (bd) is installed and meets minimum version
   - daemon                   Check if daemon is running (fixable)
-  - repo-fingerprint         Check database has valid repo fingerprint (fixable)
   - boot-health              Check Boot watchdog health (vet mode)
+  - town-beads-config        Verify town .beads/config.yaml exists (fixable)
 
 Cleanup checks (fixable):
   - orphan-sessions          Detect orphaned tmux sessions
   - orphan-processes         Detect orphaned Claude processes
+  - session-name-format      Detect sessions with outdated naming format (fixable)
   - wisp-gc                  Detect and clean abandoned wisps (>1h)
   - stale-beads-redirect     Detect stale files in .beads directories with redirects
 
@@ -83,13 +85,19 @@ Session hook checks:
   - session-hooks            Check settings.json use session-start.sh
   - claude-settings          Check Claude settings.json match templates (fixable)
   - deprecated-merge-queue-keys  Detect stale deprecated keys in merge_queue config (fixable)
+  - stale-task-dispatch      Detect stale task-dispatch guard in settings.json (fixable)
+
+Dolt checks:
+  - dolt-binary              Check that dolt is installed and in PATH
+  - dolt-metadata            Check dolt metadata tables exist
+  - dolt-server-reachable    Check dolt sql-server is reachable
+  - dolt-orphaned-databases  Detect orphaned dolt databases
 
 Patrol checks:
   - patrol-molecules-exist   Verify patrol molecules exist
   - patrol-hooks-wired       Verify daemon triggers patrols
   - patrol-not-stuck         Detect stale wisps (>1h)
   - patrol-plugins-accessible Verify plugin directories
-  - patrol-roles-have-prompts Verify role prompts exist
 
 Use --fix to attempt automatic fixes for issues that support it.
 Use --rig to check a specific rig instead of the entire workspace.
@@ -133,14 +141,14 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	// Register built-in checks
 	d.Register(doctor.NewStaleBinaryCheck())
+	d.Register(doctor.NewBeadsBinaryCheck())
 	// All database queries go through bd CLI
 	d.Register(doctor.NewTownGitCheck())
 	d.Register(doctor.NewTownRootBranchCheck())
 	d.Register(doctor.NewPreCheckoutHookCheck())
 	d.Register(doctor.NewDaemonCheck())
-	d.Register(doctor.NewRepoFingerprintCheck())
 	d.Register(doctor.NewBootHealthCheck())
-	d.Register(doctor.NewBeadsDatabaseCheck())
+	d.Register(doctor.NewTownBeadsConfigCheck())
 	d.Register(doctor.NewCustomTypesCheck())
 	d.Register(doctor.NewRoleLabelCheck())
 	d.Register(doctor.NewFormulaCheck())
@@ -151,15 +159,15 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewRoutesCheck())
 	d.Register(doctor.NewRigRoutesJSONLCheck())
 	d.Register(doctor.NewRoutingModeCheck())
+	d.Register(doctor.NewMalformedSessionNameCheck())
 	d.Register(doctor.NewOrphanSessionCheck())
 	d.Register(doctor.NewZombieSessionCheck())
 	d.Register(doctor.NewOrphanProcessCheck())
 	d.Register(doctor.NewWispGCCheck())
 	d.Register(doctor.NewCheckMisclassifiedWisps())
 	d.Register(doctor.NewStaleBeadsRedirectCheck())
+	d.Register(doctor.NewBeadsRedirectTargetCheck())
 	d.Register(doctor.NewBranchCheck())
-	d.Register(doctor.NewBeadsSyncOrphanCheck())
-	d.Register(doctor.NewBeadsSyncWorktreeCheck())
 	d.Register(doctor.NewCloneDivergenceCheck())
 	d.Register(doctor.NewDefaultBranchAllRigsCheck())
 	d.Register(doctor.NewIdentityCollisionCheck())
@@ -173,7 +181,6 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewPatrolHooksWiredCheck())
 	d.Register(doctor.NewPatrolNotStuckCheck())
 	d.Register(doctor.NewPatrolPluginsAccessibleCheck())
-	d.Register(doctor.NewPatrolRolesHavePromptsCheck())
 	d.Register(doctor.NewAgentBeadsCheck())
 	d.Register(doctor.NewStaleAgentBeadsCheck())
 	d.Register(doctor.NewRigBeadsCheck())
@@ -209,12 +216,13 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewHookAttachmentValidCheck())
 	d.Register(doctor.NewHookSingletonCheck())
 	d.Register(doctor.NewOrphanedAttachmentsCheck())
-	d.Register(doctor.NewDoltHooksCheck())
 
 	// Hooks sync check
+	d.Register(doctor.NewStaleTaskDispatchCheck())
 	d.Register(doctor.NewHooksSyncCheck())
 
 	// Dolt health checks
+	d.Register(doctor.NewDoltBinaryCheck())
 	d.Register(doctor.NewDoltMetadataCheck())
 	d.Register(doctor.NewDoltServerReachableCheck())
 	d.Register(doctor.NewDoltOrphanedDatabaseCheck())
@@ -256,4 +264,3 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	return nil
 }
-

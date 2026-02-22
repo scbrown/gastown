@@ -69,7 +69,7 @@
                 {{end}}
                 <div class="stat">
                     <span class="stat-value">{{.Summary.PolecatCount}}</span>
-                    <span class="stat-label">⚙️ Workers</span>
+                    <span class="stat-label">🦨 Polecats</span>
                 </div>
                 <div class="stat">
                     <span class="stat-value">{{.Summary.HookCount}}</span>
@@ -123,6 +123,7 @@
                     <h2>🚚 Convoys</h2>
                     <span class="count">{{len .Convoys}}</span>
                     <button class="new-convoy-btn" id="new-convoy-btn">+ New Convoy</button>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -142,6 +143,7 @@
                                 {{range .Convoys}}
                                 <tr class="convoy-row" data-convoy-id="{{.ID}}">
                                     <td>
+                                        <span class="convoy-toggle">▶</span>
                                         {{if eq .WorkStatus "complete"}}
                                         <span class="badge badge-green">✓</span>
                                         {{else if eq .WorkStatus "active"}}
@@ -251,6 +253,7 @@
                 <div class="panel-header">
                     <h2>👨‍💼 Crew</h2>
                     <span class="count" id="crew-count">0</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -276,11 +279,12 @@
                 </div>
             </div>
 
-            <!-- Workers Panel (polecats + refinery) -->
+            <!-- Polecats Panel -->
             <div class="panel">
                 <div class="panel-header">
-                    <h2>⚙️ Workers</h2>
+                    <h2>🦨 Polecats</h2>
                     <span class="count">{{len .Workers}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -342,6 +346,7 @@
                 <div class="panel-header">
                     <h2>📟 Sessions</h2>
                     <span class="count">{{len .Sessions}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -357,7 +362,7 @@
                         </thead>
                         <tbody>
                             {{range .Sessions}}
-                            <tr>
+                            <tr class="session-row" data-session-name="{{.Name}}">
                                 <td>
                                     <span class="role-{{.Role}}">{{.Role}}</span>
                                 </td>
@@ -373,26 +378,75 @@
                         <p>No active sessions</p>
                     </div>
                     {{end}}
+                    <!-- Session terminal preview -->
+                    <div id="session-preview" style="display:none;">
+                        <div class="session-preview-header">
+                            <button id="session-preview-back" class="mail-back-btn">← Back</button>
+                            <span id="session-preview-name" class="session-preview-title"></span>
+                            <span id="session-preview-status" class="session-preview-refresh-status"></span>
+                        </div>
+                        <pre id="session-preview-content" class="session-preview-content">Loading...</pre>
+                    </div>
                 </div>
             </div>
 
-            <!-- Activity Feed Panel -->
-            <div class="panel">
+            <!-- Activity Timeline Panel -->
+            <div class="panel" id="activity-panel">
                 <div class="panel-header">
                     <h2>📜 Activity</h2>
                     <span class="count">{{len .Activity}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
+                {{if .Activity}}
+                <div class="tl-filters">
+                    <div class="tl-filter-group">
+                        <label>Category:</label>
+                        <button class="tl-filter-btn active" data-filter="category" data-value="all">All</button>
+                        <button class="tl-filter-btn" data-filter="category" data-value="agent">Agent</button>
+                        <button class="tl-filter-btn" data-filter="category" data-value="work">Work</button>
+                        <button class="tl-filter-btn" data-filter="category" data-value="comms">Comms</button>
+                        <button class="tl-filter-btn" data-filter="category" data-value="system">System</button>
+                    </div>
+                    <div class="tl-filter-group">
+                        <label>Rig:</label>
+                        <select class="tl-filter-select" id="tl-rig-filter">
+                            <option value="all">All rigs</option>
+                        </select>
+                    </div>
+                    <div class="tl-filter-group">
+                        <label>Agent:</label>
+                        <select class="tl-filter-select" id="tl-agent-filter">
+                            <option value="all">All agents</option>
+                        </select>
+                    </div>
+                </div>
+                {{end}}
                 <div class="panel-body activity-feed">
                     {{if .Activity}}
-                    <div class="feed-list">
+                    <div class="tl-timeline" id="activity-timeline">
                         {{range .Activity}}
-                        <div class="feed-item">
-                            <span class="feed-icon">{{.Icon}}</span>
-                            <span class="feed-summary">{{.Summary}}</span>
-                            <span class="feed-time">{{.Time}}</span>
+                        <div class="tl-entry {{activityTypeClass .Category}}" data-category="{{.Category}}" data-rig="{{.Rig}}" data-agent="{{.Actor}}" data-type="{{.Type}}" data-ts="{{.RawTimestamp}}">
+                            <div class="tl-rail">
+                                <span class="tl-time">{{.Time}}</span>
+                                <span class="tl-node"></span>
+                            </div>
+                            <div class="tl-content">
+                                <div class="tl-header">
+                                    <span class="tl-icon">{{.Icon}}</span>
+                                    <span class="tl-summary">{{.Summary}}</span>
+                                </div>
+                                <div class="tl-meta">
+                                    {{if .Actor}}<span class="tl-badge tl-badge-agent">{{.Actor}}</span>{{end}}
+                                    {{if .Rig}}<span class="tl-badge tl-badge-rig">{{.Rig}}</span>{{end}}
+                                    <span class="tl-badge tl-badge-type">{{.Type}}</span>
+                                </div>
+                            </div>
                         </div>
                         {{end}}
+                    </div>
+                    <div class="tl-empty-filtered" id="tl-empty-filtered" style="display: none;">
+                        <p>No events match current filters</p>
                     </div>
                     {{else}}
                     <div class="empty-state">
@@ -414,23 +468,14 @@
                         <button class="mail-tab" data-tab="all">All Traffic</button>
                     </div>
                     <button class="compose-btn" id="compose-mail-btn" title="Compose new message">✎</button>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
-                    <!-- Inbox view (overseer inbox via API) -->
+                    <!-- Inbox view (threaded conversations via API) -->
                     <div id="mail-list">
                         <div class="loading-state" id="mail-loading">Loading inbox...</div>
-                        <table id="mail-table" style="display: none;">
-                            <thead>
-                                <tr>
-                                    <th>From</th>
-                                    <th>Subject</th>
-                                    <th>Time</th>
-                                </tr>
-                            </thead>
-                            <tbody id="mail-tbody">
-                            </tbody>
-                        </table>
+                        <div id="mail-threads" style="display: none;"></div>
                         <div class="empty-state" id="mail-empty" style="display: none;">
                             <p>No mail in inbox</p>
                         </div>
@@ -517,6 +562,7 @@
                 <div class="panel-header">
                     <h2>🔀 Merge Queue</h2>
                     <span class="count">{{len .MergeQueue}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -603,6 +649,7 @@
                 <div class="panel-header">
                     <h2>🚨 Escalations</h2>
                     <span class="count{{if .Escalations}} count-alert{{end}}">{{len .Escalations}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -614,11 +661,12 @@
                                 <th>Issue</th>
                                 <th>From</th>
                                 <th>Age</th>
+                                <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody>
                             {{range .Escalations}}
-                            <tr>
+                            <tr class="escalation-row" data-escalation-id="{{.ID}}">
                                 <td>
                                     {{if eq .Severity "critical"}}<span class="badge badge-red">CRIT</span>
                                     {{else if eq .Severity "high"}}<span class="badge badge-orange">HIGH</span>
@@ -631,6 +679,13 @@
                                 </td>
                                 <td>{{.EscalatedBy}}</td>
                                 <td>{{.Age}}</td>
+                                <td class="escalation-actions">
+                                    {{if not .Acked}}
+                                    <button class="esc-btn esc-ack-btn" data-action="ack" data-id="{{.ID}}" title="Acknowledge">👍 Ack</button>
+                                    {{end}}
+                                    <button class="esc-btn esc-resolve-btn" data-action="resolve" data-id="{{.ID}}" title="Resolve">✓ Resolve</button>
+                                    <button class="esc-btn esc-reassign-btn" data-action="reassign" data-id="{{.ID}}" title="Reassign">↻ Reassign</button>
+                                </td>
                             </tr>
                             {{end}}
                         </tbody>
@@ -650,6 +705,7 @@
                 <div class="panel-header">
                     <h2>🏗️ Rigs</h2>
                     <span class="count">{{len .Rigs}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -690,6 +746,7 @@
                 <div class="panel-header">
                     <h2>🐕 Dogs</h2>
                     <span class="count">{{len .Dogs}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -731,6 +788,7 @@
                 <div class="panel-header">
                     <h2>📋 Queues</h2>
                     <span class="count">{{len .Queues}}</span>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -772,6 +830,7 @@
                     <h2>📋 Work</h2>
                     <span class="count">{{len .Issues}}</span>
                     <button class="new-issue-btn" onclick="openIssueModal()">+ New</button>
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-tabs">
@@ -808,7 +867,7 @@
                                     <td class="issue-status">
                                         {{if .Assignee}}<span class="badge badge-blue" title="{{.Assignee}}">{{.Assignee}}</span>{{else}}<span class="badge badge-green">Ready</span>{{end}}
                                     </td>
-                                    <td>{{.Age}}</td>
+                                    <td class="issue-age">{{.Age}}</td>
                                     <td><button class="sling-btn" data-bead-id="{{.ID}}" title="Sling to rig">Sling</button></td>
                                 </tr>
                                 {{end}}
@@ -862,6 +921,7 @@
                     <span class="count{{if .Hooks}} {{end}}">{{len .Hooks}}</span>
                     <button class="hook-attach-btn" onclick="openHookAttachForm()">+ Attach</button>
                     {{if .Hooks}}<button class="hook-clear-all-btn" onclick="clearAllHooks()">Clear All</button>{{end}}
+                    <button class="collapse-btn" aria-label="Toggle panel">▼</button>
                     <button class="expand-btn">Expand</button>
                 </div>
                 <div class="panel-body">
@@ -890,7 +950,7 @@
                                 <td><span class="hook-id">{{.ID}}</span></td>
                                 <td class="hook-title">{{.Title}}</td>
                                 <td class="hook-agent">{{.Agent}}</td>
-                                <td>
+                                <td class="hook-age">
                                     {{if .IsStale}}
                                     <span class="badge badge-yellow">{{.Age}}</span>
                                     {{else}}

@@ -353,7 +353,7 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 	for _, name := range names {
 		d, err := mgr.Get(name)
 		if err != nil {
-			fmt.Printf("Warning: dog %s not found, skipping\n", name)
+			style.PrintWarning("dog %s not found, skipping", name)
 			continue
 		}
 
@@ -491,7 +491,7 @@ func runDogCall(cmd *cobra.Command, args []string) error {
 		for _, d := range dogs {
 			if d.State == dog.StateIdle {
 				if err := mgr.SetState(d.Name, dog.StateIdle); err != nil {
-					fmt.Printf("Warning: failed to wake %s: %v\n", d.Name, err)
+					style.PrintWarning("failed to wake %s: %v", d.Name, err)
 					continue
 				}
 				woken++
@@ -928,6 +928,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	body := formatPluginMailBody(p)
 
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	defer router.WaitPendingNotifications()
 	msg := &mail.Message{
 		From:      "deacon/",
 		To:        dogAddress,
@@ -1008,7 +1009,7 @@ func formatPluginMailBody(p *plugin.Plugin) string {
 	sb.WriteString("After completion:\n")
 	sb.WriteString("1. Create a wisp to record the result (success/failure)\n")
 	sb.WriteString("2. Send DOG_DONE mail to deacon/\n")
-	sb.WriteString("3. Return to idle state\n")
+	sb.WriteString("3. Run `gt dog done`, then exit the session (do NOT idle at the prompt)\n")
 
 	return sb.String()
 }

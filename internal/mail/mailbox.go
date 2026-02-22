@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -156,7 +158,7 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	var allMsgs []BeadsMessage
 	if err := json.Unmarshal(stdout, &allMsgs); err != nil {
 		if len(stdout) == 0 || string(stdout) == "null" {
-			return nil, nil
+			return make([]*Message, 0), nil
 		}
 		return nil, err
 	}
@@ -170,7 +172,7 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	}
 
 	// Filter: assignee match (open/hooked) OR CC match (open only)
-	var messages []*Message
+	messages := make([]*Message, 0)
 	for i := range allMsgs {
 		bm := &allMsgs[i]
 
@@ -210,18 +212,17 @@ func (m *Mailbox) identityVariants() []string {
 	return variants
 }
 
-
 func (m *Mailbox) listLegacy() ([]*Message, error) {
 	file, err := os.Open(m.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return make([]*Message, 0), nil
 		}
 		return nil, err
 	}
 	defer func() { _ = file.Close() }() // non-fatal: OS will close on exit
 
-	var messages []*Message
+	messages := make([]*Message, 0)
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
 	for scanner.Scan() {
@@ -257,7 +258,7 @@ func (m *Mailbox) ListUnread() ([]*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	var unread []*Message
+	unread := make([]*Message, 0)
 	for _, msg := range all {
 		if !msg.Read {
 			unread = append(unread, msg)
@@ -829,6 +830,64 @@ func (m *Mailbox) Count() (total, unread int, err error) {
 	}
 
 	return total, unread, nil
+}
+
+// AcknowledgeDeliveries marks delivery receipt for unread messages where this
+// mailbox is the primary recipient. This is phase-2 of two-phase delivery
+// tracking (phase-1 is written at send time as delivery:pending).
+// Acks are run concurrently (bounded to 8) to avoid N+1 sequential subprocess
+// spawns on the hot path.
+func (m *Mailbox) AcknowledgeDeliveries(recipientAddress string, messages []*Message) error {
+	if m.legacy || len(messages) == 0 {
+		return nil
+	}
+
+	recipientIdentity := AddressToIdentity(recipientAddress)
+
+	// Collect messages that need acking.
+	var toAck []*Message
+	for _, msg := range messages {
+		if msg == nil || msg.ID == "" {
+			continue
+		}
+		if AddressToIdentity(msg.To) != recipientIdentity {
+			continue
+		}
+		if msg.DeliveryState == "" || msg.DeliveryState == DeliveryStateAcked {
+			continue
+		}
+		toAck = append(toAck, msg)
+	}
+	if len(toAck) == 0 {
+		return nil
+	}
+
+	// Run acks concurrently with bounded parallelism.
+	const maxConcurrentAckOps = 8
+	sem := make(chan struct{}, maxConcurrentAckOps)
+	var mu sync.Mutex
+	var errs []string
+	var wg sync.WaitGroup
+
+	for _, msg := range toAck {
+		wg.Add(1)
+		sem <- struct{}{} // acquire
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }() // release
+			if err := AcknowledgeDeliveryBead(m.workDir, m.beadsDir, id, recipientIdentity); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+				mu.Unlock()
+			}
+		}(msg.ID)
+	}
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("acknowledging deliveries failed: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 // Append adds a message to the mailbox (legacy mode only).

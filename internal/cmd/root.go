@@ -2,15 +2,19 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/ui"
 	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -35,8 +39,7 @@ across distributed teams of AI agents working on shared codebases.`, cmdName)
 }
 
 // Commands that don't require beads to be installed/checked.
-// NOTE: Gas Town has migrated to Dolt for beads storage. The bd version
-// check is obsolete. Exempt all common commands.
+// These commands should work even when bd is missing or outdated.
 var beadsExemptCommands = map[string]bool{
 	"version":    true,
 	"help":       true,
@@ -62,10 +65,9 @@ var beadsExemptCommands = map[string]bool{
 	"tap":        true,
 	"dnd":        true,
 	"signal":        true, // Hook signal handlers must be fast, handle beads internally
+	"metrics":       true, // Metrics reads local JSONL, no beads needed
 	"krc":           true, // KRC doesn't require beads
-	"pane":           true, // Pane operations don't require beads
-	"quorum":        true, // Quorum handles beads internally
-	"run-migration": true, // Migration orchestrator handles its own beads checks
+	"run-migration":       true, // Migration orchestrator handles its own beads checks
 }
 
 // Commands exempt from the town root branch warning.
@@ -79,47 +81,34 @@ var branchCheckExemptCommands = map[string]bool{
 	"git-init":   true, // Git setup
 }
 
-// Commands exempt from the BuiltProperly fatal check.
-// These diagnostic/setup commands should work even with an improperly built binary
-// so users can identify and fix the problem.
-var buildCheckExemptCommands = map[string]bool{
-	"version":    true,
-	"help":       true,
-	"completion": true,
-	"doctor":     true,
-	"install":    true,
-}
-
 // persistentPreRun runs before every command.
 func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Check if binary was built properly (via make build, not raw go build).
-	// Raw go build skips ldflags, producing a binary with broken mail subsystem
-	// and missing version info. This is a FATAL error for most commands.
-	// Diagnostic commands (version, help, doctor, install) are exempt so users
-	// can identify and fix the problem.
-	if BuiltProperly == "" {
-		cmdName := cmd.Name()
-		if buildCheckExemptCommands[cmdName] {
-			fmt.Fprintln(os.Stderr, "WARNING: This binary was built with 'go build' directly.")
-			fmt.Fprintln(os.Stderr, "         Use 'make build' or 'make install' for a working binary.")
-		} else {
-			fmt.Fprintln(os.Stderr, "FATAL: This gt binary was NOT built with 'make build'.")
-			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "  Raw 'go build' and 'go install' skip critical build flags,")
-			fmt.Fprintln(os.Stderr, "  producing a binary with a broken mail subsystem and no version info.")
-			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "  Fix: cd to the gastown repo and run 'make install'")
-			if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
-				fmt.Fprintf(os.Stderr, "  Repo: %s\n", gtRoot)
-			}
-			fmt.Fprintln(os.Stderr, "")
-			fmt.Fprintln(os.Stderr, "  Allowed commands with this binary: gt version, gt help, gt doctor, gt install")
-			return fmt.Errorf("binary not built with 'make build' — refusing to run")
+	// Raw go build produces unsigned binaries that macOS may kill.
+	// Warning only - doesn't block execution.
+	// Skip warning when Build was set by a package manager (e.g. Homebrew sets
+	// Build to "Homebrew" via ldflags but doesn't set BuiltProperly).
+	if BuiltProperly == "" && Build == "dev" {
+		fmt.Fprintln(os.Stderr, "WARNING: This binary was built with 'go build' directly.")
+		fmt.Fprintln(os.Stderr, "         Use 'make build' to create a properly signed binary.")
+		if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
+			fmt.Fprintf(os.Stderr, "         Run from: %s\n", gtRoot)
 		}
 	}
 
 	// Initialize CLI theme (dark/light mode support)
 	initCLITheme()
+
+	// Log command usage telemetry (fire-and-forget, excludes tap/signal)
+	logCommandUsage(cmd, args)
+
+	// Initialize session prefix registry and agent registry from town root.
+	// Best-effort: if town root not found, the default "gt" prefix is used.
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		if err := session.InitRegistry(townRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: failed to initialize town registry: %v\n", err)
+		}
+	}
 
 	// Get the root command name being run
 	cmdName := cmd.Name()
@@ -141,8 +130,9 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 
 	// Check beads version (non-blocking - warn only)
 	if err := CheckBeadsVersion(); err != nil {
-		// Just warn, don't block - beads issues shouldn't prevent gt from running
-		fmt.Fprintf(os.Stderr, "⚠ beads check: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\n%s beads (bd) version issue:\n", style.Bold.Render("⚠️  WARNING:"))
+		fmt.Fprintf(os.Stderr, "   %v\n", err)
+		fmt.Fprintf(os.Stderr, "   Run %s for details.\n\n", style.Dim.Render("gt doctor"))
 	}
 	return nil
 }
@@ -198,25 +188,6 @@ func warnIfTownRootOffMain() {
 		style.Dim.Render("gt doctor --fix"))
 }
 
-// checkBeadsDependency verifies beads meets minimum version requirements.
-// Skips check for exempt commands (version, help, completion).
-// Deprecated: Use persistentPreRun instead, which calls CheckBeadsVersion.
-func checkBeadsDependency(cmd *cobra.Command, _ []string) error {
-	// Get the root command name being run
-	cmdName := cmd.Name()
-
-	// Skip check for exempt commands
-	if beadsExemptCommands[cmdName] {
-		return nil
-	}
-
-	// Check for stale binary (warning only, doesn't block)
-	checkStaleBinaryWarning()
-
-	// Check beads version
-	return CheckBeadsVersion()
-}
-
 // staleBinaryWarned tracks if we've already warned about stale binary in this session.
 // We use an environment variable since the binary restarts on each command.
 var staleBinaryWarned = os.Getenv("GT_STALE_WARNED") == "1"
@@ -259,6 +230,22 @@ func checkStaleBinaryWarning() {
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
 func Execute() int {
+	ctx := context.Background()
+	provider, err := telemetry.Init(ctx, "gastown", Version)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: telemetry init: %v\n", err)
+	}
+	if provider != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = provider.Shutdown(shutdownCtx)
+		}()
+		// Set OTEL_RESOURCE_ATTRIBUTES in the process env so all bd subprocesses
+		// spawned via exec.Command inherit GT context automatically.
+		telemetry.SetProcessOTELAttrs()
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		// Check for silent exit (scripting commands that signal status via exit code)
 		if code, ok := IsSilentExit(err); ok {

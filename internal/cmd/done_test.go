@@ -628,110 +628,489 @@ func TestBranchDetectionCleanupOnError(t *testing.T) {
 	}
 }
 
-// TestDeliveryGateLogic verifies the delivery gate decision matrix (gt-vol0q):
-// - COMPLETED: always close bead (existing behavior)
-// - DEFERRED/ESCALATED with commits > 0: close bead (work exists)
-// - DEFERRED/ESCALATED with commits <= 0: release bead for re-dispatch
-func TestDeliveryGateLogic(t *testing.T) {
+// TestConvoyMergeStrategyBranching verifies that the merge strategy branching
+// logic in runDone correctly routes to the right code path for each strategy.
+func TestConvoyMergeStrategyBranching(t *testing.T) {
 	tests := []struct {
-		name       string
-		exitType   string
-		aheadCount int
-		wantClose  bool // true = close bead, false = release bead
+		name          string
+		mergeStrategy string
+		wantPush      bool // should push happen?
+		wantMR        bool // should MR bead be created?
+		wantDirect    bool // should push to default branch?
 	}{
-		// COMPLETED always closes regardless of aheadCount
-		{"completed-with-commits", ExitCompleted, 5, true},
-		{"completed-zero-commits", ExitCompleted, 0, true},
-		{"completed-unknown", ExitCompleted, -1, true},
-
-		// DEFERRED with commits > 0 closes (work exists)
-		{"deferred-with-commits", ExitDeferred, 3, true},
-		// DEFERRED with zero commits releases (no deliverables)
-		{"deferred-zero-commits", ExitDeferred, 0, false},
-		// DEFERRED with unknown (-1) releases (safe default)
-		{"deferred-unknown", ExitDeferred, -1, false},
-
-		// ESCALATED with commits > 0 closes
-		{"escalated-with-commits", ExitEscalated, 2, true},
-		// ESCALATED with zero commits releases
-		{"escalated-zero-commits", ExitEscalated, 0, false},
-		// ESCALATED with unknown (-1) releases
-		{"escalated-unknown", ExitEscalated, -1, false},
-
-		// PHASE_COMPLETE always closes (existing behavior)
-		{"phase-complete-with-commits", ExitPhaseComplete, 1, true},
-		{"phase-complete-zero-commits", ExitPhaseComplete, 0, true},
+		{
+			name:          "mr strategy - normal push and MR",
+			mergeStrategy: "mr",
+			wantPush:      true,
+			wantMR:        true,
+			wantDirect:    false,
+		},
+		{
+			name:          "empty strategy - defaults to mr behavior",
+			mergeStrategy: "",
+			wantPush:      true,
+			wantMR:        true,
+			wantDirect:    false,
+		},
+		{
+			name:          "direct strategy - push to main, no MR",
+			mergeStrategy: "direct",
+			wantPush:      true,
+			wantMR:        false,
+			wantDirect:    true,
+		},
+		{
+			name:          "local strategy - no push, no MR",
+			mergeStrategy: "local",
+			wantPush:      false,
+			wantMR:        false,
+			wantDirect:    false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Replicate the delivery gate condition from updateAgentStateOnDone
-			shouldRelease := (tt.exitType == ExitDeferred || tt.exitType == ExitEscalated) && tt.aheadCount <= 0
-			shouldClose := !shouldRelease
+			// Simulate the branching logic from runDone
+			shouldPush := true
+			shouldCreateMR := true
+			shouldPushDirect := false
 
-			if shouldClose != tt.wantClose {
-				t.Errorf("shouldClose = %v, want %v (exitType=%s, aheadCount=%d)",
-					shouldClose, tt.wantClose, tt.exitType, tt.aheadCount)
+			switch tt.mergeStrategy {
+			case "local":
+				shouldPush = false
+				shouldCreateMR = false
+			case "direct":
+				shouldPushDirect = true
+				shouldCreateMR = false
+			default:
+				// "mr" or empty = default behavior
+			}
+
+			if shouldPush != tt.wantPush {
+				t.Errorf("shouldPush = %v, want %v", shouldPush, tt.wantPush)
+			}
+			if shouldCreateMR != tt.wantMR {
+				t.Errorf("shouldCreateMR = %v, want %v", shouldCreateMR, tt.wantMR)
+			}
+			if shouldPushDirect != tt.wantDirect {
+				t.Errorf("shouldPushDirect = %v, want %v", shouldPushDirect, tt.wantDirect)
 			}
 		})
 	}
 }
 
-// TestMoleculeChildrenGateLogic verifies that molecules with open child steps
-// are not closed (gt-vol0q). The molecule should only close if ALL children
-// have status "closed".
-func TestMoleculeChildrenGateLogic(t *testing.T) {
+// TestConvoyMergeStrategyNotification verifies that the merge strategy
+// is included in the witness notification body when set to non-default values.
+func TestConvoyMergeStrategyNotification(t *testing.T) {
 	tests := []struct {
-		name           string
-		childStatuses  map[string]string // childID -> status
-		wantCloseMol   bool
+		name          string
+		mergeStrategy string
+		wantInBody    bool
+	}{
+		{"direct strategy included", "direct", true},
+		{"local strategy included", "local", true},
+		{"mr strategy excluded", "mr", false},
+		{"empty strategy excluded", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the notification body building from runDone
+			var bodyLines []string
+			bodyLines = append(bodyLines, "Exit: COMPLETED")
+			if tt.mergeStrategy != "" && tt.mergeStrategy != "mr" {
+				bodyLines = append(bodyLines, fmt.Sprintf("MergeStrategy: %s", tt.mergeStrategy))
+			}
+
+			body := strings.Join(bodyLines, "\n")
+			hasMergeStrategy := strings.Contains(body, "MergeStrategy:")
+
+			if hasMergeStrategy != tt.wantInBody {
+				t.Errorf("body contains MergeStrategy = %v, want %v\nbody: %s",
+					hasMergeStrategy, tt.wantInBody, body)
+			}
+		})
+	}
+}
+
+// TestParseConvoyMergeStrategy verifies that parseConvoyMergeStrategy correctly
+// extracts the merge strategy from convoy descriptions.
+func TestParseConvoyMergeStrategy(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		want        string
 	}{
 		{
-			name:          "all-closed",
-			childStatuses: map[string]string{"step-1": "closed", "step-2": "closed"},
-			wantCloseMol:  true,
+			name:        "direct strategy",
+			description: "Auto-created convoy tracking gt-abc\nMerge: direct",
+			want:        "direct",
 		},
 		{
-			name:          "one-open",
-			childStatuses: map[string]string{"step-1": "closed", "step-2": "open"},
-			wantCloseMol:  false,
+			name:        "mr strategy",
+			description: "Convoy tracking 3 issues\nOwner: mayor/\nMerge: mr",
+			want:        "mr",
 		},
 		{
-			name:          "one-in-progress",
-			childStatuses: map[string]string{"step-1": "closed", "step-2": "in_progress"},
-			wantCloseMol:  false,
+			name:        "local strategy",
+			description: "Merge: local\nOwner: mayor/",
+			want:        "local",
 		},
 		{
-			name:          "all-open",
-			childStatuses: map[string]string{"step-1": "open", "step-2": "open"},
-			wantCloseMol:  false,
+			name:        "no merge field",
+			description: "Auto-created convoy tracking gt-abc",
+			want:        "",
 		},
 		{
-			name:          "no-children",
-			childStatuses: map[string]string{},
-			wantCloseMol:  true,
+			name:        "empty description",
+			description: "",
+			want:        "",
 		},
 		{
-			name:          "one-hooked",
-			childStatuses: map[string]string{"step-1": "closed", "step-2": "hooked"},
-			wantCloseMol:  false,
+			name:        "merge in middle of description",
+			description: "Convoy tracking 1 issues\nMerge: direct\nNotify: mayor/",
+			want:        "direct",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Replicate the molecule children gate logic from updateAgentStateOnDone
-			canCloseMol := true
-			for childID, status := range tt.childStatuses {
-				if status != "closed" {
-					canCloseMol = false
-					_ = childID // used in real code for warning message
-					break
+			got := parseConvoyMergeStrategy(tt.description)
+			if got != tt.want {
+				t.Errorf("parseConvoyMergeStrategy() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDoneCheckpointLabelFormat verifies the done-cp label format matches
+// the expected pattern: done-cp:<stage>:<value>:<unix-ts>
+func TestDoneCheckpointLabelFormat(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		checkpoint DoneCheckpoint
+		value      string
+		wantPrefix string
+	}{
+		{CheckpointPushed, "polecat/furiosa-abc", "done-cp:pushed:polecat/furiosa-abc:"},
+		{CheckpointMRCreated, "gt-xyz123", "done-cp:mr-created:gt-xyz123:"},
+		{CheckpointDoltMerged, "ok", "done-cp:dolt-merged:ok:"},
+		{CheckpointWitnessNotified, "ok", "done-cp:witness-notified:ok:"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.checkpoint), func(t *testing.T) {
+			label := fmt.Sprintf("done-cp:%s:%s:%d", tt.checkpoint, tt.value, now.Unix())
+			if !strings.HasPrefix(label, tt.wantPrefix) {
+				t.Errorf("label = %q, want prefix %q", label, tt.wantPrefix)
+			}
+
+			// Verify the label can be parsed back
+			parts := strings.SplitN(label, ":", 4)
+			if len(parts) != 4 {
+				t.Fatalf("expected 4 parts, got %d: %v", len(parts), parts)
+			}
+			if parts[0] != "done-cp" {
+				t.Errorf("prefix = %q, want %q", parts[0], "done-cp")
+			}
+			if DoneCheckpoint(parts[1]) != tt.checkpoint {
+				t.Errorf("stage = %q, want %q", parts[1], tt.checkpoint)
+			}
+			if parts[2] != tt.value {
+				t.Errorf("value = %q, want %q", parts[2], tt.value)
+			}
+		})
+	}
+}
+
+// TestReadDoneCheckpoints verifies that readDoneCheckpoints correctly
+// parses checkpoint labels from an issue's label list.
+func TestReadDoneCheckpoints(t *testing.T) {
+	// Test the parsing logic directly by simulating what readDoneCheckpoints does
+	tests := []struct {
+		name   string
+		labels []string
+		want   map[DoneCheckpoint]string
+	}{
+		{
+			name:   "no checkpoints",
+			labels: []string{"gt:agent", "idle:3"},
+			want:   map[DoneCheckpoint]string{},
+		},
+		{
+			name:   "push checkpoint only",
+			labels: []string{"gt:agent", "done-cp:pushed:polecat/furiosa-abc:1738972800"},
+			want:   map[DoneCheckpoint]string{CheckpointPushed: "polecat/furiosa-abc"},
+		},
+		{
+			name: "multiple checkpoints",
+			labels: []string{
+				"gt:agent",
+				"done-cp:pushed:polecat/furiosa-abc:1738972800",
+				"done-cp:mr-created:gt-xyz123:1738972801",
+				"done-cp:dolt-merged:ok:1738972802",
+			},
+			want: map[DoneCheckpoint]string{
+				CheckpointPushed:     "polecat/furiosa-abc",
+				CheckpointMRCreated:  "gt-xyz123",
+				CheckpointDoltMerged: "ok",
+			},
+		},
+		{
+			name:   "all checkpoints",
+			labels: []string{
+				"done-cp:pushed:branch-name:1738972800",
+				"done-cp:mr-created:gt-mr1:1738972801",
+				"done-cp:dolt-merged:ok:1738972802",
+				"done-cp:witness-notified:ok:1738972803",
+			},
+			want: map[DoneCheckpoint]string{
+				CheckpointPushed:          "branch-name",
+				CheckpointMRCreated:       "gt-mr1",
+				CheckpointDoltMerged:      "ok",
+				CheckpointWitnessNotified: "ok",
+			},
+		},
+		{
+			name:   "mixed with done-intent and other labels",
+			labels: []string{
+				"gt:agent",
+				"done-intent:COMPLETED:1738972800",
+				"done-cp:pushed:mybranch:1738972801",
+				"idle:2",
+			},
+			want: map[DoneCheckpoint]string{CheckpointPushed: "mybranch"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the parsing logic from readDoneCheckpoints
+			checkpoints := make(map[DoneCheckpoint]string)
+			for _, label := range tt.labels {
+				if strings.HasPrefix(label, "done-cp:") {
+					parts := strings.SplitN(label, ":", 4)
+					if len(parts) >= 3 {
+						stage := DoneCheckpoint(parts[1])
+						value := parts[2]
+						checkpoints[stage] = value
+					}
 				}
 			}
 
-			if canCloseMol != tt.wantCloseMol {
-				t.Errorf("canCloseMol = %v, want %v", canCloseMol, tt.wantCloseMol)
+			if len(checkpoints) != len(tt.want) {
+				t.Errorf("got %d checkpoints, want %d", len(checkpoints), len(tt.want))
+			}
+			for k, v := range tt.want {
+				if checkpoints[k] != v {
+					t.Errorf("checkpoint[%s] = %q, want %q", k, checkpoints[k], v)
+				}
+			}
+		})
+	}
+}
+
+// TestClearDoneCheckpoints verifies that clearDoneCheckpoints removes
+// only done-cp labels while preserving other labels.
+func TestClearDoneCheckpoints(t *testing.T) {
+	allLabels := []string{
+		"gt:agent",
+		"idle:3",
+		"done-intent:COMPLETED:1738972800",
+		"done-cp:pushed:mybranch:1738972801",
+		"done-cp:mr-created:gt-xyz:1738972802",
+		"done-cp:dolt-merged:ok:1738972803",
+		"backoff-until:1738972900",
+	}
+
+	var kept []string
+	var removed []string
+	for _, label := range allLabels {
+		if strings.HasPrefix(label, "done-cp:") {
+			removed = append(removed, label)
+		} else {
+			kept = append(kept, label)
+		}
+	}
+
+	if len(removed) != 3 {
+		t.Errorf("expected 3 checkpoint labels removed, got %d: %v", len(removed), removed)
+	}
+	if len(kept) != 4 {
+		t.Errorf("expected 4 labels kept, got %d: %v", len(kept), kept)
+	}
+
+	// Verify no checkpoint labels in kept set
+	for _, label := range kept {
+		if strings.HasPrefix(label, "done-cp:") {
+			t.Errorf("checkpoint label was not removed: %s", label)
+		}
+	}
+
+	// Verify done-intent is preserved (not a checkpoint)
+	found := false
+	for _, label := range kept {
+		if strings.HasPrefix(label, "done-intent:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("done-intent label should be preserved by clearDoneCheckpoints")
+	}
+}
+
+// TestCheckpointResumeSkipsPush verifies that when a push checkpoint exists,
+// the push section is skipped on resume.
+func TestCheckpointResumeSkipsPush(t *testing.T) {
+	tests := []struct {
+		name        string
+		checkpoints map[DoneCheckpoint]string
+		wantSkip    bool
+	}{
+		{
+			name:        "no checkpoints - push runs normally",
+			checkpoints: map[DoneCheckpoint]string{},
+			wantSkip:    false,
+		},
+		{
+			name:        "push checkpoint exists - skip push",
+			checkpoints: map[DoneCheckpoint]string{CheckpointPushed: "mybranch"},
+			wantSkip:    true,
+		},
+		{
+			name: "push and MR checkpoints - skip push",
+			checkpoints: map[DoneCheckpoint]string{
+				CheckpointPushed:    "mybranch",
+				CheckpointMRCreated: "gt-xyz",
+			},
+			wantSkip: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Replicate the guard condition from runDone
+			skipPush := tt.checkpoints[CheckpointPushed] != ""
+			if skipPush != tt.wantSkip {
+				t.Errorf("skipPush = %v, want %v", skipPush, tt.wantSkip)
+			}
+		})
+	}
+}
+
+// TestCheckpointResumeSkipsDoltMerge verifies that when a Dolt merge
+// checkpoint exists, the merge section is skipped on resume.
+func TestCheckpointResumeSkipsDoltMerge(t *testing.T) {
+	tests := []struct {
+		name        string
+		checkpoints map[DoneCheckpoint]string
+		wantSkip    bool
+	}{
+		{
+			name:        "no checkpoints - merge runs normally",
+			checkpoints: map[DoneCheckpoint]string{},
+			wantSkip:    false,
+		},
+		{
+			name: "dolt merge checkpoint - skip merge",
+			checkpoints: map[DoneCheckpoint]string{
+				CheckpointPushed:     "mybranch",
+				CheckpointDoltMerged: "ok",
+			},
+			wantSkip: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skipMerge := tt.checkpoints[CheckpointDoltMerged] != ""
+			if skipMerge != tt.wantSkip {
+				t.Errorf("skipMerge = %v, want %v", skipMerge, tt.wantSkip)
+			}
+		})
+	}
+}
+
+// TestCheckpointNilMapSafe verifies that reading from a nil/empty checkpoint
+// map returns zero values and doesn't panic.
+func TestCheckpointNilMapSafe(t *testing.T) {
+	// Nil map - should not panic
+	var nilMap map[DoneCheckpoint]string
+	if nilMap[CheckpointPushed] != "" {
+		t.Error("nil map should return zero value")
+	}
+
+	// Empty map
+	emptyMap := map[DoneCheckpoint]string{}
+	if emptyMap[CheckpointPushed] != "" {
+		t.Error("empty map should return zero value")
+	}
+}
+
+// TestConvoyInfoFallbackChain verifies that done.go checks attachment fields
+// first, then falls back to dep-based convoy lookup. This is the fix for gt-7b6wf:
+// convoy merge=direct was not propagated because cross-rig dep resolution failed.
+func TestConvoyInfoFallbackChain(t *testing.T) {
+	tests := []struct {
+		name            string
+		attachmentInfo  *ConvoyInfo // Result from getConvoyInfoFromIssue
+		depInfo         *ConvoyInfo // Result from getConvoyInfoForIssue
+		wantConvoyID    string
+		wantMerge       string
+		wantNil         bool
+	}{
+		{
+			name:           "attachment fields provide convoy info",
+			attachmentInfo: &ConvoyInfo{ID: "hq-cv-abc", MergeStrategy: "direct"},
+			depInfo:        nil, // Not called
+			wantConvoyID:   "hq-cv-abc",
+			wantMerge:      "direct",
+		},
+		{
+			name:           "attachment fields empty, dep lookup succeeds",
+			attachmentInfo: nil,
+			depInfo:        &ConvoyInfo{ID: "hq-cv-xyz", MergeStrategy: "mr"},
+			wantConvoyID:   "hq-cv-xyz",
+			wantMerge:      "mr",
+		},
+		{
+			name:           "both nil - no convoy",
+			attachmentInfo: nil,
+			depInfo:        nil,
+			wantNil:        true,
+		},
+		{
+			name:           "attachment has convoy, dep also has (attachment wins)",
+			attachmentInfo: &ConvoyInfo{ID: "hq-cv-from-attachment", MergeStrategy: "direct"},
+			depInfo:        &ConvoyInfo{ID: "hq-cv-from-dep", MergeStrategy: "mr"},
+			wantConvoyID:   "hq-cv-from-attachment",
+			wantMerge:      "direct",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the fallback chain from done.go
+			var convoyInfo *ConvoyInfo
+			convoyInfo = tt.attachmentInfo
+			if convoyInfo == nil {
+				convoyInfo = tt.depInfo
+			}
+
+			if tt.wantNil {
+				if convoyInfo != nil {
+					t.Errorf("expected nil, got %+v", convoyInfo)
+				}
+				return
+			}
+			if convoyInfo == nil {
+				t.Fatal("expected non-nil convoy info")
+			}
+			if convoyInfo.ID != tt.wantConvoyID {
+				t.Errorf("ConvoyID = %q, want %q", convoyInfo.ID, tt.wantConvoyID)
+			}
+			if convoyInfo.MergeStrategy != tt.wantMerge {
+				t.Errorf("MergeStrategy = %q, want %q", convoyInfo.MergeStrategy, tt.wantMerge)
 			}
 		})
 	}

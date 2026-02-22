@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -286,12 +287,7 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 		parts = append(parts, AgentTypeIcons[AgentDeacon])
 	}
 
-	// Build rig status display with LED indicators
-	// 🟢 = both witness and refinery running (fully active)
-	// 🟡 = one of witness/refinery running (partially active)
-	// 🅿️ = parked (nothing running, intentionally paused)
-	// 🛑 = docked (nothing running, global shutdown)
-	// ⚫ = operational but nothing running (unexpected state)
+	// Build rig status display with LED indicators (see GetRigLED for definitions)
 
 	// Create sortable rig list
 	type rigInfo struct {
@@ -344,24 +340,7 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 		lastGroup = currentGroup
 
 		status := rig.status
-		var led string
-
-		// Check if processes are running first (regardless of operational state)
-		if status.hasWitness && status.hasRefinery {
-			led = "🟢" // Both running - fully active
-		} else if status.hasWitness || status.hasRefinery {
-			led = "🟡" // One running - partially active
-		} else {
-			// Nothing running - show operational state
-			switch status.opState {
-			case "PARKED":
-				led = "🅿️" // Parked - intentionally paused
-			case "DOCKED":
-				led = "🛑" // Docked - global shutdown
-			default:
-				led = "⚫" // Operational but nothing running
-			}
-		}
+		led := GetRigLED(status.hasWitness, status.hasRefinery, status.opState)
 
 		// All icons get 1 space, Park gets 2
 		space := " "
@@ -479,15 +458,15 @@ func runDeaconStatusLine(t *tmux.Tmux) error {
 // Note: Polecats excluded - their sessions are ephemeral and idle detection is a GC concern
 func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 	if rigName == "" {
-		// Try to extract from session name: gt-<rig>-witness
-		if strings.HasSuffix(statusLineSession, "-witness") && strings.HasPrefix(statusLineSession, "gt-") {
-			rigName = strings.TrimPrefix(strings.TrimSuffix(statusLineSession, "-witness"), "gt-")
+		// Try to extract from session name: <prefix>-witness
+		if identity, err := session.ParseSessionName(statusLineSession); err == nil && identity.Role == session.RoleWitness {
+			rigName = identity.Rig
 		}
 	}
 
 	// Get town root from witness pane's working directory
 	var townRoot string
-	sessionName := fmt.Sprintf("gt-%s-witness", rigName)
+	sessionName := session.WitnessSessionName(session.PrefixFor(rigName))
 	paneDir, err := t.GetPaneWorkDir(sessionName)
 	if err == nil && paneDir != "" {
 		townRoot, _ = workspace.Find(paneDir)
@@ -546,10 +525,9 @@ func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 // Shows: MQ length, current item, hook or mail preview
 func runRefineryStatusLine(t *tmux.Tmux, rigName string) error {
 	if rigName == "" {
-		// Try to extract from session name: gt-<rig>-refinery
-		if strings.HasPrefix(statusLineSession, "gt-") && strings.HasSuffix(statusLineSession, "-refinery") {
-			rigName = strings.TrimPrefix(statusLineSession, "gt-")
-			rigName = strings.TrimSuffix(rigName, "-refinery")
+		// Try to extract from session name: <prefix>-refinery
+		if identity, err := session.ParseSessionName(statusLineSession); err == nil && identity.Role == session.RoleRefinery {
+			rigName = identity.Rig
 		}
 	}
 
@@ -560,7 +538,7 @@ func runRefineryStatusLine(t *tmux.Tmux, rigName string) error {
 
 	// Get town root from refinery pane's working directory
 	var townRoot string
-	sessionName := fmt.Sprintf("gt-%s-refinery", rigName)
+	sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 	paneDir, err := t.GetPaneWorkDir(sessionName)
 	if err == nil && paneDir != "" {
 		townRoot, _ = workspace.Find(paneDir)
@@ -689,7 +667,7 @@ func getHookedWork(identity string, maxLen int, beadsDir string) string {
 		}
 	}
 
-	b := beads.New(beadsDir)
+	b := beads.New(beadsDir).OnMain()
 
 	// Query for hooked beads assigned to this agent
 	hookedBeads, err := b.List(beads.ListOptions{

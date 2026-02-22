@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -47,20 +48,27 @@ The --collect (-c) flag gathers current state (hooked work, inbox, ready beads,
 in-progress items) and includes it in the handoff mail. This provides context
 for the next session without manual summarization.
 
+The --cycle flag triggers automatic session cycling (used by PreCompact hooks).
+Unlike --auto (state only) or normal handoff (polecat→gt-done redirect), --cycle
+always does a full respawn regardless of role. This enables crew workers and
+polecats to get a fresh context window when the current one fills up.
+
 Any molecule on the hook will be auto-continued by the new session.
 The SessionStart hook runs 'gt prime' to restore context.`,
 	RunE: runHandoff,
 }
 
 var (
-	handoffWatch   bool
-	handoffDryRun  bool
-	handoffSubject string
-	handoffMessage string
-	handoffCollect bool
-	handoffStdin   bool
-	handoffAuto    bool
-	handoffReason  string
+	handoffWatch      bool
+	handoffDryRun     bool
+	handoffSubject    string
+	handoffMessage    string
+	handoffCollect    bool
+	handoffStdin      bool
+	handoffAuto       bool
+	handoffCycle      bool
+	handoffReason     string
+	handoffNoGitCheck bool
 )
 
 func init() {
@@ -71,7 +79,9 @@ func init() {
 	handoffCmd.Flags().BoolVarP(&handoffCollect, "collect", "c", false, "Auto-collect state (status, inbox, beads) into handoff message")
 	handoffCmd.Flags().BoolVar(&handoffStdin, "stdin", false, "Read message body from stdin (avoids shell quoting issues)")
 	handoffCmd.Flags().BoolVar(&handoffAuto, "auto", false, "Save state only, no session cycling (for PreCompact hooks)")
+	handoffCmd.Flags().BoolVar(&handoffCycle, "cycle", false, "Auto-cycle session (for PreCompact hooks that want full session replacement)")
 	handoffCmd.Flags().StringVar(&handoffReason, "reason", "", "Reason for handoff (e.g., 'compaction', 'idle')")
+	handoffCmd.Flags().BoolVar(&handoffNoGitCheck, "no-git-check", false, "Skip git workspace cleanliness check")
 	rootCmd.AddCommand(handoffCmd)
 }
 
@@ -90,18 +100,51 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 
 	// --auto mode: save state only, no session cycling.
 	// Used by PreCompact hook to preserve state before compaction.
+	// Note: auto-mode exits here, before the git-status warning check below.
+	// This is intentional — auto-handoffs are triggered by hooks and should not
+	// spam warnings. The --no-git-check flag has no effect in auto mode.
 	if handoffAuto {
 		return runHandoffAuto()
 	}
 
-	// Check if we're a polecat - polecats use gt done instead
-	// GT_POLECAT is set by the session manager when starting polecat sessions
-	if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" {
+	// --cycle mode: full session cycling, triggered by PreCompact hook.
+	// Unlike --auto (state only), this replaces the current session with a fresh one.
+	// Unlike normal handoff, this skips the polecat→gt-done redirect because
+	// cycling preserves work state (the hook stays attached).
+	//
+	// Flow: collect state → send handoff mail → respawn pane (fresh Claude instance)
+	// The successor session picks up hooked work via SessionStart hook (gt prime --hook).
+	if handoffCycle {
+		return runHandoffCycle()
+	}
+
+	// Check if we're a polecat - polecats use gt done instead.
+	// Check GT_ROLE first: coordinators (mayor, witness, etc.) may have a stale
+	// GT_POLECAT in their environment from spawning polecats. Only block if the
+	// parsed role is actually polecat (handles compound forms like
+	// "gastown/polecats/Toast"). If GT_ROLE is unset, fall back to GT_POLECAT.
+	isPolecat := false
+	polecatName := ""
+	if role := os.Getenv("GT_ROLE"); role != "" {
+		parsedRole, _, name := parseRoleString(role)
+		if parsedRole == RolePolecat {
+			isPolecat = true
+			polecatName = name
+			// Bare "polecat" role yields empty name; fall back to GT_POLECAT.
+			if polecatName == "" {
+				polecatName = os.Getenv("GT_POLECAT")
+			}
+		}
+	} else if name := os.Getenv("GT_POLECAT"); name != "" {
+		isPolecat = true
+		polecatName = name
+	}
+	if isPolecat {
 		fmt.Printf("%s Polecat detected (%s) - using gt done for handoff\n",
 			style.Bold.Render("🐾"), polecatName)
 		// Polecats don't respawn themselves - Witness handles lifecycle
-		// Call gt done with DEFERRED exit type to preserve work state
-		doneCmd := exec.Command("gt", "done", "--exit", "DEFERRED")
+		// Call gt done with DEFERRED status to preserve work state
+		doneCmd := exec.Command("gt", "done", "--status", "DEFERRED")
 		doneCmd.Stdout = os.Stdout
 		doneCmd.Stderr = os.Stderr
 		return doneCmd.Run()
@@ -138,6 +181,15 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting session name: %w", err)
 	}
 
+	// Warn if workspace has uncommitted or unpushed work (wa-7967c).
+	// Note: this checks the caller's cwd, not the target session's workdir.
+	// For remote handoff (gt handoff <role>), the warning reflects the caller's
+	// workspace state. Checking the target session's workdir would require tmux
+	// pane introspection and is deferred to a future enhancement.
+	if !handoffNoGitCheck {
+		warnHandoffGitStatus()
+	}
+
 	// Determine target session and check for bead hook
 	targetSession := currentSession
 	if len(args) > 0 {
@@ -170,6 +222,8 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 
 	// If handing off a different session, we need to find its pane and respawn there
 	if targetSession != currentSession {
+		// Update tmux session env before respawn (not during dry-run — see below)
+		updateSessionEnvForHandoff(t, targetSession, "")
 		return handoffRemoteSession(t, targetSession, restartCmd)
 	}
 
@@ -196,6 +250,13 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Would execute: tmux respawn-pane -k -t %s %s\n", pane, restartCmd)
 		return nil
 	}
+
+	// Update tmux session environment for liveness detection.
+	// IsAgentAlive reads GT_PROCESS_NAMES via tmux show-environment (session env),
+	// not from shell exports. The restart command sets shell exports for the child
+	// process, but we must also update the session env so liveness checks work.
+	// Placed after the dry-run guard to avoid mutating session state during dry-run.
+	updateSessionEnvForHandoff(t, currentSession, "")
 
 	// Send handoff mail to self (defaults applied inside sendHandoffMail).
 	// The mail is auto-hooked so the next session picks it up.
@@ -262,8 +323,7 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 
 // runHandoffAuto saves state without cycling the session.
 // Used by the PreCompact hook to preserve context before compaction.
-// No tmux required — commits uncommitted work, pushes, records bead comment,
-// sends handoff mail, and writes marker.
+// No tmux required — just collects state, sends handoff mail, and writes marker.
 func runHandoffAuto() error {
 	// Build subject
 	subject := handoffSubject
@@ -282,25 +342,12 @@ func runHandoffAuto() error {
 	}
 
 	if handoffDryRun {
-		fmt.Printf("[auto-handoff] Would commit uncommitted work\n")
-		fmt.Printf("[auto-handoff] Would push to remote\n")
 		fmt.Printf("[auto-handoff] Would send mail: subject=%q\n", subject)
 		fmt.Printf("[auto-handoff] Would write handoff marker\n")
 		return nil
 	}
 
-	// Step 1: Commit any uncommitted work
-	commitSHA := autoCommitWork(subject)
-
-	// Step 2: Push to remote (if we're in a git repo with a remote)
-	if commitSHA != "" {
-		autoPushToRemote()
-	}
-
-	// Step 3: Record session summary as bead comment on hooked work
-	autoRecordBeadComment(message, commitSHA)
-
-	// Step 4: Send handoff mail to self
+	// Send handoff mail to self
 	beadID, err := sendHandoffMail(subject, message)
 	if err != nil {
 		// Non-fatal — log and continue
@@ -309,7 +356,7 @@ func runHandoffAuto() error {
 		fmt.Fprintf(os.Stderr, "auto-handoff: saved state to %s\n", beadID)
 	}
 
-	// Step 5: Write handoff marker so post-compact prime knows it's post-handoff
+	// Write handoff marker so post-compact prime knows it's post-handoff
 	if cwd, err := os.Getwd(); err == nil {
 		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
 		_ = os.MkdirAll(runtimeDir, 0755)
@@ -323,7 +370,7 @@ func runHandoffAuto() error {
 		_ = os.WriteFile(markerPath, []byte(sessionName), 0644)
 	}
 
-	// Step 6: Log handoff event
+	// Log handoff event
 	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
 		agent := detectSender()
 		if agent == "" || agent == "overseer" {
@@ -335,122 +382,132 @@ func runHandoffAuto() error {
 	return nil
 }
 
-// autoCommitWork commits any uncommitted changes with a [handoff] prefix.
-// Returns the commit SHA if a commit was made, empty string otherwise.
-func autoCommitWork(context string) string {
-	// Check if we're in a git repo
-	if err := exec.Command("git", "rev-parse", "--git-dir").Run(); err != nil {
-		return "" // Not in a git repo
-	}
-
-	// Check for uncommitted changes (staged + unstaged + untracked)
-	out, err := exec.Command("git", "status", "--porcelain").Output()
-	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
-		return "" // No changes
-	}
-
-	// Stage all changes
-	if err := exec.Command("git", "add", "-A").Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "auto-handoff: git add failed: %v\n", err)
-		return ""
-	}
-
-	// Build commit message
-	commitMsg := fmt.Sprintf("[handoff] %s", context)
-
-	// Commit
-	cmd := exec.Command("git", "commit", "-m", commitMsg, "--no-verify")
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "auto-handoff: git commit failed: %v\n", err)
-		return ""
-	}
-
-	// Get the commit SHA
-	shaOut, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
-	if err != nil {
-		return ""
-	}
-	sha := strings.TrimSpace(string(shaOut))
-	fmt.Fprintf(os.Stderr, "auto-handoff: committed work (%s)\n", sha)
-	return sha
-}
-
-// autoPushToRemote pushes the current branch to its tracking remote.
-func autoPushToRemote() {
-	// Check if there's a remote configured
-	out, err := exec.Command("git", "remote").Output()
-	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
-		return // No remote
-	}
-
-	// Push current branch
-	cmd := exec.Command("git", "push")
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "auto-handoff: git push failed: %v\n", err)
-		return
-	}
-	fmt.Fprintf(os.Stderr, "auto-handoff: pushed to remote\n")
-}
-
-// autoRecordBeadComment records a session summary as a comment on hooked work.
-func autoRecordBeadComment(summary, commitSHA string) {
-	// Get the hooked bead ID from gt hook
-	out, err := exec.Command("gt", "hook", "--json").Output()
-	if err != nil {
-		return // No hook or gt hook failed
-	}
-
-	hookStr := strings.TrimSpace(string(out))
-	if hookStr == "" || hookStr == "null" || hookStr == "{}" {
-		return
-	}
-
-	// Extract bead ID — gt hook --json returns {"bead":"<id>",...}
-	// Simple extraction: find "bead":"<value>"
-	beadID := extractJSONField(hookStr, "bead")
-	if beadID == "" {
-		return
-	}
-
-	// Build comment
-	comment := "auto-handoff state snapshot"
-	if commitSHA != "" {
-		comment = fmt.Sprintf("auto-handoff (commit %s)", commitSHA)
-	}
-	if summary != "" {
-		// Truncate summary for comment (keep first 500 chars)
-		s := summary
-		if len(s) > 500 {
-			s = s[:500] + "..."
+// runHandoffCycle performs a full session cycle — save state AND respawn.
+// This is the PreCompact-triggered session succession mechanism (gt-op78).
+//
+// Unlike --auto (state only) or normal handoff (polecat→gt-done redirect),
+// --cycle always does a full respawn regardless of role. This enables
+// crew workers (and polecats) to get a fresh context window when the
+// current one fills up.
+//
+// The flow:
+//  1. Auto-collect state (inbox, ready beads, hooked work)
+//  2. Send handoff mail to self (auto-hooked for successor)
+//  3. Write handoff marker (prevents handoff loop)
+//  4. Respawn the tmux pane with a fresh Claude instance
+//
+// The successor session starts via SessionStart hook (gt prime --hook),
+// finds the hooked work, and continues from where we left off.
+func runHandoffCycle() error {
+	// Build subject
+	subject := handoffSubject
+	if subject == "" {
+		reason := handoffReason
+		if reason == "" {
+			reason = "context-cycle"
 		}
-		comment = comment + "\n\n" + s
+		subject = fmt.Sprintf("🤝 HANDOFF: %s", reason)
 	}
 
-	cmd := exec.Command("bd", "comment", beadID, "-m", comment)
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "auto-handoff: could not add bead comment: %v\n", err)
+	// Auto-collect state if no explicit message
+	message := handoffMessage
+	if message == "" {
+		message = collectHandoffState()
 	}
-}
 
-// extractJSONField extracts a string value for a key from a JSON string.
-// Simple extraction without importing encoding/json for minimal overhead.
-func extractJSONField(jsonStr, key string) string {
-	pattern := fmt.Sprintf(`"%s":"`, key)
-	idx := strings.Index(jsonStr, pattern)
-	if idx == -1 {
-		// Try with space after colon
-		pattern = fmt.Sprintf(`"%s": "`, key)
-		idx = strings.Index(jsonStr, pattern)
-		if idx == -1 {
-			return ""
+	// Must be in tmux to respawn
+	if !tmux.IsInsideTmux() {
+		// Fall back to auto mode (save state only) if not in tmux
+		fmt.Fprintf(os.Stderr, "handoff --cycle: not in tmux, falling back to state-save only\n")
+		handoffMessage = message
+		handoffSubject = subject
+		return runHandoffAuto()
+	}
+
+	pane := os.Getenv("TMUX_PANE")
+	if pane == "" {
+		fmt.Fprintf(os.Stderr, "handoff --cycle: TMUX_PANE not set, falling back to state-save only\n")
+		handoffMessage = message
+		handoffSubject = subject
+		return runHandoffAuto()
+	}
+
+	currentSession, err := getCurrentTmuxSession()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "handoff --cycle: could not get session: %v, falling back to state-save only\n", err)
+		handoffMessage = message
+		handoffSubject = subject
+		return runHandoffAuto()
+	}
+
+	t := tmux.NewTmux()
+
+	if handoffDryRun {
+		fmt.Printf("[cycle] Would send handoff mail: subject=%q\n", subject)
+		fmt.Printf("[cycle] Would write handoff marker\n")
+		fmt.Printf("[cycle] Would execute: tmux clear-history -t %s\n", pane)
+		fmt.Printf("[cycle] Would execute: tmux respawn-pane -k -t %s <restart-cmd>\n", pane)
+		return nil
+	}
+
+	// Send handoff mail to self (auto-hooked for successor)
+	beadID, err := sendHandoffMail(subject, message)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "handoff --cycle: could not send mail: %v\n", err)
+		// Continue — respawn is more important than mail
+	} else {
+		fmt.Fprintf(os.Stderr, "handoff --cycle: saved state to %s\n", beadID)
+	}
+
+	// Write handoff marker so post-cycle prime knows it's post-handoff
+	if cwd, err := os.Getwd(); err == nil {
+		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+		_ = os.MkdirAll(runtimeDir, 0755)
+		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+		_ = os.WriteFile(markerPath, []byte(currentSession), 0644)
+	}
+
+	// Log cycle event
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		agent := sessionToGTRole(currentSession)
+		if agent == "" {
+			agent = currentSession
+		}
+		_ = LogHandoff(townRoot, agent, subject)
+		_ = events.LogFeed(events.TypeHandoff, agent, events.HandoffPayload(subject, true))
+	}
+
+	// Build restart command for fresh session
+	restartCmd, err := buildRestartCommand(currentSession)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "handoff --cycle: could not build restart command: %v\n", err)
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "handoff --cycle: cycling session %s\n", currentSession)
+
+	// Set remain-on-exit so the pane survives process death during handoff
+	if err := t.SetRemainOnExit(pane, true); err != nil {
+		style.PrintWarning("could not set remain-on-exit: %v", err)
+	}
+
+	// Clear scrollback history before respawn
+	if err := t.ClearHistory(pane); err != nil {
+		style.PrintWarning("could not clear history: %v", err)
+	}
+
+	// Check if pane's working directory exists (may have been deleted)
+	paneWorkDir, _ := t.GetPaneWorkDir(currentSession)
+	if paneWorkDir != "" {
+		if _, err := os.Stat(paneWorkDir); err != nil {
+			if townRoot := detectTownRootFromCwd(); townRoot != "" {
+				return t.RespawnPaneWithWorkDir(pane, townRoot, restartCmd)
+			}
 		}
 	}
-	start := idx + len(pattern)
-	end := strings.Index(jsonStr[start:], `"`)
-	if end == -1 {
-		return ""
-	}
-	return jsonStr[start : start+end]
+
+	// Respawn pane — this atomically kills current process and starts fresh
+	return t.RespawnPane(pane, restartCmd)
 }
 
 // getCurrentTmuxSession returns the current tmux session name.
@@ -497,21 +554,21 @@ func resolveRoleToSession(role string) (string, error) {
 		if rig == "" || crewName == "" {
 			return "", fmt.Errorf("cannot determine crew identity - run from crew directory or specify GT_RIG/GT_CREW")
 		}
-		return fmt.Sprintf("gt-%s-crew-%s", rig, crewName), nil
+		return session.CrewSessionName(session.PrefixFor(rig), crewName), nil
 
 	case "witness", "wit":
 		rig := os.Getenv("GT_RIG")
 		if rig == "" {
 			return "", fmt.Errorf("cannot determine rig - set GT_RIG or run from rig context")
 		}
-		return fmt.Sprintf("gt-%s-witness", rig), nil
+		return session.WitnessSessionName(session.PrefixFor(rig)), nil
 
 	case "refinery", "ref":
 		rig := os.Getenv("GT_RIG")
 		if rig == "" {
 			return "", fmt.Errorf("cannot determine rig - set GT_RIG or run from rig context")
 		}
-		return fmt.Sprintf("gt-%s-refinery", rig), nil
+		return session.RefinerySessionName(session.PrefixFor(rig)), nil
 
 	default:
 		// Assume it's a direct session name (e.g., gt-gastown-crew-max)
@@ -533,14 +590,14 @@ func resolvePathToSession(path string) (string, error) {
 	if len(parts) == 3 && parts[1] == "crew" {
 		rig := parts[0]
 		name := parts[2]
-		return fmt.Sprintf("gt-%s-crew-%s", rig, name), nil
+		return session.CrewSessionName(session.PrefixFor(rig), name), nil
 	}
 
 	// Handle <rig>/polecats/<name> format (explicit polecat path)
 	if len(parts) == 3 && parts[1] == "polecats" {
 		rig := parts[0]
 		name := strings.ToLower(parts[2]) // normalize polecat name
-		return fmt.Sprintf("gt-%s-%s", rig, name), nil
+		return session.PolecatSessionName(session.PrefixFor(rig), name), nil
 	}
 
 	// Handle <rig>/<role-or-polecat> format
@@ -552,9 +609,9 @@ func resolvePathToSession(path string) (string, error) {
 		// Check for known roles first
 		switch secondLower {
 		case "witness":
-			return fmt.Sprintf("gt-%s-witness", rig), nil
+			return session.WitnessSessionName(session.PrefixFor(rig)), nil
 		case "refinery":
-			return fmt.Sprintf("gt-%s-refinery", rig), nil
+			return session.RefinerySessionName(session.PrefixFor(rig)), nil
 		case "crew":
 			// Just "<rig>/crew" without a name - need more info
 			return "", fmt.Errorf("crew path requires name: %s/crew/<name>", rig)
@@ -569,11 +626,11 @@ func resolvePathToSession(path string) (string, error) {
 			if townRoot != "" {
 				crewPath := filepath.Join(townRoot, rig, "crew", second)
 				if info, err := os.Stat(crewPath); err == nil && info.IsDir() {
-					return fmt.Sprintf("gt-%s-crew-%s", rig, second), nil
+					return session.CrewSessionName(session.PrefixFor(rig), second), nil
 				}
 			}
 			// Not a crew member - treat as polecat name (e.g., gastown/nux)
-			return fmt.Sprintf("gt-%s-%s", rig, secondLower), nil
+			return session.PolecatSessionName(session.PrefixFor(rig), secondLower), nil
 		}
 	}
 
@@ -589,6 +646,26 @@ var claudeEnvVars = []string{
 	// AWS vars for Bedrock
 	"AWS_PROFILE",
 	"AWS_REGION",
+	// OTEL telemetry — propagate so Claude keeps sending metrics after handoff
+	// (tmux respawn-pane starts a fresh shell that doesn't inherit these)
+	"CLAUDE_CODE_ENABLE_TELEMETRY",
+	"OTEL_METRICS_EXPORTER",
+	"OTEL_METRIC_EXPORT_INTERVAL",
+	"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+	"OTEL_LOGS_EXPORTER",
+	"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+	"OTEL_LOG_TOOL_DETAILS",
+	"OTEL_LOG_TOOL_CONTENT",
+	"OTEL_LOG_USER_PROMPTS",
+	"OTEL_RESOURCE_ATTRIBUTES",
+	// bd telemetry — so `bd` calls inside Claude emit to VictoriaMetrics/Logs
+	"BD_OTEL_METRICS_URL",
+	"BD_OTEL_LOGS_URL",
+	// GT telemetry source vars — needed to recompute derived vars after handoff
+	"GT_OTEL_METRICS_URL",
+	"GT_OTEL_LOGS_URL",
 }
 
 // buildRestartCommand creates the command to run when respawning a session's pane.
@@ -624,7 +701,7 @@ func buildRestartCommand(sessionName string) (string, error) {
 	// Use FormatStartupBeacon instead of bare "gt prime" which confuses agents
 	// The SessionStart hook handles context injection (gt prime --hook)
 	beacon := session.FormatStartupBeacon(session.BeaconConfig{
-		Recipient: identity.Address(),
+		Recipient: identity.BeaconAddress(),
 		Sender:    "self",
 		Topic:     "handoff",
 	})
@@ -695,6 +772,19 @@ func buildRestartCommand(sessionName string) (string, error) {
 		exports = append(exports, "GT_AGENT="+currentAgent)
 	}
 
+	// Preserve GT_PROCESS_NAMES across handoff for accurate liveness detection.
+	// Without this, custom agents that shadow built-in presets (e.g., custom
+	// "codex" running "opencode") would revert to GT_AGENT-based lookup after
+	// handoff, causing false liveness failures.
+	if processNames := os.Getenv("GT_PROCESS_NAMES"); processNames != "" {
+		// Preserve existing process names from environment
+		exports = append(exports, "GT_PROCESS_NAMES="+processNames)
+	} else if currentAgent != "" {
+		// First boot or missing GT_PROCESS_NAMES — compute from agent config
+		resolved := config.ResolveProcessNames(currentAgent, "")
+		exports = append(exports, "GT_PROCESS_NAMES="+strings.Join(resolved, ","))
+	}
+
 	// Add Claude-related env vars from current environment
 	for _, name := range claudeEnvVars {
 		if val := os.Getenv(name); val != "" {
@@ -722,6 +812,64 @@ func buildRestartCommand(sessionName string) (string, error) {
 	return fmt.Sprintf("cd %s && exec %s", workDir, runtimeCmd), nil
 }
 
+// updateSessionEnvForHandoff updates the tmux session environment with the
+// agent name and process names for liveness detection. IsAgentAlive reads
+// GT_PROCESS_NAMES from the tmux session env (via tmux show-environment), not
+// from shell exports in the pane. Without this, post-handoff liveness checks
+// would use stale values from the previous agent.
+func updateSessionEnvForHandoff(t *tmux.Tmux, sessionName, agentOverride string) {
+	// Resolve current agent using the same priority as buildRestartCommandWithAgent
+	var currentAgent string
+	if agentOverride != "" {
+		currentAgent = agentOverride
+	} else {
+		currentAgent = os.Getenv("GT_AGENT")
+		if currentAgent == "" {
+			if val, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && val != "" {
+				currentAgent = val
+			}
+		}
+	}
+
+	if currentAgent == "" {
+		return
+	}
+
+	// Update GT_AGENT in session env
+	_ = t.SetEnvironment(sessionName, "GT_AGENT", currentAgent)
+
+	// Resolve and update GT_PROCESS_NAMES in session env
+	// When switching agents, recompute from config. When preserving, use env value.
+	var processNames string
+	if agentOverride != "" {
+		// Agent is changing — resolve config to get the command for process name resolution
+		townRoot := detectTownRootFromCwd()
+		if townRoot != "" {
+			identity, err := session.ParseSessionName(sessionName)
+			rigPath := ""
+			if err == nil && identity.Rig != "" {
+				rigPath = filepath.Join(townRoot, identity.Rig)
+			}
+			rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, rigPath, currentAgent)
+			if err == nil {
+				resolved := config.ResolveProcessNames(currentAgent, rc.Command)
+				processNames = strings.Join(resolved, ",")
+			}
+		}
+	}
+	if processNames == "" {
+		// Preserve existing value or compute from current agent
+		if pn := os.Getenv("GT_PROCESS_NAMES"); pn != "" {
+			processNames = pn
+		} else {
+			resolved := config.ResolveProcessNames(currentAgent, "")
+			processNames = strings.Join(resolved, ",")
+		}
+	}
+
+	_ = t.SetEnvironment(sessionName, "GT_PROCESS_NAMES", processNames)
+}
+
 // sessionWorkDir returns the correct working directory for a session.
 // This is the canonical home for each role type.
 func sessionWorkDir(sessionName, townRoot string) (string, error) {
@@ -740,36 +888,28 @@ func sessionWorkDir(sessionName, townRoot string) (string, error) {
 
 	case strings.Contains(sessionName, "-crew-"):
 		// gt-<rig>-crew-<name> -> <townRoot>/<rig>/crew/<name>
-		rig, name, ok := parseCrewSessionName(sessionName)
+		rig, name, _, ok := parseCrewSessionName(sessionName)
 		if !ok {
 			return "", fmt.Errorf("cannot parse crew session name: %s", sessionName)
 		}
 		return fmt.Sprintf("%s/%s/crew/%s", townRoot, rig, name), nil
 
-	case strings.HasSuffix(sessionName, "-witness"):
-		// gt-<rig>-witness -> <townRoot>/<rig>/witness
-		// Note: witness doesn't have a /rig worktree like refinery does
-		rig := strings.TrimPrefix(sessionName, "gt-")
-		rig = strings.TrimSuffix(rig, "-witness")
-		return fmt.Sprintf("%s/%s/witness", townRoot, rig), nil
-
-	case strings.HasSuffix(sessionName, "-refinery"):
-		// gt-<rig>-refinery -> <townRoot>/<rig>/refinery/rig
-		rig := strings.TrimPrefix(sessionName, "gt-")
-		rig = strings.TrimSuffix(rig, "-refinery")
-		return fmt.Sprintf("%s/%s/refinery/rig", townRoot, rig), nil
-
 	default:
-		// Assume polecat: gt-<rig>-<name> -> <townRoot>/<rig>/polecats/<name>
-		// Use session.ParseSessionName to determine rig and name
+		// Parse session name to determine role and resolve paths
 		identity, err := session.ParseSessionName(sessionName)
 		if err != nil {
 			return "", fmt.Errorf("unknown session type: %s (%w)", sessionName, err)
 		}
-		if identity.Role != session.RolePolecat {
+		switch identity.Role {
+		case session.RoleWitness:
+			return fmt.Sprintf("%s/%s/witness", townRoot, identity.Rig), nil
+		case session.RoleRefinery:
+			return fmt.Sprintf("%s/%s/refinery/rig", townRoot, identity.Rig), nil
+		case session.RolePolecat:
+			return fmt.Sprintf("%s/%s/polecats/%s", townRoot, identity.Rig, identity.Name), nil
+		default:
 			return "", fmt.Errorf("unknown session type: %s (role %s, try specifying role explicitly)", sessionName, identity.Role)
 		}
-		return fmt.Sprintf("%s/%s/polecats/%s", townRoot, identity.Rig, identity.Name), nil
 	}
 }
 
@@ -883,7 +1023,7 @@ func handoffRemoteSession(t *tmux.Tmux, targetSession, restartCmd string) error 
 	if handoffWatch {
 		fmt.Printf("Switching to %s...\n", targetSession)
 		// Use tmux switch-client to move our view to the target session
-		if err := exec.Command("tmux", "switch-client", "-t", targetSession).Run(); err != nil {
+		if err := exec.Command("tmux", "-u", "switch-client", "-t", targetSession).Run(); err != nil {
 			// Non-fatal - they can manually switch
 			fmt.Printf("Note: Could not auto-switch (use: tmux switch-client -t %s)\n", targetSession)
 		}
@@ -955,9 +1095,11 @@ func sendHandoffMail(subject, message string) (string, error) {
 		"--", subject,
 	}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Dir = townRoot // Run from town root for town-level beads
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
+	cmd := BdCmd(args...).
+		WithAutoCommit().
+		Dir(townRoot).
+		Build()
+	cmd.Env = append(cmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -977,9 +1119,11 @@ func sendHandoffMail(subject, message string) (string, error) {
 	}
 
 	// Auto-hook the created mail bead
-	hookCmd := exec.Command("bd", "update", beadID, "--status=hooked", "--assignee="+agentID)
-	hookCmd.Dir = townRoot
-	hookCmd.Env = append(os.Environ(), "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
+	hookCmd := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
+		WithAutoCommit().
+		Dir(townRoot).
+		Build()
+	hookCmd.Env = append(hookCmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
 	hookCmd.Stderr = os.Stderr
 
 	if err := hookCmd.Run(); err != nil {
@@ -989,6 +1133,35 @@ func sendHandoffMail(subject, message string) (string, error) {
 	}
 
 	return beadID, nil
+}
+
+// warnHandoffGitStatus checks the current workspace for uncommitted or unpushed
+// work and prints a warning if found. Non-blocking — handoff continues regardless.
+// Skips .beads/ changes since those are managed by Dolt and not a concern.
+func warnHandoffGitStatus() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	g := git.NewGit(cwd)
+	if !g.IsRepo() {
+		return
+	}
+	status, err := g.CheckUncommittedWork()
+	if err != nil || status.CleanExcludingBeads() {
+		return
+	}
+	style.PrintWarning("workspace has uncommitted work: %s", status.String())
+	if len(status.ModifiedFiles) > 0 {
+		style.PrintWarning("  modified: %s", strings.Join(status.ModifiedFiles, ", "))
+	}
+	if len(status.UntrackedFiles) > 0 {
+		style.PrintWarning("  untracked: %s", strings.Join(status.UntrackedFiles, ", "))
+	}
+	if status.UnpushedCommits > 0 {
+		style.PrintWarning("  %d unpushed commit(s) — run 'git push' before handoff", status.UnpushedCommits)
+	}
+	fmt.Println("  (use --no-git-check to suppress this warning)")
 }
 
 // looksLikeBeadID checks if a string looks like a bead ID.

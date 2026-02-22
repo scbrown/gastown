@@ -47,7 +47,7 @@ type TownSettings struct {
 	CLITheme string `json:"cli_theme,omitempty"`
 
 	// DefaultAgent is the name of the agent preset to use by default.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent name defined in settings/agents.json.
 	// Default: "claude"
 	DefaultAgent string `json:"default_agent,omitempty"`
@@ -81,6 +81,11 @@ type TownSettings struct {
 
 	// Convoy configures convoy behavior settings.
 	Convoy *ConvoyConfig `json:"convoy,omitempty"`
+
+	// CostTier tracks which cost tier preset was applied (informational).
+	// Actual model assignments live in RoleAgents and Agents.
+	// Values: "standard", "economy", "budget", or empty for custom configs.
+	CostTier string `json:"cost_tier,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.
@@ -273,6 +278,7 @@ type RigsConfig struct {
 // RigEntry represents a single rig in the registry.
 type RigEntry struct {
 	GitURL      string       `json:"git_url"`
+	PushURL     string       `json:"push_url,omitempty"`
 	LocalRepo   string       `json:"local_repo,omitempty"`
 	AddedAt     time.Time    `json:"added_at"`
 	BeadsConfig *BeadsConfig `json:"beads,omitempty"`
@@ -304,6 +310,7 @@ type RigConfig struct {
 	Version   int          `json:"version"` // schema version
 	Name      string       `json:"name"`    // rig name
 	GitURL    string       `json:"git_url"` // git repository URL
+	PushURL   string       `json:"push_url,omitempty"` // optional push URL (fork for read-only upstreams)
 	LocalRepo string       `json:"local_repo,omitempty"`
 	CreatedAt time.Time    `json:"created_at"` // when the rig was created
 	Beads     *BeadsConfig `json:"beads,omitempty"`
@@ -328,7 +335,7 @@ type RigSettings struct {
 	Runtime    *RuntimeConfig    `json:"runtime,omitempty"`     // LLM runtime settings (deprecated: use Agent)
 
 	// Agent selects which agent preset to use for this rig.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent defined in settings/agents.json.
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
@@ -404,6 +411,12 @@ type RuntimeConfig struct {
 
 	// Instructions controls the per-workspace instruction file name.
 	Instructions *RuntimeInstructionsConfig `json:"instructions,omitempty"`
+
+	// ResolvedAgent is the agent name that was resolved during config lookup.
+	// Set by ResolveRoleAgentConfig / resolveAgentConfigInternal so that
+	// BuildStartupCommand can export GT_AGENT for process detection.
+	// Not serialized — this is a runtime-only field.
+	ResolvedAgent string `json:"-"`
 }
 
 // RuntimeSessionConfig configures how Gas Town discovers runtime session IDs.
@@ -419,7 +432,7 @@ type RuntimeSessionConfig struct {
 
 // RuntimeHooksConfig configures runtime hook installation.
 type RuntimeHooksConfig struct {
-	// Provider controls which hook templates to install: "claude", "opencode", or "none".
+	// Provider controls which hook templates to install: "claude", "opencode", "copilot", or "none".
 	Provider string `json:"provider,omitempty"`
 
 	// Dir is the settings directory (e.g., ".claude").
@@ -427,6 +440,12 @@ type RuntimeHooksConfig struct {
 
 	// SettingsFile is the settings file name (e.g., "settings.json").
 	SettingsFile string `json:"settings_file,omitempty"`
+
+	// Informational indicates the hooks provider installs instructions files only,
+	// not executable lifecycle hooks. When true, Gas Town sends startup fallback
+	// commands (gt prime) via nudge since hooks won't run automatically.
+	// Defaults to false (backwards compatible with claude/opencode which have real hooks).
+	Informational bool `json:"informational,omitempty"`
 }
 
 // RuntimeTmuxConfig controls tmux heuristics for detecting runtime readiness.
@@ -512,6 +531,7 @@ func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	return args
 }
 
+
 func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 	if rc == nil {
 		rc = &RuntimeConfig{}
@@ -583,6 +603,13 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 		rc.Hooks.SettingsFile = defaultHooksFile(rc.Provider)
 	}
 
+	// Set informational flag for providers whose "hooks" are instructions files,
+	// not executable lifecycle hooks. This tells startup fallback logic to send
+	// gt prime via nudge since hooks won't run automatically.
+	if !rc.Hooks.Informational {
+		rc.Hooks.Informational = defaultHooksInformational(rc.Provider)
+	}
+
 	if rc.Tmux == nil {
 		rc.Tmux = &RuntimeTmuxConfig{}
 	}
@@ -611,16 +638,18 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 }
 
 func defaultRuntimeCommand(provider string) string {
-	switch provider {
-	case "codex":
-		return "codex"
-	case "opencode":
-		return "opencode"
-	case "generic":
+	if provider == "generic" {
 		return ""
-	default:
-		return resolveClaudePath()
 	}
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		cmd := preset.Command
+		// Resolve claude path for Claude preset (handles alias installations)
+		if preset.Name == AgentClaude && cmd == "claude" {
+			return resolveClaudePath()
+		}
+		return cmd
+	}
+	return resolveClaudePath() // fallback for unknown providers
 }
 
 // resolveClaudePath finds the claude binary, checking PATH first then common installation locations.
@@ -649,82 +678,67 @@ func resolveClaudePath() string {
 }
 
 func defaultRuntimeArgs(provider string) []string {
-	switch provider {
-	case "claude":
-		return []string{"--dangerously-skip-permissions"}
-	default:
-		return nil
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.Args != nil {
+		return append([]string(nil), preset.Args...) // copy to avoid mutation
 	}
+	return nil
 }
 
 func defaultPromptMode(provider string) string {
-	switch provider {
-	case "codex":
-		return "none"
-	case "opencode":
-		return "none"
-	default:
-		return "arg"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.PromptMode != "" {
+		return preset.PromptMode
 	}
+	return "arg"
 }
 
 func defaultSessionIDEnv(provider string) string {
-	if provider == "claude" {
-		return "CLAUDE_SESSION_ID"
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.SessionIDEnv
 	}
 	return ""
 }
 
 func defaultConfigDirEnv(provider string) string {
-	if provider == "claude" {
-		return "CLAUDE_CONFIG_DIR"
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ConfigDirEnv
 	}
 	return ""
 }
 
 func defaultHooksProvider(provider string) string {
-	switch provider {
-	case "claude":
-		return "claude"
-	case "opencode":
-		return "opencode"
-	default:
-		return "none"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.HooksProvider != "" {
+		return preset.HooksProvider
 	}
+	return "none"
 }
 
 func defaultHooksDir(provider string) string {
-	switch provider {
-	case "claude":
-		return ".claude"
-	case "opencode":
-		return ".opencode/plugin"
-	default:
-		return ""
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksDir
 	}
+	return ""
 }
 
 func defaultHooksFile(provider string) string {
-	switch provider {
-	case "claude":
-		// Use settings.json installed via --settings flag in a gastown-managed
-		// parent directory, keeping customer repos untouched.
-		return "settings.json"
-	case "opencode":
-		return "gastown.js"
-	default:
-		return ""
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksSettingsFile
 	}
+	return ""
+}
+
+// defaultHooksInformational returns true for providers whose hooks are instructions
+// files only (not executable lifecycle hooks). For these providers, Gas Town sends
+// startup fallback commands (gt prime) via nudge since hooks won't auto-run.
+func defaultHooksInformational(provider string) bool {
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksInformational
+	}
+	return false
 }
 
 func defaultProcessNames(provider, command string) []string {
-	if provider == "claude" {
-		return []string{"node"}
-	}
-	if provider == "opencode" {
-		// OpenCode runs as Node.js process, need both for IsAgentRunning detection.
-		// tmux pane_current_command may show "node" or "opencode" depending on how invoked.
-		return []string{"opencode", "node"}
+	if preset := GetAgentPresetByName(provider); preset != nil && len(preset.ProcessNames) > 0 {
+		return append([]string(nil), preset.ProcessNames...) // copy to avoid mutation
 	}
 	if command != "" {
 		return []string{filepath.Base(command)}
@@ -733,37 +747,24 @@ func defaultProcessNames(provider, command string) []string {
 }
 
 func defaultReadyPromptPrefix(provider string) string {
-	if provider == "claude" {
-		// Claude Code uses ❯ (U+276F) as the prompt character
-		return "❯ "
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ReadyPromptPrefix
 	}
 	return ""
 }
 
 func defaultReadyDelayMs(provider string) int {
-	if provider == "claude" {
-		return 10000
-	}
-	if provider == "codex" {
-		return 3000
-	}
-	if provider == "opencode" {
-		// OpenCode requires delay-based detection because its TUI uses
-		// box-drawing characters (┃) that break prompt prefix matching.
-		// 8000ms provides reliable startup detection across models.
-		return 8000
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ReadyDelayMs
 	}
 	return 0
 }
 
 func defaultInstructionsFile(provider string) string {
-	if provider == "codex" {
-		return "AGENTS.md"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.InstructionsFile != "" {
+		return preset.InstructionsFile
 	}
-	if provider == "opencode" {
-		return "AGENTS.md"
-	}
-	return "CLAUDE.md"
+	return "AGENTS.md"
 }
 
 // quoteForShell quotes a string for safe shell usage.
@@ -1008,6 +1009,38 @@ func DefaultAccountsConfigDir() (string, error) {
 	}
 	return home + "/.claude-accounts", nil
 }
+
+// QuotaState represents the quota management state (mayor/quota.json).
+// Tracks which accounts are rate-limited and when they were last rotated.
+type QuotaState struct {
+	Version  int                         `json:"version"`  // schema version
+	Accounts map[string]AccountQuotaState `json:"accounts"` // handle -> quota state
+}
+
+// AccountQuotaStatus is the rate-limit status of an account.
+type AccountQuotaStatus string
+
+const (
+	// QuotaStatusAvailable means the account is not rate-limited.
+	QuotaStatusAvailable AccountQuotaStatus = "available"
+
+	// QuotaStatusLimited means the account has been detected as rate-limited.
+	QuotaStatusLimited AccountQuotaStatus = "limited"
+
+	// QuotaStatusCooldown means the account was limited and is in cooldown.
+	QuotaStatusCooldown AccountQuotaStatus = "cooldown"
+)
+
+// AccountQuotaState tracks the quota status of a single account.
+type AccountQuotaState struct {
+	Status    AccountQuotaStatus `json:"status"`              // current status
+	LimitedAt string             `json:"limited_at,omitempty"` // RFC3339 when limit was detected
+	ResetsAt  string             `json:"resets_at,omitempty"`  // Human-readable reset time from provider (e.g. "7pm (America/Los_Angeles)")
+	LastUsed  string             `json:"last_used,omitempty"`  // RFC3339 when account was last assigned to a session
+}
+
+// CurrentQuotaVersion is the current schema version for QuotaState.
+const CurrentQuotaVersion = 1
 
 // MessagingConfig represents the messaging configuration (config/messaging.json).
 // This defines mailing lists, work queues, and announcement channels.

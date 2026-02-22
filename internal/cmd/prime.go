@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -49,7 +51,8 @@ var primeCmd = &cobra.Command{
 	Long: `Detect the agent role from the current directory and output context.
 
 Role detection:
-  - Town root, mayor/, or <rig>/mayor/ → Mayor context
+  - Town root → Neutral (no role inferred; use GT_ROLE)
+  - mayor/ or <rig>/mayor/ → Mayor context
   - <rig>/witness/rig/ → Witness context
   - <rig>/refinery/rig/ → Refinery context
   - <rig>/polecats/<name>/ → Polecat context
@@ -88,7 +91,8 @@ func init() {
 // New code should use RoleInfo directly.
 type RoleContext = RoleInfo
 
-func runPrime(cmd *cobra.Command, args []string) error {
+func runPrime(cmd *cobra.Command, args []string) (retErr error) {
+	defer func() { telemetry.RecordPrime(context.Background(), os.Getenv("GT_ROLE"), primeHookMode, retErr) }()
 	if err := validatePrimeFlags(); err != nil {
 		return err
 	}
@@ -141,12 +145,18 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	// The agent already has role docs in compressed memory — just restore
 	// identity, hook status, and any new mail.
 	if isCompactResume() {
-		return runPrimeCompactResume(ctx, cwd)
+		runPrimeCompactResume(ctx, cwd)
+		return nil
 	}
 
-	if err := outputRoleContext(ctx); err != nil {
+	formula, err := outputRoleContext(ctx)
+	if err != nil {
 		return err
 	}
+	// Log the rendered formula to OTEL so it's visible in VictoriaLogs alongside
+	// Claude's API calls, letting operators see exactly what context each agent
+	// started with. Only emitted when GT telemetry is active (GT_OTEL_LOGS_URL set).
+	telemetry.RecordPrimeContext(context.Background(), formula, os.Getenv("GT_ROLE"), primeHookMode)
 
 	hasSlungWork := checkSlungWork(ctx)
 	explain(hasSlungWork, "Autonomous mode: hooked/in-progress work detected")
@@ -170,7 +180,7 @@ func runPrime(cmd *cobra.Command, args []string) error {
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
 // The agent already has full role context in compressed memory. This just
 // restores identity, checks hook/work status, and injects any new mail.
-func runPrimeCompactResume(ctx RoleContext, cwd string) error {
+func runPrimeCompactResume(ctx RoleContext, cwd string) {
 	// Brief identity confirmation
 	actor := getAgentIdentity(ctx)
 	fmt.Printf("\n> **Recovery**: Context %s complete. You are **%s** (%s).\n",
@@ -194,8 +204,6 @@ func runPrimeCompactResume(ctx RoleContext, cwd string) error {
 	if !hasSlungWork {
 		outputStartupDirective(ctx)
 	}
-
-	return nil
 }
 
 // validatePrimeFlags checks that CLI flag combinations are valid.
@@ -299,19 +307,21 @@ func setupPrimeSession(ctx RoleContext, roleInfo RoleInfo) error {
 }
 
 // outputRoleContext emits session metadata and all role/context output sections.
-func outputRoleContext(ctx RoleContext) error {
+// Returns the rendered formula content for OTEL telemetry (empty if using fallback path).
+func outputRoleContext(ctx RoleContext) (string, error) {
 	explain(true, "Session metadata: always included for seance discovery")
 	outputSessionMetadata(ctx)
 
 	explain(true, fmt.Sprintf("Role context: detected role is %s", ctx.Role))
-	if err := outputPrimeContext(ctx); err != nil {
-		return err
+	formula, err := outputPrimeContext(ctx)
+	if err != nil {
+		return "", err
 	}
 
 	outputContextFile(ctx)
 	outputHandoffContent(ctx)
 	outputAttachmentStatus(ctx)
-	return nil
+	return formula, nil
 }
 
 // runPrimeExternalTools runs bd prime and gt mail check --inject.
@@ -331,6 +341,7 @@ func runPrimeExternalTools(cwd string) {
 func runBdPrime(workDir string) {
 	cmd := exec.Command("bd", "prime")
 	cmd.Dir = workDir
+	cmd.Env = beads.StripBdBranch(os.Environ())
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -402,6 +413,8 @@ func checkSlungWork(ctx RoleContext) bool {
 }
 
 // findAgentWork looks up hooked or in-progress beads assigned to this agent.
+// Primary: reads hook_bead from the agent bead (same strategy as detectSessionState/gt hook).
+// Fallback: queries by assignee for agents without an agent bead.
 // Returns nil if no work is found.
 func findAgentWork(ctx RoleContext) *beads.Issue {
 	agentID := getAgentIdentity(ctx)
@@ -409,7 +422,24 @@ func findAgentWork(ctx RoleContext) *beads.Issue {
 		return nil
 	}
 
-	b := beads.New(ctx.WorkDir)
+	b := beads.New(ctx.WorkDir).OnMain()
+
+	// Primary: agent bead's hook_bead field (authoritative, set by bd slot set during sling)
+	agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
+	if agentBeadID != "" {
+		agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
+		ab := beads.New(agentBeadDir).OnMain()
+		if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil && agentBead.HookBead != "" {
+			hookBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBead.HookBead, ctx.WorkDir)
+			hb := beads.New(hookBeadDir).OnMain()
+			if hookBead, err := hb.Show(agentBead.HookBead); err == nil && hookBead != nil &&
+				(hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
+				return hookBead
+			}
+		}
+	}
+
+	// Fallback: query by assignee
 	hookedBeads, err := b.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
@@ -456,7 +486,7 @@ func outputAutonomousDirective(ctx RoleContext, hookedBead *beads.Issue, hasMole
 	if hasMolecule {
 		fmt.Println("2. This bead has an ATTACHED MOLECULE (formula workflow)")
 		fmt.Println("3. Work through molecule steps in order - see CURRENT STEP below")
-		fmt.Println("4. Close each step with `bd close <step-id>`, then check `bd ready`")
+		fmt.Println("4. Close each step with `bd close <step-id>`, then check `bd mol current` for next step")
 	} else {
 		fmt.Printf("2. Then IMMEDIATELY run: `bd show %s`\n", hookedBead.ID)
 		fmt.Println("3. Begin execution - no waiting for user input")
@@ -503,6 +533,12 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 	}
 	fmt.Println()
 
+	// Ralph loop mode: output Ralph Wiggum loop command instead of step-by-step execution
+	if attachment.Mode == "ralph" {
+		outputRalphLoopDirective(ctx, attachment)
+		return
+	}
+
 	showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
 
 	fmt.Println()
@@ -510,10 +546,48 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 	fmt.Println("The base bead is just a container. The molecule steps define your workflow.")
 }
 
+// outputRalphLoopDirective emits the Ralph Wiggum loop command for ralphcat mode.
+// The agent sees this and runs the slash command, activating the Ralph plugin's
+// stop hook loop. Each iteration gets a fresh context window while preserving
+// artifacts on disk via git.
+func outputRalphLoopDirective(_ RoleContext, attachment *beads.AttachmentFields) {
+	fmt.Printf("%s\n\n", style.Bold.Render("## 🐱 RALPH LOOP MODE (RALPHCAT)"))
+	fmt.Println("This work uses Ralph Wiggum loop mode for multi-step execution.")
+	fmt.Println("Each step runs in a fresh context window to avoid context exhaustion.")
+	fmt.Println()
+
+	// Build the ralph prompt from the molecule steps
+	prompt := buildRalphPromptFromMolecule(attachment)
+
+	fmt.Printf("Run this command NOW:\n\n")
+	fmt.Printf("```\n/ralph-loop \"%s\" --max-iterations 20 --completion-phrase \"POLECAT_DONE\"\n```\n\n",
+		strings.ReplaceAll(prompt, "\"", "\\\""))
+
+	fmt.Println("The Ralph loop will:")
+	fmt.Println("1. Execute each step in a fresh context")
+	fmt.Println("2. Preserve work via git commits between steps")
+	fmt.Println("3. Stop when POLECAT_DONE is output or max iterations reached")
+	fmt.Println()
+	fmt.Printf("%s\n", style.Bold.Render("⚠️  Run the /ralph-loop command above. Do NOT work step-by-step manually."))
+}
+
+// buildRalphPromptFromMolecule constructs the Ralph loop prompt text from molecule steps.
+func buildRalphPromptFromMolecule(attachment *beads.AttachmentFields) string {
+	var b strings.Builder
+	b.WriteString("Execute the attached molecule workflow. ")
+	if attachment.AttachedArgs != "" {
+		b.WriteString("Context: " + attachment.AttachedArgs + ". ")
+	}
+	b.WriteString("Work through steps in order, committing after each. ")
+	b.WriteString("When all steps complete, output POLECAT_DONE.")
+	return b.String()
+}
+
 // outputBeadPreview runs `bd show` and displays a truncated preview of the bead.
 func outputBeadPreview(hookedBead *beads.Issue) {
 	fmt.Println("**Bead details:**")
 	cmd := exec.Command("bd", "show", hookedBead.ID)
+	cmd.Env = beads.StripBdBranch(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -708,6 +782,7 @@ func checkPendingEscalations(ctx RoleContext) {
 	// Query for open escalations using bd list with tag filter
 	cmd := exec.Command("bd", "list", "--status=open", "--tag=escalation", "--json")
 	cmd.Dir = ctx.WorkDir
+	cmd.Env = beads.StripBdBranch(os.Environ())
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

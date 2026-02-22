@@ -152,7 +152,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 1: Stop refineries
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-refinery", rigName)
+		sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Refinery (%s)", rigName), true, "would stop")
@@ -172,7 +172,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 2: Stop witnesses
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-witness", rigName)
+		sessionName := session.WitnessSessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Witness (%s)", rigName), true, "would stop")
@@ -459,7 +459,7 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 	sessions, err := t.ListSessions()
 	if err == nil {
 		for _, sess := range sessions {
-			if strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-") {
+			if session.IsKnownSession(sess) {
 				respawned = append(respawned, fmt.Sprintf("tmux session %s", sess))
 			}
 		}

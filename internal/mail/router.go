@@ -7,9 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -24,6 +27,10 @@ var ErrUnknownQueue = errors.New("unknown queue")
 // ErrUnknownAnnounce indicates an announce channel name was not found in configuration.
 var ErrUnknownAnnounce = errors.New("unknown announce channel")
 
+// DefaultIdleNotifyTimeout is how long the router waits for a recipient's
+// session to become idle before falling back to a queued nudge.
+const DefaultIdleNotifyTimeout = 1 * time.Second
+
 // Router handles message delivery via beads.
 // It routes messages to the correct beads database based on address:
 // - Town-level (mayor/, deacon/) -> {townRoot}/.beads
@@ -32,6 +39,12 @@ type Router struct {
 	workDir  string // fallback directory to run bd commands in
 	townRoot string // town root directory (e.g., ~/gt)
 	tmux     *tmux.Tmux
+
+	// IdleNotifyTimeout controls how long to wait for a session to become
+	// idle before falling back to a queued nudge. Zero uses the default.
+	IdleNotifyTimeout time.Duration
+
+	notifyWg sync.WaitGroup // tracks in-flight async notifications
 }
 
 // NewRouter creates a new mail router.
@@ -55,6 +68,13 @@ func NewRouterWithTownRoot(workDir, townRoot string) *Router {
 		townRoot: townRoot,
 		tmux:     tmux.NewTmux(),
 	}
+}
+
+// WaitPendingNotifications blocks until all in-flight async notifications
+// have completed. CLI commands should call this before exiting to avoid
+// losing notifications that are still being delivered.
+func (r *Router) WaitPendingNotifications() {
+	r.notifyWg.Wait()
 }
 
 // isListAddress returns true if the address uses list:name syntax.
@@ -173,14 +193,11 @@ func detectTownRoot(startDir string) string {
 	return townRoot
 }
 
-// resolveBeadsDir returns the correct .beads directory for the given address.
+// resolveBeadsDir returns the correct .beads directory for mail delivery.
 //
-// Two-level beads architecture:
-// - ALL mail uses town beads ({townRoot}/.beads) regardless of address
-// - Rig-level beads ({rig}/.beads) are for project issues only, not mail
-//
-// This ensures messages are visible to all agents in the town.
-func (r *Router) resolveBeadsDir(_ string) string { // address unused: all mail uses town-level beads
+// All mail uses town beads ({townRoot}/.beads). Rig-level beads ({rig}/.beads)
+// are for project issues only, not mail.
+func (r *Router) resolveBeadsDir() string {
 	// If no town root, fall back to workDir's .beads
 	if r.townRoot == "" {
 		return filepath.Join(r.workDir, ".beads")
@@ -489,17 +506,26 @@ func parseRigAgentAddressFromID(id string) string {
 }
 
 // parseAgentAddressFromDescription extracts agent address from description metadata.
-// Looks for "role_type: X" and "rig: Y" patterns in the description.
+// Looks for "location: X" first (explicit address), then falls back to
+// "role_type: X" and "rig: Y" patterns in the description.
 func parseAgentAddressFromDescription(desc string) string {
-	var roleType, rig string
+	var roleType, rig, location string
 
 	for _, line := range strings.Split(desc, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "role_type:") {
+		if strings.HasPrefix(line, "location:") {
+			location = strings.TrimSpace(strings.TrimPrefix(line, "location:"))
+		} else if strings.HasPrefix(line, "role_type:") {
 			roleType = strings.TrimSpace(strings.TrimPrefix(line, "role_type:"))
 		} else if strings.HasPrefix(line, "rig:") {
 			rig = strings.TrimSpace(strings.TrimPrefix(line, "rig:"))
 		}
+	}
+
+	// Explicit location takes priority (used by dogs and other agents
+	// whose address can't be derived from role_type + rig alone)
+	if location != "" && location != "null" {
+		return location
 	}
 
 	// Handle null values from description
@@ -632,7 +658,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 	var allAgents []*agentBead
 
 	// Query town-level beads
-	townBeadsDir := r.resolveBeadsDir("")
+	townBeadsDir := r.resolveBeadsDir()
 	townAgents, err := r.queryAgentsInDir(townBeadsDir, descContains)
 	if err != nil {
 		// Don't fail yet - rig beads might still have results
@@ -693,10 +719,10 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 		return nil, fmt.Errorf("parsing agent query result: %w", err)
 	}
 
-	// Filter for open agents only (closed agents are inactive)
+	// Filter for active agents (closed/deleted agents are inactive)
 	var active []*agentBead
 	for _, agent := range agents {
-		if agent.Status == "open" || agent.Status == "in_progress" {
+		if agent.Status == "open" || agent.Status == "in_progress" || agent.Status == "hooked" {
 			active = append(active, agent)
 		}
 	}
@@ -868,6 +894,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	var labels []string
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, DeliverySendLabels()...)
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -909,7 +936,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// This prevents subjects like "--help" or "--json" from being parsed as flags.
 	args = append(args, "--", msg.Subject)
 
-	beadsDir := r.resolveBeadsDir(msg.To)
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -920,10 +947,19 @@ func (r *Router) sendToSingle(msg *Message) error {
 		return fmt.Errorf("sending message: %w", err)
 	}
 
-	// Notify recipient if they have an active session (best-effort notification)
-	// Skip notification for self-mail (handoffs to future-self don't need present-self notified)
-	if !isSelfMail(msg.From, msg.To) {
-		_ = r.notifyRecipient(msg)
+	// Notify recipient if they have an active session (best-effort notification).
+	// Skip when the caller explicitly suppressed notification (--no-notify)
+	// or for self-mail (handoffs to future-self don't need present-self notified).
+	// Notification is async: the durable write is complete, so the caller
+	// doesn't block on idle probing (up to 1s per recipient in fan-out).
+	// Callers that exit soon after Send should call WaitPendingNotifications.
+	if !msg.SuppressNotify && !isSelfMail(msg.From, msg.To) {
+		msgCopy := *msg // copy to avoid data race if caller mutates msg
+		r.notifyWg.Add(1)
+		go func() {
+			defer r.notifyWg.Done()
+			r.notifyRecipient(&msgCopy) //nolint:errcheck
+		}()
 	}
 
 	return nil
@@ -987,6 +1023,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
 	labels = append(labels, "queue:"+queueName)
+	labels = append(labels, DeliverySendLabels()...)
 	if msg.ThreadID != "" {
 		labels = append(labels, "thread:"+msg.ThreadID)
 	}
@@ -1026,7 +1063,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	// Queue messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1063,7 +1100,10 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 		}
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus announce metadata
+	// Build labels for type, from/thread/reply-to/cc plus announce metadata.
+	// Note: delivery:pending is intentionally omitted for announce messages —
+	// broadcast messages have no single recipient to ack against. Subscriber
+	// fan-out copies go through sendToSingle which adds delivery tracking.
 	var labels []string
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
@@ -1107,7 +1147,7 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	// Announce messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1146,7 +1186,10 @@ func (r *Router) sendToChannel(msg *Message) error {
 		return fmt.Errorf("channel %s is closed", channelName)
 	}
 
-	// Build labels for type, from/thread/reply-to/cc plus channel metadata
+	// Build labels for type, from/thread/reply-to/cc plus channel metadata.
+	// Note: delivery:pending is intentionally omitted for the channel-origin
+	// copy — it has no single recipient to ack. Subscriber fan-out copies go
+	// through sendToSingle which adds delivery tracking.
 	var labels []string
 	labels = append(labels, "gt:message")
 	labels = append(labels, "from:"+msg.From)
@@ -1190,7 +1233,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	// Channel messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1238,7 +1281,7 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 		return nil // No retention limit
 	}
 
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1297,13 +1340,19 @@ func isSelfMail(from, to string) bool {
 // GetMailbox returns a Mailbox for the given address.
 // Routes to the correct beads database based on the address.
 func (r *Router) GetMailbox(address string) (*Mailbox, error) {
-	beadsDir := r.resolveBeadsDir(address)
+	beadsDir := r.resolveBeadsDir()
 	workDir := filepath.Dir(beadsDir) // Parent of .beads
 	return NewMailboxFromAddress(address, workDir), nil
 }
 
 // notifyRecipient sends a notification to a recipient's tmux session.
-// Uses NudgeSession to add the notification to the agent's conversation history.
+//
+// Notification strategy (idle-aware):
+//  1. If the session is idle (prompt visible), send an immediate nudge.
+//  2. If the session is busy, enqueue a nudge for cooperative delivery at
+//     the next turn boundary.
+//  3. For the overseer (human operator), always use a visible banner.
+//
 // Supports mayor/, deacon/, rig/crew/name, rig/polecats/name, and rig/name addresses.
 // Respects agent DND/muted state - skips notification if recipient has DND enabled.
 func (r *Router) notifyRecipient(msg *Message) error {
@@ -1314,9 +1363,14 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		}
 	}
 
-	sessionIDs := addressToSessionIDs(msg.To)
+	sessionIDs := AddressToSessionIDs(msg.To)
 	if len(sessionIDs) == 0 {
 		return nil // Unable to determine session ID
+	}
+
+	timeout := r.IdleNotifyTimeout
+	if timeout == 0 {
+		timeout = DefaultIdleNotifyTimeout
 	}
 
 	// Try each possible session ID until we find one that exists.
@@ -1334,12 +1388,52 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
 		}
 
-		// Send notification to the agent's conversation history
 		notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
+
+		// Idle-aware notification: try immediate nudge first, fall back to queue.
+		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
+		if waitErr == nil {
+			// Session is idle → send immediate nudge
+			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
+				return nil
+			} else if errors.Is(err, tmux.ErrSessionNotFound) {
+				// Session disappeared between idle check and nudge — try next candidate
+				continue
+			} else if errors.Is(err, tmux.ErrNoServer) {
+				return nil
+			}
+			// NudgeSession failed for non-terminal reason — fall through to queue
+		} else if errors.Is(waitErr, tmux.ErrNoServer) {
+			// No tmux server — no point trying other candidates
+			return nil
+		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
+			// Session disappeared — try next candidate
+			continue
+		}
+
+		// Busy or nudge failed → enqueue for cooperative delivery at the
+		// agent's next turn boundary.
+		if r.townRoot != "" {
+			return nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
+				Sender:  msg.From,
+				Message: notification,
+			})
+		}
+		// Fallback to direct nudge if town root unavailable
 		return r.tmux.NudgeSession(sessionID, notification)
 	}
 
 	return nil // No active session found
+}
+
+// IsRecipientMuted checks if a mail recipient has DND/muted notifications enabled.
+// Returns true if the recipient is muted and should not receive tmux nudges.
+// Fails open (returns false) if the agent bead cannot be found or the town root is not set.
+func (r *Router) IsRecipientMuted(address string) bool {
+	if r.townRoot == "" {
+		return false
+	}
+	return r.isRecipientMuted(address)
 }
 
 // isRecipientMuted checks if a mail recipient has DND/muted notifications enabled.
@@ -1380,27 +1474,32 @@ func addressToAgentBeadID(address string) string {
 	rig := parts[0]
 	target := parts[1]
 
+	rigPrefix := session.PrefixFor(rig)
+
 	switch {
 	case target == "witness":
-		return fmt.Sprintf("gt-%s-witness", rig)
+		return session.WitnessSessionName(rigPrefix)
 	case target == "refinery":
-		return fmt.Sprintf("gt-%s-refinery", rig)
+		return session.RefinerySessionName(rigPrefix)
 	case strings.HasPrefix(target, "crew/"):
 		crewName := strings.TrimPrefix(target, "crew/")
-		return fmt.Sprintf("gt-%s-crew-%s", rig, crewName)
+		return session.CrewSessionName(rigPrefix, crewName)
+	case strings.HasPrefix(target, "polecats/"):
+		pcName := strings.TrimPrefix(target, "polecats/")
+		return session.PolecatSessionName(rigPrefix, pcName)
 	default:
-		return fmt.Sprintf("gt-%s-polecat-%s", rig, target)
+		return session.PolecatSessionName(rigPrefix, target)
 	}
 }
 
-// addressToSessionIDs converts a mail address to possible tmux session IDs.
+// AddressToSessionIDs converts a mail address to possible tmux session IDs.
 // Returns multiple candidates since the canonical address format (rig/name)
 // doesn't distinguish between crew workers (gt-rig-crew-name) and polecats
 // (gt-rig-name). The caller should try each and use the one that exists.
 //
 // This supersedes the approach in PR #896 which only handled slash-to-dash
 // conversion but didn't address the crew/polecat ambiguity.
-func addressToSessionIDs(address string) []string {
+func AddressToSessionIDs(address string) []string {
 	// Overseer address: "overseer" (human operator)
 	if address == "overseer" {
 		return []string{session.OverseerSessionName()}
@@ -1424,35 +1523,34 @@ func addressToSessionIDs(address string) []string {
 
 	rig := parts[0]
 	target := parts[1]
+	rigPrefix := session.PrefixFor(rig)
 
 	// If target already has crew/ or polecats/ prefix, use it directly
-	// e.g., "gastown/crew/holden" → "gt-gastown-crew-holden"
-	if strings.HasPrefix(target, "crew/") || strings.HasPrefix(target, "polecats/") {
-		return []string{fmt.Sprintf("gt-%s-%s", rig, strings.ReplaceAll(target, "/", "-"))}
+	// e.g., "gastown/crew/holden" → "gt-crew-holden"
+	if strings.HasPrefix(target, "crew/") {
+		crewName := strings.TrimPrefix(target, "crew/")
+		return []string{session.CrewSessionName(rigPrefix, crewName)}
+	}
+	if strings.HasPrefix(target, "polecats/") {
+		polecatName := strings.TrimPrefix(target, "polecats/")
+		return []string{session.PolecatSessionName(rigPrefix, polecatName)}
 	}
 
 	// Special cases that don't need crew variant
-	if target == "witness" || target == "refinery" {
-		return []string{fmt.Sprintf("gt-%s-%s", rig, target)}
+	if target == "witness" {
+		return []string{session.WitnessSessionName(rigPrefix)}
+	}
+	if target == "refinery" {
+		return []string{session.RefinerySessionName(rigPrefix)}
 	}
 
 	// For normalized addresses like "gastown/holden", try both:
-	// 1. Crew format: gt-gastown-crew-holden
-	// 2. Polecat format: gt-gastown-holden
+	// 1. Crew format: gt-crew-holden
+	// 2. Polecat format: gt-holden
 	// Return crew first since crew workers are more commonly missed.
 	return []string{
-		session.CrewSessionName(rig, target),    // gt-rig-crew-name
-		session.PolecatSessionName(rig, target), // gt-rig-name
+		session.CrewSessionName(rigPrefix, target),    // <prefix>-crew-name
+		session.PolecatSessionName(rigPrefix, target), // <prefix>-name
 	}
 }
 
-// addressToSessionID converts a mail address to a tmux session ID.
-// Returns empty string if address format is not recognized.
-// Deprecated: Use addressToSessionIDs for proper crew/polecat handling.
-func addressToSessionID(address string) string {
-	ids := addressToSessionIDs(address)
-	if len(ids) == 0 {
-		return ""
-	}
-	return ids[0]
-}

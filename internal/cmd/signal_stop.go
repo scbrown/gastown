@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -76,16 +77,34 @@ func runSignalStop(cmd *cobra.Command, args []string) error {
 
 	wg.Wait()
 
-	// Mail takes priority (messages from other agents are time-sensitive)
+	// Determine the block reason (mail takes priority)
+	var reason string
 	if mailReason != "" {
-		return outputStopBlock(mailReason)
-	}
-	if workReason != "" {
-		return outputStopBlock(workReason)
+		reason = mailReason
+	} else if workReason != "" {
+		reason = workReason
 	}
 
-	// Nothing queued — allow the agent to stop
-	return outputStopAllow()
+	statePath := stopStateFilePath(address)
+
+	if reason == "" {
+		// No blocking conditions — clear state so future conditions get notified
+		clearStopState(statePath)
+		return outputStopAllow()
+	}
+
+	// Check if we've already notified about this exact condition.
+	// This prevents infinite loops where the same block reason fires
+	// at every turn boundary, consuming the entire agent context.
+	state := loadStopState(statePath)
+	if state != nil && state.LastReason == reason {
+		// Already notified — don't re-block (prevents infinite loop)
+		return outputStopAllow()
+	}
+
+	// New or changed condition — block and record what we notified about
+	saveStopState(statePath, &stopState{LastReason: reason})
+	return outputStopBlock(reason)
 }
 
 // checkUnreadMail checks for unread mail and returns a block reason if found.
@@ -184,6 +203,49 @@ func checkStopSlungWork(townRoot string) string {
 	}
 
 	return ""
+}
+
+// stopState tracks the last block reason to prevent infinite notification loops.
+// When the stop hook blocks with a reason, it saves the reason. On subsequent
+// calls, if the reason hasn't changed, the hook approves instead of blocking.
+// When conditions clear (no block reason), the state is deleted so future
+// conditions trigger fresh notifications.
+type stopState struct {
+	LastReason string `json:"last_reason"`
+}
+
+// stopStateFilePath returns the path to the state file for the given agent.
+// State files are stored in the OS temp directory and scoped per-agent.
+func stopStateFilePath(address string) string {
+	safe := strings.ReplaceAll(address, "/", "_")
+	return filepath.Join(os.TempDir(), "gt-signal-stop-"+safe+".json")
+}
+
+// loadStopState loads the saved state for this agent.
+func loadStopState(path string) *stopState {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var s stopState
+	if json.Unmarshal(data, &s) != nil {
+		return nil
+	}
+	return &s
+}
+
+// saveStopState saves the state for this agent.
+func saveStopState(path string, state *stopState) {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0600)
+}
+
+// clearStopState removes the state file so future conditions get notified.
+func clearStopState(path string) {
+	_ = os.Remove(path)
 }
 
 // outputStopAllow outputs the JSON response to approve the agent stopping.

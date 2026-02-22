@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 func TestDetectTownRoot(t *testing.T) {
@@ -90,6 +92,14 @@ func TestIsTownLevelAddress(t *testing.T) {
 }
 
 func TestAddressToSessionIDs(t *testing.T) {
+	// Set up prefix registry for test
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	defer session.SetDefaultRegistry(old)
+
 	tests := []struct {
 		address string
 		want    []string
@@ -103,16 +113,16 @@ func TestAddressToSessionIDs(t *testing.T) {
 		{"deacon", []string{"hq-deacon"}},
 
 		// Rig singletons - single session (no crew/polecat ambiguity)
-		{"gastown/refinery", []string{"gt-gastown-refinery"}},
-		{"beads/witness", []string{"gt-beads-witness"}},
+		{"gastown/refinery", []string{"gt-refinery"}},
+		{"beads/witness", []string{"bd-witness"}},
 
 		// Ambiguous addresses - try both crew and polecat variants
-		{"gastown/Toast", []string{"gt-gastown-crew-Toast", "gt-gastown-Toast"}},
-		{"beads/ruby", []string{"gt-beads-crew-ruby", "gt-beads-ruby"}},
+		{"gastown/Toast", []string{"gt-crew-Toast", "gt-Toast"}},
+		{"beads/ruby", []string{"bd-crew-ruby", "bd-ruby"}},
 
 		// Explicit crew/polecat - single session
-		{"gastown/crew/max", []string{"gt-gastown-crew-max"}},
-		{"gastown/polecats/nux", []string{"gt-gastown-polecats-nux"}},
+		{"gastown/crew/max", []string{"gt-crew-max"}},
+		{"gastown/polecats/nux", []string{"gt-nux"}},
 
 		// Invalid addresses - empty result
 		{"gastown/", nil},  // Empty target
@@ -122,43 +132,15 @@ func TestAddressToSessionIDs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.address, func(t *testing.T) {
-			got := addressToSessionIDs(tt.address)
+			got := AddressToSessionIDs(tt.address)
 			if len(got) != len(tt.want) {
-				t.Errorf("addressToSessionIDs(%q) = %v, want %v", tt.address, got, tt.want)
+				t.Errorf("AddressToSessionIDs(%q) = %v, want %v", tt.address, got, tt.want)
 				return
 			}
 			for i, v := range got {
 				if v != tt.want[i] {
-					t.Errorf("addressToSessionIDs(%q)[%d] = %q, want %q", tt.address, i, v, tt.want[i])
+					t.Errorf("AddressToSessionIDs(%q)[%d] = %q, want %q", tt.address, i, v, tt.want[i])
 				}
-			}
-		})
-	}
-}
-
-func TestAddressToSessionID(t *testing.T) {
-	// Deprecated wrapper - returns first candidate from addressToSessionIDs
-	tests := []struct {
-		address string
-		want    string
-	}{
-		{"overseer", "hq-overseer"},
-		{"mayor", "hq-mayor"},
-		{"mayor/", "hq-mayor"},
-		{"deacon", "hq-deacon"},
-		{"gastown/refinery", "gt-gastown-refinery"},
-		{"gastown/Toast", "gt-gastown-crew-Toast"}, // First candidate is crew
-		{"beads/witness", "gt-beads-witness"},
-		{"gastown/", ""},   // Empty target
-		{"gastown", ""},    // No slash
-		{"", ""},           // Empty address
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.address, func(t *testing.T) {
-			got := addressToSessionID(tt.address)
-			if got != tt.want {
-				t.Errorf("addressToSessionID(%q) = %q, want %q", tt.address, got, tt.want)
 			}
 		})
 	}
@@ -254,7 +236,7 @@ func TestShouldBeWisp(t *testing.T) {
 func TestResolveBeadsDir(t *testing.T) {
 	// With town root set
 	r := NewRouterWithTownRoot("/work/dir", "/home/user/gt")
-	got := r.resolveBeadsDir("gastown/Toast")
+	got := r.resolveBeadsDir()
 	want := "/home/user/gt/.beads"
 	if filepath.ToSlash(got) != want {
 		t.Errorf("resolveBeadsDir with townRoot = %q, want %q", got, want)
@@ -262,7 +244,7 @@ func TestResolveBeadsDir(t *testing.T) {
 
 	// Without town root (fallback to workDir)
 	r2 := &Router{workDir: "/work/dir", townRoot: ""}
-	got2 := r2.resolveBeadsDir("mayor/")
+	got2 := r2.resolveBeadsDir()
 	want2 := "/work/dir/.beads"
 	if filepath.ToSlash(got2) != want2 {
 		t.Errorf("resolveBeadsDir without townRoot = %q, want %q", got2, want2)
@@ -813,6 +795,29 @@ func TestAgentBeadToAddress(t *testing.T) {
 			bead: &agentBead{ID: ""},
 			want: "",
 		},
+		{
+			name: "hq-dog with location in description",
+			bead: &agentBead{
+				ID:          "hq-dog-alpha",
+				Description: "Dog: alpha\n\nrole_type: dog\nrig: town\nlocation: deacon/dogs/alpha",
+			},
+			want: "deacon/dogs/alpha",
+		},
+		{
+			name: "hq-dog without description returns empty",
+			bead: &agentBead{
+				ID: "hq-dog-bravo",
+			},
+			want: "",
+		},
+		{
+			name: "hq-dog with location takes priority over role_type+rig",
+			bead: &agentBead{
+				ID:          "hq-dog-charlie",
+				Description: "Dog: charlie\n\nrole_type: dog\nrig: town\nlocation: deacon/dogs/charlie",
+			},
+			want: "deacon/dogs/charlie",
+		},
 	}
 
 	for _, tt := range tests {
@@ -820,6 +825,49 @@ func TestAgentBeadToAddress(t *testing.T) {
 			got := agentBeadToAddress(tt.bead)
 			if got != tt.want {
 				t.Errorf("agentBeadToAddress(%+v) = %q, want %q", tt.bead, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseAgentAddressFromDescription(t *testing.T) {
+	tests := []struct {
+		name string
+		desc string
+		want string
+	}{
+		{
+			name: "location field returns address directly",
+			desc: "Dog: alpha\n\nrole_type: dog\nrig: town\nlocation: deacon/dogs/alpha",
+			want: "deacon/dogs/alpha",
+		},
+		{
+			name: "location null falls back to role_type+rig",
+			desc: "Some agent\n\nrole_type: witness\nrig: myrig\nlocation: null",
+			want: "myrig/witness",
+		},
+		{
+			name: "no location uses role_type+rig",
+			desc: "Some agent\n\nrole_type: polecat\nrig: gastown",
+			want: "gastown/polecat",
+		},
+		{
+			name: "town-level agent no rig",
+			desc: "Mayor\n\nrole_type: mayor\nrig: null",
+			want: "mayor/",
+		},
+		{
+			name: "empty description",
+			desc: "",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseAgentAddressFromDescription(tt.desc)
+			if got != tt.want {
+				t.Errorf("parseAgentAddressFromDescription(%q) = %q, want %q", tt.desc, got, tt.want)
 			}
 		})
 	}
@@ -1022,7 +1070,19 @@ func TestValidateRecipient(t *testing.T) {
 	}
 }
 
+func setupTestRegistryForAddressTest(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
+
 func TestAddressToAgentBeadID(t *testing.T) {
+	setupTestRegistryForAddressTest(t)
+
 	tests := []struct {
 		name     string
 		address  string
@@ -1051,22 +1111,27 @@ func TestAddressToAgentBeadID(t *testing.T) {
 		{
 			name:     "witness",
 			address:  "gastown/witness",
-			expected: "gt-gastown-witness",
+			expected: "gt-witness",
 		},
 		{
 			name:     "refinery",
 			address:  "gastown/refinery",
-			expected: "gt-gastown-refinery",
+			expected: "gt-refinery",
 		},
 		{
 			name:     "crew member",
 			address:  "gastown/crew/max",
-			expected: "gt-gastown-crew-max",
+			expected: "gt-crew-max",
 		},
 		{
 			name:     "polecat (default)",
 			address:  "gastown/alpha",
-			expected: "gt-gastown-polecat-alpha",
+			expected: "gt-alpha",
+		},
+		{
+			name:     "explicit polecat with polecats/ prefix",
+			address:  "gastown/polecats/alpha",
+			expected: "gt-alpha",
 		},
 		{
 			name:     "empty address",

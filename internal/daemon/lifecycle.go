@@ -307,30 +307,26 @@ func (d *Daemon) getRoleConfigForIdentity(identity string) (*beads.RoleConfig, *
 }
 
 // identityToSession converts a beads identity to a tmux session name.
-// Uses role config if available, falls back to hardcoded patterns.
+// Always uses session.*SessionName() functions for consistency with gt up and daemon heartbeat.
 func (d *Daemon) identityToSession(identity string) string {
-	config, parsed, err := d.getRoleConfigForIdentity(identity)
+	parsed, err := parseIdentity(identity)
 	if err != nil {
 		return ""
 	}
 
-	// If role config has session_pattern, use it
-	if config != nil && config.SessionPattern != "" {
-		return beads.ExpandRolePattern(config.SessionPattern, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
-	}
-
-	// Fallback: use default patterns based on role type
 	switch parsed.RoleType {
 	case "mayor":
 		return session.MayorSessionName()
 	case "deacon":
 		return session.DeaconSessionName()
-	case "witness", "refinery":
-		return fmt.Sprintf("gt-%s-%s", parsed.RigName, parsed.RoleType)
+	case "witness":
+		return session.WitnessSessionName(session.PrefixFor(parsed.RigName))
+	case "refinery":
+		return session.RefinerySessionName(session.PrefixFor(parsed.RigName))
 	case "crew":
-		return fmt.Sprintf("gt-%s-crew-%s", parsed.RigName, parsed.AgentName)
+		return session.CrewSessionName(session.PrefixFor(parsed.RigName), parsed.AgentName)
 	case "polecat":
-		return fmt.Sprintf("gt-%s-%s", parsed.RigName, parsed.AgentName)
+		return session.PolecatSessionName(session.PrefixFor(parsed.RigName), parsed.AgentName)
 	default:
 		return ""
 	}
@@ -403,7 +399,7 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 func (d *Daemon) getWorkDir(config *beads.RoleConfig, parsed *ParsedIdentity) string {
 	// If role config has work_dir_pattern, use it
 	if config != nil && config.WorkDirPattern != "" {
-		return beads.ExpandRolePattern(config.WorkDirPattern, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
+		return beads.ExpandRolePattern(config.WorkDirPattern, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 	}
 
 	// Fallback: use default patterns based on role type
@@ -455,7 +451,7 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 	// If role config is available, use it
 	if roleConfig != nil && roleConfig.StartCommand != "" {
 		// Expand any patterns in the command
-		return beads.ExpandRolePattern(roleConfig.StartCommand, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
+		return beads.ExpandRolePattern(roleConfig.StartCommand, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 	}
 
 	rigPath := ""
@@ -466,14 +462,9 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 	// Use role-based agent resolution for per-role model selection
 	runtimeConfig := config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath)
 
-	// Build recipient for beacon
-	recipient := identityToBDActor(parsed.RigName + "/" + parsed.RoleType)
-	if parsed.AgentName != "" {
-		recipient = identityToBDActor(parsed.RigName + "/" + parsed.RoleType + "/" + parsed.AgentName)
-	}
-	if parsed.RoleType == "deacon" || parsed.RoleType == "mayor" {
-		recipient = parsed.RoleType
-	}
+	// Build recipient for beacon using non-path format to prevent LLMs
+	// from misinterpreting the recipient as a filesystem path.
+	recipient := session.BeaconRecipient(parsed.RoleType, parsed.AgentName, parsed.RigName)
 	prompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: recipient,
 		Sender:    "daemon",
@@ -544,7 +535,7 @@ func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.Rol
 	// Set any custom env vars from role config
 	if roleConfig != nil {
 		for k, v := range roleConfig.EnvVars {
-			expanded := beads.ExpandRolePattern(v, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType)
+			expanded := beads.ExpandRolePattern(v, d.config.TownRoot, parsed.RigName, parsed.AgentName, parsed.RoleType, session.PrefixFor(parsed.RigName))
 			_ = d.tmux.SetEnvironment(sessionName, k, expanded)
 		}
 	}
@@ -726,8 +717,8 @@ func (d *Daemon) closeMessage(id string) error {
 type AgentBeadInfo struct {
 	ID         string `json:"id"`
 	Type       string `json:"issue_type"`
-	State      string // Parsed from description: agent_state
-	HookBead   string // Parsed from description: hook_bead
+	State      string // From DB column (agent_state), fallback to description
+	HookBead   string // From DB column (hook_bead)
 	RoleType   string // Parsed from description: role_type
 	Rig        string // Parsed from description: rig
 	LastUpdate string `json:"updated_at"`
@@ -799,9 +790,18 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	}
 
 	if fields != nil {
-		info.State = fields.AgentState
 		info.RoleType = fields.RoleType
 		info.Rig = fields.Rig
+	}
+
+	// Use AgentState from database column directly (not from description).
+	// UpdateAgentState updates the DB column but not the description text,
+	// so the description can contain stale state (e.g., "spawning" after
+	// the polecat has transitioned to "working"). Fall back to description
+	// only if the DB column is empty (legacy beads).
+	info.State = issue.AgentState
+	if info.State == "" && fields != nil {
+		info.State = fields.AgentState
 	}
 
 	// Use HookBead from database column directly (not from description)
@@ -958,7 +958,7 @@ func (d *Daemon) checkRigGUPPViolations(rigName string) {
 		// Per gt-zecmc: derive running state from tmux, not agent_state
 		// Extract polecat name from agent ID (<prefix>-<rig>-polecat-<name> -> <name>)
 		polecatName := strings.TrimPrefix(agent.ID, prefix)
-		sessionName := fmt.Sprintf("gt-%s-%s", rigName, polecatName)
+		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 
 		// Check if tmux session exists and agent is running
 		if d.tmux.IsAgentAlive(sessionName) {
@@ -1052,7 +1052,7 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {
 
 		// Check if tmux session is alive (derive state from tmux, not bead)
 		polecatName := strings.TrimPrefix(agent.ID, prefix)
-		sessionName := fmt.Sprintf("gt-%s-%s", rigName, polecatName)
+		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 
 		// Session running = not orphaned (work is being processed)
 		if d.tmux.IsAgentAlive(sessionName) {

@@ -2,12 +2,16 @@
 package session
 
 import (
+	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -128,7 +132,8 @@ type StartResult struct {
 // Role-specific concerns (issue validation, fallback nudges, pane-died hooks,
 // crew cycle bindings, etc.) should be handled by the caller before/after
 // calling StartSession.
-func StartSession(t *tmux.Tmux, cfg SessionConfig) (*StartResult, error) {
+func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error) {
+	defer func() { telemetry.RecordSessionStart(context.Background(), cfg.SessionID, cfg.Role, retErr) }()
 	if cfg.SessionID == "" {
 		return nil, fmt.Errorf("SessionID is required")
 	}
@@ -191,12 +196,14 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (*StartResult, error) {
 		AgentName:        cfg.AgentName,
 		TownRoot:         cfg.TownRoot,
 		RuntimeConfigDir: cfg.RuntimeConfigDir,
+		Agent:            cfg.AgentOverride,
 	})
-	for k, v := range envVars {
-		_ = t.SetEnvironment(cfg.SessionID, k, v)
+	envVars = mergeRuntimeLivenessEnv(envVars, runtimeConfig)
+	for _, k := range mapKeysSorted(envVars) {
+		_ = t.SetEnvironment(cfg.SessionID, k, envVars[k])
 	}
-	for k, v := range cfg.ExtraEnv {
-		_ = t.SetEnvironment(cfg.SessionID, k, v)
+	for _, k := range mapKeysSorted(cfg.ExtraEnv) {
+		_ = t.SetEnvironment(cfg.SessionID, k, cfg.ExtraEnv[k])
 	}
 
 	// 7. Apply theme.
@@ -275,6 +282,55 @@ func StopSession(t *tmux.Tmux, sessionID string, graceful bool) error {
 	}
 
 	return nil
+}
+
+func mapKeysSorted(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// mergeRuntimeLivenessEnv ensures liveness-critical env vars are present in the
+// tmux session environment table, even when agent resolution came from
+// workspace/default settings rather than an explicit --agent override.
+func mergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.RuntimeConfig) map[string]string {
+	if envVars == nil {
+		envVars = make(map[string]string)
+	}
+	if runtimeConfig == nil {
+		return envVars
+	}
+
+	if _, hasGTAgent := envVars["GT_AGENT"]; !hasGTAgent && runtimeConfig.ResolvedAgent != "" {
+		envVars["GT_AGENT"] = runtimeConfig.ResolvedAgent
+	}
+
+	if _, hasProcessNames := envVars["GT_PROCESS_NAMES"]; !hasProcessNames {
+		agentForLookup := runtimeConfig.ResolvedAgent
+		commandForLookup := runtimeConfig.Command
+		if existing, ok := envVars["GT_AGENT"]; ok && existing != "" {
+			agentForLookup = existing
+			// When GT_AGENT was set by AgentOverride (differs from the
+			// workspace-resolved agent), the runtimeConfig.Command belongs
+			// to the workspace agent, not the override. Pass empty command
+			// so ResolveProcessNames uses the preset's own command.
+			if existing != runtimeConfig.ResolvedAgent {
+				commandForLookup = ""
+			}
+		}
+		processNames := config.ResolveProcessNames(agentForLookup, commandForLookup)
+		if len(processNames) > 0 {
+			envVars["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
+		}
+	}
+
+	return envVars
 }
 
 // KillExistingSession kills an existing session if one is found.

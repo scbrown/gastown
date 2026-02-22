@@ -93,6 +93,20 @@
         }
     });
 
+    // ============================================
+    // COLLAPSE BUTTON HANDLER
+    // ============================================
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('.collapse-btn');
+        if (!btn) return;
+
+        e.preventDefault();
+        var panel = btn.closest('.panel');
+        if (!panel) return;
+
+        panel.classList.toggle('collapsed');
+    });
+
     // After HTMX swap - morph preserves most state, but we need to re-init some things
     document.body.addEventListener('htmx:afterSwap', function() {
         // Morph preserves expanded class, so we don't need to close panels anymore
@@ -104,12 +118,14 @@
         var prDetail = document.getElementById('pr-detail');
         var convoyDetailView = document.getElementById('convoy-detail');
         var convoyCreateView = document.getElementById('convoy-create-form');
+        var sessionPreview = document.getElementById('session-preview');
         var inDetailView = (mailDetail && mailDetail.style.display !== 'none') ||
                           (mailCompose && mailCompose.style.display !== 'none') ||
                           (issueDetail && issueDetail.style.display !== 'none') ||
                           (prDetail && prDetail.style.display !== 'none') ||
                           (convoyDetailView && convoyDetailView.style.display !== 'none') ||
-                          (convoyCreateView && convoyCreateView.style.display !== 'none');
+                          (convoyCreateView && convoyCreateView.style.display !== 'none') ||
+                          (sessionPreview && sessionPreview.style.display !== 'none');
         if (!inDetailView && !hasExpanded) {
             window.pauseRefresh = false;
         }
@@ -747,6 +763,19 @@
             return;
         }
 
+        // Escape closes expanded panels when palette is not open
+        if (!isPaletteOpen && e.key === 'Escape') {
+            var expanded = document.querySelector('.panel.expanded');
+            if (expanded) {
+                e.preventDefault();
+                expanded.classList.remove('expanded');
+                var expandBtn = expanded.querySelector('.expand-btn');
+                if (expandBtn) expandBtn.textContent = 'Expand';
+                window.pauseRefresh = false;
+                return;
+            }
+        }
+
         // Rest only when palette is open
         if (!isPaletteOpen) return;
 
@@ -835,41 +864,87 @@
         });
     });
 
-    // Load mail inbox on page load
+    // Load mail inbox as threaded conversations
     function loadMailInbox() {
         var loading = document.getElementById('mail-loading');
-        var table = document.getElementById('mail-table');
-        var tbody = document.getElementById('mail-tbody');
+        var threadsContainer = document.getElementById('mail-threads');
         var empty = document.getElementById('mail-empty');
         var count = document.getElementById('mail-count');
 
-        if (!loading || !table || !tbody) return;
+        if (!loading || !threadsContainer) return;
 
-        fetch('/api/mail/inbox')
+        fetch('/api/mail/threads')
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 loading.style.display = 'none';
 
-                if (data.messages && data.messages.length > 0) {
-                    table.style.display = 'table';
+                if (data.threads && data.threads.length > 0) {
+                    threadsContainer.style.display = 'block';
                     empty.style.display = 'none';
-                    tbody.innerHTML = '';
+                    threadsContainer.innerHTML = '';
 
-                    data.messages.forEach(function(msg) {
-                        var tr = document.createElement('tr');
-                        tr.className = 'mail-row' + (msg.read ? '' : ' mail-unread');
-                        tr.setAttribute('data-msg-id', msg.id);
-                        tr.setAttribute('data-from', msg.from);
+                    data.threads.forEach(function(thread) {
+                        var threadEl = document.createElement('div');
+                        threadEl.className = 'mail-thread' + (thread.unread_count > 0 ? ' mail-thread-unread' : '');
+
+                        var last = thread.last_message;
+                        var hasMultiple = thread.count > 1;
+                        var countBadge = hasMultiple ? '<span class="thread-count">' + thread.count + '</span>' : '';
+                        var unreadDot = thread.unread_count > 0 ? '<span class="thread-unread-dot"></span>' : '';
 
                         var priorityIcon = '';
-                        if (msg.priority === 'urgent') priorityIcon = '<span class="priority-urgent">⚡</span> ';
-                        else if (msg.priority === 'high') priorityIcon = '<span class="priority-high">!</span> ';
+                        if (last.priority === 'urgent') priorityIcon = '<span class="priority-urgent">⚡</span> ';
+                        else if (last.priority === 'high') priorityIcon = '<span class="priority-high">!</span> ';
 
-                        tr.innerHTML =
-                            '<td class="mail-from">' + escapeHtml(msg.from) + '</td>' +
-                            '<td>' + priorityIcon + '<span class="mail-subject">' + escapeHtml(msg.subject) + '</span></td>' +
-                            '<td class="mail-time">' + formatMailTime(msg.timestamp) + '</td>';
-                        tbody.appendChild(tr);
+                        // Thread header (always visible)
+                        var headerEl = document.createElement('div');
+                        headerEl.className = 'mail-thread-header';
+                        headerEl.setAttribute('data-thread-id', thread.thread_id);
+                        headerEl.innerHTML =
+                            '<div class="mail-thread-left">' +
+                                unreadDot +
+                                '<span class="mail-from">' + escapeHtml(last.from) + '</span>' +
+                                countBadge +
+                            '</div>' +
+                            '<div class="mail-thread-center">' +
+                                priorityIcon +
+                                '<span class="mail-subject">' + escapeHtml(thread.subject) + '</span>' +
+                                (hasMultiple ? '<span class="mail-thread-preview"> — ' + escapeHtml(last.body ? last.body.substring(0, 60) : '') + '</span>' : '') +
+                            '</div>' +
+                            '<div class="mail-thread-right">' +
+                                '<span class="mail-time">' + formatMailTime(last.timestamp) + '</span>' +
+                            '</div>';
+
+                        threadEl.appendChild(headerEl);
+
+                        // Thread messages (collapsed by default, only for multi-message threads)
+                        if (hasMultiple) {
+                            var msgsEl = document.createElement('div');
+                            msgsEl.className = 'mail-thread-messages';
+                            msgsEl.style.display = 'none';
+
+                            thread.messages.forEach(function(msg) {
+                                var msgEl = document.createElement('div');
+                                msgEl.className = 'mail-thread-msg' + (msg.read ? '' : ' mail-unread');
+                                msgEl.setAttribute('data-msg-id', msg.id);
+                                msgEl.setAttribute('data-from', msg.from);
+                                msgEl.innerHTML =
+                                    '<div class="mail-thread-msg-header">' +
+                                        '<span class="mail-from">' + escapeHtml(msg.from) + '</span>' +
+                                        '<span class="mail-time">' + formatMailTime(msg.timestamp) + '</span>' +
+                                    '</div>' +
+                                    '<div class="mail-thread-msg-subject">' + escapeHtml(msg.subject) + '</div>';
+                                msgsEl.appendChild(msgEl);
+                            });
+
+                            threadEl.appendChild(msgsEl);
+                        } else {
+                            // Single message thread - clicking opens the message directly
+                            headerEl.setAttribute('data-msg-id', last.id);
+                            headerEl.setAttribute('data-from', last.from);
+                        }
+
+                        threadsContainer.appendChild(threadEl);
                     });
 
                     // Update count
@@ -877,9 +952,10 @@
                         var unread = data.unread_count || 0;
                         count.textContent = unread > 0 ? unread + ' unread' : data.total;
                         if (unread > 0) count.classList.add('has-unread');
+                        else count.classList.remove('has-unread');
                     }
                 } else {
-                    table.style.display = 'none';
+                    threadsContainer.style.display = 'none';
                     empty.style.display = 'block';
                     if (count) count.textContent = '0';
                 }
@@ -1776,8 +1852,43 @@
         });
     }
 
-    // Click on mail row to read message
+    // Click on mail thread header - toggle expand or open single message
     document.addEventListener('click', function(e) {
+        // Handle click on individual message within expanded thread
+        var threadMsg = e.target.closest('.mail-thread-msg');
+        if (threadMsg) {
+            e.preventDefault();
+            var msgId = threadMsg.getAttribute('data-msg-id');
+            var from = threadMsg.getAttribute('data-from');
+            if (msgId) {
+                openMailDetail(msgId, from);
+            }
+            return;
+        }
+
+        // Handle click on thread header
+        var threadHeader = e.target.closest('.mail-thread-header');
+        if (threadHeader) {
+            e.preventDefault();
+            var msgId = threadHeader.getAttribute('data-msg-id');
+            if (msgId) {
+                // Single message thread - open directly
+                var from = threadHeader.getAttribute('data-from');
+                openMailDetail(msgId, from);
+            } else {
+                // Multi-message thread - toggle expand/collapse
+                var threadEl = threadHeader.closest('.mail-thread');
+                var msgsEl = threadEl ? threadEl.querySelector('.mail-thread-messages') : null;
+                if (msgsEl) {
+                    var isExpanded = msgsEl.style.display !== 'none';
+                    msgsEl.style.display = isExpanded ? 'none' : 'block';
+                    threadEl.classList.toggle('mail-thread-expanded', !isExpanded);
+                }
+            }
+            return;
+        }
+
+        // Legacy: handle click on mail-row (All Traffic tab)
         var mailRow = e.target.closest('.mail-row');
         if (mailRow) {
             e.preventDefault();
@@ -2586,5 +2697,514 @@
             closeSlingDropdown();
         }
     });
+
+
+
+    // ============================================
+    // ESCALATION ACTIONS
+    // ============================================
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('.esc-btn');
+        if (!btn) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        var action = btn.getAttribute('data-action');
+        var id = btn.getAttribute('data-id');
+        if (!action || !id) return;
+
+        if (action === 'reassign') {
+            showReassignPicker(btn, id);
+            return;
+        }
+
+        // Ack or Resolve - run directly
+        var cmdName = 'escalate ' + action + ' ' + id;
+        btn.disabled = true;
+        btn.textContent = action === 'ack' ? 'Acking...' : 'Resolving...';
+
+        runEscalationAction(cmdName, btn, action);
+    });
+
+    function runEscalationAction(cmdName, btn, action) {
+        showToast('info', 'Running...', 'gt ' + cmdName);
+
+        fetch('/api/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ command: cmdName })
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.success) {
+                showToast('success', 'Success', 'gt ' + cmdName);
+                // Remove ack button or fade row on resolve
+                var row = btn.closest('.escalation-row');
+                if (action === 'resolve' && row) {
+                    row.style.opacity = '0.4';
+                    row.style.pointerEvents = 'none';
+                } else if (action === 'ack' && row) {
+                    // Replace ack button with ACK badge
+                    btn.outerHTML = '<span class="badge badge-cyan">ACK</span>';
+                }
+            } else {
+                showToast('error', 'Failed', data.error || 'Unknown error');
+                btn.disabled = false;
+                btn.textContent = action === 'ack' ? '👍 Ack' : '✓ Resolve';
+            }
+        })
+        .catch(function(err) {
+            showToast('error', 'Error', err.message || 'Request failed');
+            btn.disabled = false;
+            btn.textContent = action === 'ack' ? '👍 Ack' : '✓ Resolve';
+        });
+    }
+
+    function showReassignPicker(btn, escalationId) {
+        // Check if picker already open
+        var existing = btn.parentNode.querySelector('.reassign-picker');
+        if (existing) {
+            existing.remove();
+            return;
+        }
+
+        var picker = document.createElement('div');
+        picker.className = 'reassign-picker';
+        picker.innerHTML = '<select class="reassign-select"><option value="">Loading...</option></select>' +
+            '<button class="esc-btn esc-reassign-confirm">Go</button>' +
+            '<button class="esc-btn esc-reassign-cancel">✕</button>';
+        btn.parentNode.appendChild(picker);
+
+        var select = picker.querySelector('.reassign-select');
+
+        // Pause refresh while picker is open
+        window.pauseRefresh = true;
+
+        // Load agents
+        fetch('/api/options')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                select.innerHTML = '<option value="">Select agent...</option>';
+                var agents = data.agents || [];
+                agents.forEach(function(agent) {
+                    var name = typeof agent === 'string' ? agent : agent.name;
+                    var running = typeof agent === 'object' ? agent.running : true;
+                    var opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name + (running ? '' : ' (stopped)');
+                    select.appendChild(opt);
+                });
+            })
+            .catch(function() {
+                select.innerHTML = '<option value="">Failed to load</option>';
+            });
+
+        // Confirm reassign
+        picker.querySelector('.esc-reassign-confirm').addEventListener('click', function() {
+            var agent = select.value;
+            if (!agent) {
+                showToast('error', 'Missing', 'Select an agent to reassign to');
+                return;
+            }
+            picker.remove();
+            window.pauseRefresh = false;
+
+            var cmdName = 'escalate reassign ' + escalationId + ' ' + agent;
+            btn.disabled = true;
+            btn.textContent = 'Reassigning...';
+
+            showToast('info', 'Running...', 'gt ' + cmdName);
+
+            fetch('/api/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command: cmdName })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.success) {
+                    showToast('success', 'Reassigned', 'Escalation reassigned to ' + agent);
+                    var row = btn.closest('.escalation-row');
+                    if (row) {
+                        // Update the "From" cell to show new assignee
+                        var fromCell = row.querySelectorAll('td')[2];
+                        if (fromCell) fromCell.textContent = '→ ' + agent;
+                    }
+                } else {
+                    showToast('error', 'Failed', data.error || 'Unknown error');
+                }
+                btn.disabled = false;
+                btn.textContent = '↻ Reassign';
+            })
+            .catch(function(err) {
+                showToast('error', 'Error', err.message || 'Request failed');
+                btn.disabled = false;
+                btn.textContent = '↻ Reassign';
+            });
+        });
+
+        // Cancel
+        picker.querySelector('.esc-reassign-cancel').addEventListener('click', function() {
+            picker.remove();
+            window.pauseRefresh = false;
+        });
+    }
+
+
+
+    // ============================================
+    // ACTIVITY TIMELINE FILTERS
+    // ============================================
+
+    function initTimelineFilters() {
+        var timeline = document.getElementById('activity-timeline');
+        if (!timeline) return;
+
+        var entries = timeline.querySelectorAll('.tl-entry');
+        var rigFilter = document.getElementById('tl-rig-filter');
+        var agentFilter = document.getElementById('tl-agent-filter');
+        var emptyMsg = document.getElementById('tl-empty-filtered');
+
+        // Collect unique rigs and agents for dropdowns
+        var rigs = {};
+        var agents = {};
+        entries.forEach(function(entry) {
+            var rig = entry.getAttribute('data-rig');
+            var agent = entry.getAttribute('data-agent');
+            if (rig) rigs[rig] = true;
+            if (agent) agents[agent] = true;
+        });
+
+        // Populate rig dropdown
+        if (rigFilter) {
+            Object.keys(rigs).sort().forEach(function(rig) {
+                var opt = document.createElement('option');
+                opt.value = rig;
+                opt.textContent = rig;
+                rigFilter.appendChild(opt);
+            });
+        }
+
+        // Populate agent dropdown
+        if (agentFilter) {
+            Object.keys(agents).sort().forEach(function(agent) {
+                var opt = document.createElement('option');
+                opt.value = agent;
+                opt.textContent = agent;
+                agentFilter.appendChild(opt);
+            });
+        }
+
+        // Current filter state
+        var activeCategory = 'all';
+
+        function applyFilters() {
+            var selectedRig = rigFilter ? rigFilter.value : 'all';
+            var selectedAgent = agentFilter ? agentFilter.value : 'all';
+            var visibleCount = 0;
+
+            entries.forEach(function(entry) {
+                var show = true;
+
+                if (activeCategory !== 'all' && entry.getAttribute('data-category') !== activeCategory) {
+                    show = false;
+                }
+                if (selectedRig !== 'all' && entry.getAttribute('data-rig') !== selectedRig) {
+                    show = false;
+                }
+                if (selectedAgent !== 'all' && entry.getAttribute('data-agent') !== selectedAgent) {
+                    show = false;
+                }
+
+                if (show) {
+                    entry.classList.remove('tl-hidden');
+                    visibleCount++;
+                } else {
+                    entry.classList.add('tl-hidden');
+                }
+            });
+
+            if (emptyMsg) {
+                emptyMsg.style.display = visibleCount === 0 ? 'block' : 'none';
+            }
+        }
+
+        // Category filter buttons
+        document.addEventListener('click', function(e) {
+            var btn = e.target.closest('.tl-filter-btn');
+            if (!btn) return;
+            if (btn.getAttribute('data-filter') !== 'category') return;
+
+            // Update active state
+            var group = btn.closest('.tl-filter-group');
+            if (group) {
+                group.querySelectorAll('.tl-filter-btn').forEach(function(b) {
+                    b.classList.remove('active');
+                });
+            }
+            btn.classList.add('active');
+            activeCategory = btn.getAttribute('data-value');
+            applyFilters();
+        });
+
+        // Dropdown filters
+        if (rigFilter) {
+            rigFilter.addEventListener('change', applyFilters);
+        }
+        if (agentFilter) {
+            agentFilter.addEventListener('change', applyFilters);
+        }
+    }
+
+    // Init on page load
+    initTimelineFilters();
+
+    // Re-init after HTMX swaps
+    document.body.addEventListener('htmx:afterSwap', function() {
+        initTimelineFilters();
+    });
+
+    // ============================================
+    // SESSION TERMINAL PREVIEW
+    // ============================================
+    var sessionPreviewInterval = null;
+    var sessionsTable = null; // will be set when opening preview
+
+    // Click on session row to preview terminal output
+    document.addEventListener('click', function(e) {
+        var sessionRow = e.target.closest('.session-row');
+        if (sessionRow) {
+            e.preventDefault();
+            var sessionName = sessionRow.getAttribute('data-session-name');
+            if (sessionName) {
+                openSessionPreview(sessionName);
+            }
+        }
+    });
+
+    function openSessionPreview(sessionName) {
+        window.pauseRefresh = true;
+
+        var preview = document.getElementById('session-preview');
+        var nameEl = document.getElementById('session-preview-name');
+        var contentEl = document.getElementById('session-preview-content');
+        var statusEl = document.getElementById('session-preview-status');
+
+        if (!preview || !contentEl) return;
+
+        // Hide the sessions table, show preview
+        sessionsTable = preview.parentNode.querySelector('table');
+        if (sessionsTable) sessionsTable.style.display = 'none';
+        var emptyState = preview.parentNode.querySelector('.empty-state');
+        if (emptyState) emptyState.style.display = 'none';
+
+        nameEl.textContent = sessionName;
+        contentEl.textContent = 'Loading...';
+        statusEl.textContent = '';
+        preview.style.display = 'block';
+
+        // Fetch immediately
+        fetchSessionPreview(sessionName, contentEl, statusEl);
+
+        // Auto-refresh every 3 seconds
+        if (sessionPreviewInterval) clearInterval(sessionPreviewInterval);
+        sessionPreviewInterval = setInterval(function() {
+            fetchSessionPreview(sessionName, contentEl, statusEl);
+        }, 3000);
+    }
+
+    function fetchSessionPreview(sessionName, contentEl, statusEl) {
+        fetch('/api/session/preview?session=' + encodeURIComponent(sessionName))
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    contentEl.textContent = 'Error: ' + data.error;
+                    return;
+                }
+                contentEl.textContent = data.content || '(empty)';
+                // Auto-scroll to bottom
+                contentEl.scrollTop = contentEl.scrollHeight;
+                // Show refresh timestamp
+                var now = new Date();
+                var timeStr = now.getHours() + ':' + (now.getMinutes() < 10 ? '0' : '') + now.getMinutes() + ':' + (now.getSeconds() < 10 ? '0' : '') + now.getSeconds();
+                statusEl.textContent = 'refreshed ' + timeStr;
+            })
+            .catch(function(err) {
+                contentEl.textContent = 'Failed to load preview: ' + err.message;
+            });
+    }
+
+    function closeSessionPreview() {
+        if (sessionPreviewInterval) {
+            clearInterval(sessionPreviewInterval);
+            sessionPreviewInterval = null;
+        }
+
+        var preview = document.getElementById('session-preview');
+        if (preview) preview.style.display = 'none';
+
+        // Show the sessions table again
+        if (sessionsTable) sessionsTable.style.display = '';
+
+        window.pauseRefresh = false;
+    }
+
+    // Back button from session preview
+    var sessionPreviewBack = document.getElementById('session-preview-back');
+    if (sessionPreviewBack) {
+        sessionPreviewBack.addEventListener('click', closeSessionPreview);
+    }
+
+    // ============================================
+    // CONVOY DRILL-DOWN (expand rows to show tracked issues)
+    // ============================================
+    var convoyCache = {}; // Cache fetched convoy data by ID
+
+    document.addEventListener('click', function(e) {
+        var row = e.target.closest('.convoy-row');
+        if (!row) return;
+
+        e.preventDefault();
+        var convoyId = row.getAttribute('data-convoy-id');
+        if (!convoyId) return;
+
+        // Check if already expanded
+        var existingDetail = row.nextElementSibling;
+        if (existingDetail && existingDetail.classList.contains('convoy-detail-row')) {
+            // Collapse: remove the detail row
+            existingDetail.remove();
+            row.classList.remove('convoy-expanded');
+            var toggle = row.querySelector('.convoy-toggle');
+            if (toggle) toggle.textContent = '▶';
+            return;
+        }
+
+        // Collapse any other expanded convoy
+        document.querySelectorAll('.convoy-detail-row').forEach(function(r) { r.remove(); });
+        document.querySelectorAll('.convoy-row.convoy-expanded').forEach(function(r) {
+            r.classList.remove('convoy-expanded');
+            var t = r.querySelector('.convoy-toggle');
+            if (t) t.textContent = '▶';
+        });
+
+        // Mark this row as expanded
+        row.classList.add('convoy-expanded');
+        var toggleEl = row.querySelector('.convoy-toggle');
+        if (toggleEl) toggleEl.textContent = '▼';
+
+        // Create detail row
+        var detailRow = document.createElement('tr');
+        detailRow.className = 'convoy-detail-row';
+        var detailCell = document.createElement('td');
+        detailCell.colSpan = 4;
+        detailCell.innerHTML = '<div class="tracked-issues"><div class="tracked-issues-loading">Loading tracked issues...</div></div>';
+        detailRow.appendChild(detailCell);
+        row.parentNode.insertBefore(detailRow, row.nextSibling);
+
+        // Check cache first
+        if (convoyCache[convoyId]) {
+            renderConvoyIssues(detailCell, convoyCache[convoyId]);
+            return;
+        }
+
+        // Fetch via /api/run
+        fetch('/api/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ command: 'convoy status ' + convoyId + ' --json' })
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data.success) {
+                detailCell.innerHTML = '<div class="tracked-issues"><div class="tracked-issues-error">Failed to load: ' + escapeHtml(data.error || 'Unknown error') + '</div></div>';
+                return;
+            }
+            try {
+                var parsed = JSON.parse(data.output);
+                convoyCache[convoyId] = parsed;
+                renderConvoyIssues(detailCell, parsed);
+            } catch (err) {
+                detailCell.innerHTML = '<div class="tracked-issues"><div class="tracked-issues-error">Failed to parse response</div></div>';
+            }
+        })
+        .catch(function(err) {
+            detailCell.innerHTML = '<div class="tracked-issues"><div class="tracked-issues-error">Request failed: ' + escapeHtml(err.message) + '</div></div>';
+        });
+    });
+
+    function renderConvoyIssues(cell, data) {
+        var issues = data.tracked || [];
+        if (issues.length === 0) {
+            cell.innerHTML = '<div class="tracked-issues"><div class="tracked-issues-empty">No tracked issues</div></div>';
+            return;
+        }
+
+        var html = '<div class="tracked-issues">';
+        html += '<table class="tracked-issues-table">';
+        html += '<thead><tr><th>Status</th><th>ID</th><th>Title</th><th>Assignee</th><th>Progress</th></tr></thead>';
+        html += '<tbody>';
+
+        for (var i = 0; i < issues.length; i++) {
+            var issue = issues[i];
+
+            // Status badge
+            var statusBadge = '';
+            switch (issue.status) {
+                case 'closed':
+                    statusBadge = '<span class="badge badge-green">Done</span>';
+                    break;
+                case 'in_progress':
+                    statusBadge = '<span class="badge badge-yellow">In Progress</span>';
+                    break;
+                case 'hooked':
+                    statusBadge = '<span class="badge badge-blue">Hooked</span>';
+                    break;
+                default:
+                    statusBadge = '<span class="badge badge-muted">Open</span>';
+            }
+
+            // Assignee - extract short name
+            var assignee = '—';
+            if (issue.assignee) {
+                var parts = issue.assignee.split('/');
+                assignee = parts[parts.length - 1];
+            }
+
+            // Worker info as progress indicator
+            var progress = '';
+            if (issue.status === 'closed') {
+                progress = '<span class="convoy-progress-done">✓</span>';
+            } else if (issue.worker) {
+                var workerName = issue.worker.split('/').pop();
+                progress = '<span class="convoy-progress-active">@' + escapeHtml(workerName) + '</span>';
+                if (issue.worker_age) {
+                    progress += ' <span class="convoy-progress-age">' + escapeHtml(issue.worker_age) + '</span>';
+                }
+            }
+
+            html += '<tr class="tracked-issue-row tracked-issue-' + escapeHtml(issue.status) + '">' +
+                '<td>' + statusBadge + '</td>' +
+                '<td><span class="issue-id">' + escapeHtml(issue.id) + '</span></td>' +
+                '<td class="tracked-issue-title">' + escapeHtml(issue.title) + '</td>' +
+                '<td class="tracked-issue-assignee">' + escapeHtml(assignee) + '</td>' +
+                '<td class="tracked-issue-progress">' + progress + '</td>' +
+                '</tr>';
+        }
+
+        html += '</tbody></table>';
+
+        // Progress summary
+        var completed = data.completed || 0;
+        var total = data.total || issues.length;
+        var pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+        html += '<div class="tracked-issues-summary">';
+        html += '<div class="tracked-issues-progress-bar"><div class="tracked-issues-progress-fill" style="width: ' + pct + '%;"></div></div>';
+        html += '<span class="tracked-issues-progress-text">' + completed + '/' + total + ' completed (' + pct + '%)</span>';
+        html += '</div>';
+
+        html += '</div>';
+        cell.innerHTML = html;
+    }
 
 })();

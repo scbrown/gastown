@@ -259,20 +259,20 @@ func runLiveCosts() error {
 	var costs []SessionCost
 	var total float64
 
-	for _, session := range sessions {
-		// Only process Gas Town sessions (start with "gt-")
-		if !strings.HasPrefix(session, constants.SessionPrefix) {
+	for _, sess := range sessions {
+		// Only process Gas Town sessions
+		if !session.IsKnownSession(sess) {
 			continue
 		}
 
 		// Parse session name to get role/rig/worker
-		role, rig, worker := parseSessionName(session)
+		role, rig, worker := parseSessionName(sess)
 
 		// Get working directory of the session
-		workDir, err := getTmuxSessionWorkDir(session)
+		workDir, err := getTmuxSessionWorkDir(sess)
 		if err != nil {
 			if costsVerbose {
-				fmt.Fprintf(os.Stderr, "[costs] could not get workdir for %s: %v\n", session, err)
+				fmt.Fprintf(os.Stderr, "[costs] could not get workdir for %s: %v\n", sess, err)
 			}
 			continue
 		}
@@ -281,17 +281,17 @@ func runLiveCosts() error {
 		cost, err := extractCostFromWorkDir(workDir)
 		if err != nil {
 			if costsVerbose {
-				fmt.Fprintf(os.Stderr, "[costs] could not extract cost for %s: %v\n", session, err)
+				fmt.Fprintf(os.Stderr, "[costs] could not extract cost for %s: %v\n", sess, err)
 			}
 			// Still include the session with zero cost
 			cost = 0.0
 		}
 
 		// Check if an agent appears to be running
-		running := t.IsAgentRunning(session)
+		running := t.IsAgentRunning(sess)
 
 		costs = append(costs, SessionCost{
-			Session: session,
+			Session: sess,
 			Role:    role,
 			Rig:     rig,
 			Worker:  worker,
@@ -633,8 +633,20 @@ func queryDigestBeads(days int) ([]CostEntry, error) {
 			continue
 		}
 
-		// Extract individual session entries from the digest
-		entries = append(entries, digest.Sessions...)
+		// If the digest has per-session data (old format), use it directly.
+		// Otherwise, synthesize entries from the aggregate ByRole data.
+		if len(digest.Sessions) > 0 {
+			entries = append(entries, digest.Sessions...)
+		} else {
+			for role, cost := range digest.ByRole {
+				entries = append(entries, CostEntry{
+					SessionID: fmt.Sprintf("digest-%s-%s", digest.Date, role),
+					Role:      role,
+					CostUSD:   cost,
+					EndedAt:   digestDate,
+				})
+			}
+		}
 	}
 
 	return entries, nil
@@ -1044,40 +1056,50 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 }
 
 // deriveSessionName derives the tmux session name from GT_* environment variables.
-// Session naming patterns:
-//   - Polecats: gt-{rig}-{polecat} (e.g., gt-gastown-toast)
-//   - Crew: gt-{rig}-crew-{crew} (e.g., gt-gastown-crew-max)
-//   - Witness/Refinery: gt-{rig}-{role} (e.g., gt-gastown-witness)
-//   - Mayor/Deacon: gt-{town}-{role} (e.g., gt-ai-mayor)
+// Uses session.* helpers for canonical naming. Parses GT_ROLE via parseRoleString
+// so compound forms (e.g. "gastown/witness") resolve to their canonical session names.
 func deriveSessionName() string {
 	role := os.Getenv("GT_ROLE")
 	rig := os.Getenv("GT_RIG")
 	polecat := os.Getenv("GT_POLECAT")
 	crew := os.Getenv("GT_CREW")
-	town := os.Getenv("GT_TOWN")
 
-	// Polecat: gt-{rig}-{polecat}
+	// Parse GT_ROLE once to handle both bare and compound forms.
+	parsedRole, _, parsedName := parseRoleString(role)
+
+	// Polecat: {prefix}-{polecat}
+	// Gate on GT_ROLE: coordinators may have stale GT_POLECAT from spawning polecats.
 	if polecat != "" && rig != "" {
-		return fmt.Sprintf("gt-%s-%s", rig, polecat)
-	}
-
-	// Crew: gt-{rig}-crew-{crew}
-	if crew != "" && rig != "" {
-		return fmt.Sprintf("gt-%s-crew-%s", rig, crew)
-	}
-
-	// Town-level roles (mayor, deacon): gt-{town}-{role} or gt-{role}
-	if role == "mayor" || role == "deacon" {
-		if town != "" {
-			return fmt.Sprintf("gt-%s-%s", town, role)
+		if role == "" || parsedRole == RolePolecat {
+			return session.PolecatSessionName(session.PrefixFor(rig), polecat)
 		}
-		// No town set - use simple gt-{role} pattern
-		return fmt.Sprintf("gt-%s", role)
 	}
 
-	// Rig-based roles (witness, refinery): gt-{rig}-{role}
-	if role != "" && rig != "" {
-		return fmt.Sprintf("gt-%s-%s", rig, role)
+	// Crew: {prefix}-crew-{crew} (from GT_CREW or parsed compound role)
+	if parsedRole == RoleCrew && parsedName != "" && rig != "" {
+		return session.CrewSessionName(session.PrefixFor(rig), parsedName)
+	}
+	if crew != "" && rig != "" {
+		return session.CrewSessionName(session.PrefixFor(rig), crew)
+	}
+
+	// Town-level roles (mayor, deacon)
+	if parsedRole == RoleMayor {
+		return session.MayorSessionName()
+	}
+	if parsedRole == RoleDeacon {
+		return session.DeaconSessionName()
+	}
+
+	// Rig-based roles (witness, refinery): {prefix}-{role}
+	if rig != "" {
+		prefix := session.PrefixFor(rig)
+		switch parsedRole {
+		case RoleWitness:
+			return session.WitnessSessionName(prefix)
+		case RoleRefinery:
+			return session.RefinerySessionName(prefix)
+		}
 	}
 
 	return ""
@@ -1108,7 +1130,17 @@ type CostDigest struct {
 	Date         string             `json:"date"`
 	TotalUSD     float64            `json:"total_usd"`
 	SessionCount int                `json:"session_count"`
-	Sessions     []CostEntry        `json:"sessions"`
+	Sessions     []CostEntry        `json:"sessions,omitempty"`
+	ByRole       map[string]float64 `json:"by_role"`
+	ByRig        map[string]float64 `json:"by_rig,omitempty"`
+}
+
+// CostDigestPayload is the compact payload stored in the bead.
+// It excludes per-session details to avoid exceeding Dolt column size limits.
+type CostDigestPayload struct {
+	Date         string             `json:"date"`
+	TotalUSD     float64            `json:"total_usd"`
+	SessionCount int                `json:"session_count"`
 	ByRole       map[string]float64 `json:"by_role"`
 	ByRig        map[string]float64 `json:"by_rig,omitempty"`
 }
@@ -1283,8 +1315,16 @@ func createCostDigestBead(digest CostDigest) (string, error) {
 		desc.WriteString("\n")
 	}
 
-	// Build payload JSON with full session details
-	payloadJSON, err := json.Marshal(digest)
+	// Build compact payload (aggregate only, no per-session details).
+	// Per-session details can be thousands of records and exceed Dolt column limits.
+	compactPayload := CostDigestPayload{
+		Date:         digest.Date,
+		TotalUSD:     digest.TotalUSD,
+		SessionCount: digest.SessionCount,
+		ByRole:       digest.ByRole,
+		ByRig:        digest.ByRig,
+	}
+	payloadJSON, err := json.Marshal(compactPayload)
 	if err != nil {
 		return "", fmt.Errorf("marshaling digest payload: %w", err)
 	}

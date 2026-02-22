@@ -257,12 +257,13 @@ func detectRole(cwd, townRoot string) RoleInfo {
 	relPath = filepath.ToSlash(relPath)
 	parts := strings.Split(relPath, "/")
 
-	// Check for mayor role
-	// At town root, or in mayor/ or mayor/rig/
+	// Town root is a neutral location — don't infer any role from it.
+	// The mayor's actual home is mayor/ (matched below).
 	if relPath == "." || relPath == "" {
-		ctx.Role = RoleMayor
 		return ctx
 	}
+
+	// Check for mayor role: mayor/ or mayor/rig/
 	if len(parts) >= 1 && parts[0] == "mayor" {
 		ctx.Role = RoleMayor
 		return ctx
@@ -377,6 +378,7 @@ func parseRoleString(s string) (Role, string, string) {
 // ActorString returns the actor identity string for beads attribution.
 // Format matches beads created_by convention:
 //   - Simple roles: "mayor", "deacon"
+//   - Dog roles: "deacon-boot" (hyphenated, matching BD_ACTOR)
 //   - Rig-specific: "gastown/witness", "gastown/refinery"
 //   - Workers: "gastown/crew/max", "gastown/polecats/Toast"
 func (info RoleInfo) ActorString() string {
@@ -405,6 +407,8 @@ func (info RoleInfo) ActorString() string {
 			return fmt.Sprintf("%s/crew/%s", info.Rig, info.Polecat)
 		}
 		return "crew"
+	case RoleBoot:
+		return "deacon-boot"
 	default:
 		return string(info.Role)
 	}

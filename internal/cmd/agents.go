@@ -48,6 +48,14 @@ var AgentTypeColors = map[AgentType]string{
 	AgentPolecat:  "#[fg=white,dim]",
 }
 
+// rigTypeOrder defines the display order of rig-level agent types.
+var rigTypeOrder = map[AgentType]int{
+	AgentRefinery: 0,
+	AgentWitness:  1,
+	AgentCrew:     2,
+	AgentPolecat:  3,
+}
+
 // AgentTypeIcons maps agent types to display icons.
 // Uses centralized emojis from constants package.
 var AgentTypeIcons = map[AgentType]string{
@@ -63,14 +71,14 @@ var agentsCmd = &cobra.Command{
 	Use:     "agents",
 	Aliases: []string{"ag"},
 	GroupID: GroupAgents,
-	Short:   "Switch between Gas Town agent sessions",
-	Long: `Display a popup menu of core Gas Town agent sessions.
+	Short:   "List Gas Town agent sessions",
+	Long: `List Gas Town agent sessions to stdout.
 
 Shows Mayor, Deacon, Witnesses, Refineries, and Crew workers.
 Polecats are hidden (use 'gt polecat list' to see them).
 
-The menu appears as a tmux popup for quick session switching.`,
-	RunE: runAgents,
+Use 'gt agents menu' for an interactive tmux popup menu.`,
+	RunE: runAgentsList,
 }
 
 var agentsListCmd = &cobra.Command{
@@ -78,6 +86,13 @@ var agentsListCmd = &cobra.Command{
 	Short: "List agent sessions (no popup)",
 	Long:  `List all agent sessions to stdout without the popup menu.`,
 	RunE:  runAgentsList,
+}
+
+var agentsMenuCmd = &cobra.Command{
+	Use:   "menu",
+	Short: "Interactive popup menu for session switching",
+	Long:  `Display a tmux popup menu of Gas Town agent sessions for quick switching.`,
+	RunE:  runAgents,
 }
 
 var agentsCheckCmd = &cobra.Command{
@@ -121,6 +136,7 @@ func init() {
 	agentsCheckCmd.Flags().BoolVar(&agentsCheckJSON, "json", false, "Output as JSON")
 
 	agentsCmd.AddCommand(agentsListCmd)
+	agentsCmd.AddCommand(agentsMenuCmd)
 	agentsCmd.AddCommand(agentsCheckCmd)
 	agentsCmd.AddCommand(agentsFixCmd)
 	rootCmd.AddCommand(agentsCmd)
@@ -151,6 +167,8 @@ func categorizeSession(name string) *AgentSession {
 		sess.Type = AgentCrew
 	case session.RolePolecat:
 		sess.Type = AgentPolecat
+	case session.RoleOverseer:
+		return nil // overseer is the human operator, not a display agent
 	default:
 		return nil
 	}
@@ -165,14 +183,22 @@ func getAgentSessions(includePolecats bool) ([]*AgentSession, error) {
 	if err != nil {
 		return nil, err
 	}
+	return filterAndSortSessions(sessions, includePolecats), nil
+}
 
+// filterAndSortSessions filters raw session names into categorized, sorted agents.
+func filterAndSortSessions(sessionNames []string, includePolecats bool) []*AgentSession {
 	var agents []*AgentSession
-	for _, name := range sessions {
+	for _, name := range sessionNames {
 		agent := categorizeSession(name)
 		if agent == nil {
 			continue
 		}
 		if agent.Type == AgentPolecat && !includePolecats {
+			continue
+		}
+		// Skip boot sessions (utility session, not a user-facing agent)
+		if agent.Name == session.BootSessionName() {
 			continue
 		}
 		agents = append(agents, agent)
@@ -202,21 +228,15 @@ func getAgentSessions(includePolecats bool) ([]*AgentSession, error) {
 		}
 
 		// Within rig: refinery, witness, crew, polecat
-		typeOrder := map[AgentType]int{
-			AgentRefinery: 0,
-			AgentWitness:  1,
-			AgentCrew:     2,
-			AgentPolecat:  3,
-		}
-		if typeOrder[a.Type] != typeOrder[b.Type] {
-			return typeOrder[a.Type] < typeOrder[b.Type]
+		if rigTypeOrder[a.Type] != rigTypeOrder[b.Type] {
+			return rigTypeOrder[a.Type] < rigTypeOrder[b.Type]
 		}
 
 		// Same type: alphabetical by agent name
 		return a.AgentName < b.AgentName
 	})
 
-	return agents, nil
+	return agents
 }
 
 // displayLabel returns the menu display label for an agent.
@@ -468,10 +488,10 @@ func buildCollisionReport(townRoot string) (*CollisionReport, error) {
 		sessions = []string{} // Continue even if tmux not running
 	}
 
-	// Filter to gt- sessions
+	// Filter to Gas Town sessions
 	var gtSessions []string
 	for _, s := range sessions {
-		if strings.HasPrefix(s, "gt-") {
+		if session.IsKnownSession(s) {
 			gtSessions = append(gtSessions, s)
 		}
 	}
@@ -543,9 +563,13 @@ func guessSessionFromWorkerDir(workerDir, townRoot string) string {
 
 	switch workerType {
 	case "crew":
-		return fmt.Sprintf("gt-%s-crew-%s", rig, workerName)
+		return session.CrewSessionName(session.PrefixFor(rig), workerName)
 	case "polecats":
-		return fmt.Sprintf("gt-%s-%s", rig, workerName)
+		return session.PolecatSessionName(session.PrefixFor(rig), workerName)
+	case "witness":
+		return session.WitnessSessionName(session.PrefixFor(rig))
+	case "refinery":
+		return session.RefinerySessionName(session.PrefixFor(rig))
 	}
 
 	return ""
