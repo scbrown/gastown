@@ -150,6 +150,11 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		style.PrintWarning("could not update refinery .gitignore: %v", err)
 	}
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	// Without this, auth fails on new sessions that don't inherit tmux global env.
+	accountsPath := constants.MayorAccountsPath(townRoot)
+	claudeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("refinery", "", m.rig.Name),
 		Sender:    "deacon",
@@ -168,6 +173,11 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
+	// Prepend runtime config dir env to startup command so the initial process inherits it.
+	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && claudeConfigDir != "" {
+		command = config.PrependEnv(command, map[string]string{runtimeConfig.Session.ConfigDirEnv: claudeConfigDir})
+	}
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := t.NewSessionWithCommand(sessionID, refineryRigDir, command); err != nil {
@@ -177,10 +187,11 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "refinery",
-		Rig:      m.rig.Name,
-		TownRoot: townRoot,
-		Agent:    agentOverride,
+		Role:             "refinery",
+		Rig:              m.rig.Name,
+		TownRoot:         townRoot,
+		Agent:            agentOverride,
+		RuntimeConfigDir: claudeConfigDir,
 	})
 
 	// Add refinery-specific flag

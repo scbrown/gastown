@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -102,14 +103,19 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 	}
 	instructions := fmt.Sprintf("I am Dog %s.%s Check mail for work: `"+cli.Name()+" mail inbox`. Execute assigned formula/bead. When done, send DOG_DONE mail to deacon/, run `"+cli.Name()+" dog done`, then exit the session. Do NOT idle at the prompt after completing work.", dogName, workInfo)
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	accountsPath := constants.MayorAccountsPath(m.townRoot)
+	claudeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+
 	// Use unified session lifecycle.
 	theme := tmux.DogTheme()
 	_, err = session.StartSession(m.tmux, session.SessionConfig{
-		SessionID: sessionID,
-		WorkDir:   kennelDir,
-		Role:      "dog",
-		TownRoot:  m.townRoot,
-		AgentName: dogName,
+		SessionID:        sessionID,
+		WorkDir:          kennelDir,
+		Role:             "dog",
+		TownRoot:         m.townRoot,
+		AgentName:        dogName,
+		RuntimeConfigDir: claudeConfigDir,
 		Beacon: session.BeaconConfig{
 			Recipient: session.BeaconRecipient("dog", dogName, ""),
 			Sender:    "deacon",

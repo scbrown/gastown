@@ -93,6 +93,11 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("creating deacon directory: %w", err)
 	}
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	// Without this, auth fails on new sessions that don't inherit tmux global env.
+	accountsPath := constants.MayorAccountsPath(m.townRoot)
+	claudeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+
 	// Ensure runtime settings exist in deaconDir where session runs.
 	runtimeConfig := config.ResolveRoleAgentConfig("deacon", m.townRoot, deaconDir)
 	if err := runtime.EnsureSettingsForRole(deaconDir, deaconDir, "deacon", runtimeConfig); err != nil {
@@ -115,6 +120,11 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
+	// Prepend runtime config dir env to startup command so the initial process inherits it.
+	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && claudeConfigDir != "" {
+		startupCmd = config.PrependEnv(startupCmd, map[string]string{runtimeConfig.Session.ConfigDirEnv: claudeConfigDir})
+	}
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := t.NewSessionWithCommand(sessionID, deaconDir, startupCmd); err != nil {
@@ -129,9 +139,10 @@ func (m *Manager) Start(agentOverride string) error {
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "deacon",
-		TownRoot: m.townRoot,
-		Agent:    agentOverride,
+		Role:             "deacon",
+		TownRoot:         m.townRoot,
+		Agent:            agentOverride,
+		RuntimeConfigDir: claudeConfigDir,
 	})
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)

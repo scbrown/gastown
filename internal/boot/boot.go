@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -178,12 +179,17 @@ func (b *Boot) spawnTmux(agentOverride string) error {
 		return fmt.Errorf("ensuring boot dir: %w", err)
 	}
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	accountsPath := constants.MayorAccountsPath(b.townRoot)
+	claudeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+
 	// Use unified session lifecycle for config → settings → command → create → env.
 	_, err := session.StartSession(b.tmux, session.SessionConfig{
-		SessionID: session.BootSessionName(),
-		WorkDir:   b.bootDir,
-		Role:      "boot",
-		TownRoot:  b.townRoot,
+		SessionID:        session.BootSessionName(),
+		WorkDir:          b.bootDir,
+		Role:             "boot",
+		TownRoot:         b.townRoot,
+		RuntimeConfigDir: claudeConfigDir,
 		Beacon: session.BeaconConfig{
 			Recipient: "boot",
 			Sender:    "daemon",
@@ -203,10 +209,15 @@ func (b *Boot) spawnDegraded() error {
 	cmd := exec.Command("gt", "boot", "triage", "--degraded")
 	cmd.Dir = b.deaconDir
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	degradedAccountsPath := constants.MayorAccountsPath(b.townRoot)
+	degradedConfigDir, _, _ := config.ResolveAccountConfigDir(degradedAccountsPath, "")
+
 	// Use centralized AgentEnv for consistency with tmux mode
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "boot",
-		TownRoot: b.townRoot,
+		Role:             "boot",
+		TownRoot:         b.townRoot,
+		RuntimeConfigDir: degradedConfigDir,
 	})
 	cmd.Env = config.EnvForExecCommand(envVars)
 	cmd.Env = append(cmd.Env, "GT_DEGRADED=true")

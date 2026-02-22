@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -64,14 +66,20 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("creating mayor directory: %w", err)
 	}
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	// Without this, auth fails on new sessions that don't inherit tmux global env.
+	accountsPath := constants.MayorAccountsPath(m.townRoot)
+	claudeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+
 	// Use unified session lifecycle for config → settings → command → create → env → theme → wait.
 	theme := tmux.MayorTheme()
 	_, err = session.StartSession(t, session.SessionConfig{
-		SessionID: sessionID,
-		WorkDir:   mayorDir,
-		Role:      "mayor",
-		TownRoot:  m.townRoot,
-		AgentName: "Mayor",
+		SessionID:        sessionID,
+		WorkDir:          mayorDir,
+		Role:             "mayor",
+		TownRoot:         m.townRoot,
+		AgentName:        "Mayor",
+		RuntimeConfigDir: claudeConfigDir,
 		Beacon: session.BeaconConfig{
 			Recipient: "mayor",
 			Sender:    "human",

@@ -149,6 +149,11 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		style.PrintWarning("could not update witness .gitignore: %v", err)
 	}
 
+	// Resolve account config dir for CLAUDE_CONFIG_DIR (gt-ae209).
+	// Without this, auth fails on new sessions that don't inherit tmux global env.
+	accountsPath := constants.MayorAccountsPath(townRoot)
+	claudeConfigDir, _, _ := config.ResolveAccountConfigDir(accountsPath, "")
+
 	roleConfig, err := m.roleConfig()
 	if err != nil {
 		return err
@@ -163,6 +168,11 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		return err
 	}
 
+	// Prepend runtime config dir env to startup command so the initial process inherits it.
+	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && claudeConfigDir != "" {
+		command = config.PrependEnv(command, map[string]string{runtimeConfig.Session.ConfigDirEnv: claudeConfigDir})
+	}
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := t.NewSessionWithCommand(sessionID, witnessDir, command); err != nil {
@@ -172,10 +182,11 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "witness",
-		Rig:      m.rig.Name,
-		TownRoot: townRoot,
-		Agent:    agentOverride,
+		Role:             "witness",
+		Rig:              m.rig.Name,
+		TownRoot:         townRoot,
+		Agent:            agentOverride,
+		RuntimeConfigDir: claudeConfigDir,
 	})
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
