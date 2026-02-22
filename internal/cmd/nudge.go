@@ -354,6 +354,17 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			// Extract crew name and use crew session naming
 			crewName := strings.TrimPrefix(polecatName, "crew/")
 			sessionName = crewSessionName(rigName, crewName)
+
+			// If not found on default socket, discover across all tmux sockets.
+			// Crew members may run in alternative tmux servers (e.g., shanty).
+			if exists, _ := t.HasSession(sessionName); !exists {
+				if sock, foundSess, err := tmux.DiscoverSession(sessionName); err == nil {
+					sessionName = foundSess
+					if sock != "" {
+						t = tmux.NewTmuxWithSocket(sock)
+					}
+				}
+			}
 		} else if strings.HasPrefix(polecatName, "polecats/") {
 			// Explicit polecat address (e.g., "vastal/polecats/furiosa").
 			// Bypasses crew-first resolution for short addresses.
@@ -371,11 +382,20 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			if exists, _ := t.HasSession(crewSession); exists {
 				sessionName = crewSession
 			} else {
-				mgr, _, err := getSessionManager(rigName)
-				if err != nil {
-					return err
+				// Try discovering crew session across all tmux sockets
+				// before falling back to polecat resolution.
+				if sock, foundSess, err := tmux.DiscoverSession(crewSession); err == nil {
+					sessionName = foundSess
+					if sock != "" {
+						t = tmux.NewTmuxWithSocket(sock)
+					}
+				} else {
+					mgr, _, err := getSessionManager(rigName)
+					if err != nil {
+						return err
+					}
+					sessionName = mgr.SessionName(polecatName)
 				}
-				sessionName = mgr.SessionName(polecatName)
 			}
 		}
 

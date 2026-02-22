@@ -57,19 +57,33 @@ func validateSessionName(name string) error {
 }
 
 // Tmux wraps tmux operations.
-type Tmux struct{}
+// When Socket is set, all commands use -L <socket> to target that tmux server.
+type Tmux struct {
+	Socket string // tmux socket name (empty = default server)
+}
 
-// NewTmux creates a new Tmux wrapper.
+// NewTmux creates a new Tmux wrapper using the default tmux server.
 func NewTmux() *Tmux {
 	return &Tmux{}
+}
+
+// NewTmuxWithSocket creates a Tmux wrapper targeting a specific tmux socket.
+// Use this to interact with sessions on non-default servers (e.g., shanty).
+func NewTmuxWithSocket(socket string) *Tmux {
+	return &Tmux{Socket: socket}
 }
 
 // run executes a tmux command and returns stdout.
 // All commands include -u flag for UTF-8 support regardless of locale settings.
 // See: https://github.com/steveyegge/gastown/issues/1219
 func (t *Tmux) run(args ...string) (string, error) {
-	// Prepend -u flag for UTF-8 mode (PATCH-004)
-	allArgs := append([]string{"-u"}, args...)
+	// Build flags: -u for UTF-8 (PATCH-004), -L for socket if set
+	var flags []string
+	if t.Socket != "" {
+		flags = append(flags, "-L", t.Socket)
+	}
+	flags = append(flags, "-u")
+	allArgs := append(flags, args...)
 	cmd := exec.Command("tmux", allArgs...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -639,6 +653,66 @@ func (t *Tmux) ListSessions() ([]string, error) {
 	}
 
 	return strings.Split(out, "\n"), nil
+}
+
+// DiscoverSession searches for a session across all tmux sockets on the system.
+// Returns the socket name and actual session name if found on a non-default socket.
+// This handles cases where agents run in alternative tmux servers (e.g., shanty).
+//
+// Search order:
+//  1. Default tmux server (empty socket)
+//  2. All sockets in /tmp/tmux-<uid>/ except "default"
+//
+// For each socket, it checks for the exact session name first, then falls back
+// to a suffix match (e.g., looking for "hammond" matches "shanty-hammond").
+// Returns ("", "", ErrSessionNotFound) if no match found on any socket.
+func DiscoverSession(sessionName string) (socket, foundSession string, err error) {
+	// 1. Try default socket first
+	defaultTmux := NewTmux()
+	if exists, _ := defaultTmux.HasSession(sessionName); exists {
+		return "", sessionName, nil
+	}
+
+	// 2. Scan alternative sockets
+	uid := os.Getuid()
+	tmuxDir := fmt.Sprintf("/tmp/tmux-%d", uid)
+	entries, err := os.ReadDir(tmuxDir)
+	if err != nil {
+		return "", "", ErrSessionNotFound
+	}
+
+	// Extract the base name we're searching for (e.g., "hammond" from "aegis-crew-hammond")
+	baseName := sessionName
+	if idx := strings.LastIndex(sessionName, "-"); idx >= 0 {
+		baseName = sessionName[idx+1:]
+	}
+
+	for _, entry := range entries {
+		sockName := entry.Name()
+		if sockName == "default" {
+			continue // already checked
+		}
+
+		altTmux := NewTmuxWithSocket(sockName)
+
+		// Try exact match first
+		if exists, _ := altTmux.HasSession(sessionName); exists {
+			return sockName, sessionName, nil
+		}
+
+		// Try suffix match: look for sessions ending in the base name
+		sessions, err := altTmux.ListSessions()
+		if err != nil {
+			continue
+		}
+		for _, sess := range sessions {
+			if strings.HasSuffix(sess, "-"+baseName) || sess == baseName {
+				return sockName, sess, nil
+			}
+		}
+	}
+
+	return "", "", ErrSessionNotFound
 }
 
 // SessionSet provides O(1) session existence checks by caching session names.
