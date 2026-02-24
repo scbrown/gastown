@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 // hookTestCounter generates unique prefixes for each hook test to isolate
@@ -80,6 +81,18 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 	}
 
 	return townRoot, polecatDir, rigPrefix
+}
+
+// initBeadsDB initializes the beads database by running bd init on the test server.
+func initBeadsDB(t *testing.T, dir string) {
+	t.Helper()
+	testutil.RequireDoltServer(t)
+
+	cmd := exec.Command("bd", "init", "--server-port", testutil.DoltTestPort())
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd init failed: %v\n%s", err, output)
+	}
 }
 
 // TestHookSlot_BasicHook verifies that a bead can be hooked to an agent.
