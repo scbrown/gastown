@@ -298,10 +298,11 @@ func formatDailyDigest(report *compactReport) string {
 func sendCompactDigest(dateStr, body string) error {
 	subject := fmt.Sprintf("Wisp Compaction: %s", dateStr)
 
-	mailCmd := exec.Command("gt", "mail", "send", "deacon/",
+	// Send to mayor/ only — deacon/ is not a valid mail address (audit bead
+	// serves as the deacon-side record).
+	mailCmd := exec.Command("gt", "mail", "send", "mayor/",
 		"-s", subject,
 		"-m", body,
-		"--cc", "mayor/",
 	)
 	mailCmd.Stdout = os.Stdout
 	mailCmd.Stderr = os.Stderr
