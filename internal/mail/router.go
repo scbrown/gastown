@@ -754,7 +754,7 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 	// Filter for active agents (closed/deleted agents are inactive)
 	var active []*agentBead
 	for _, agent := range agents {
-		if agent.Status == "open" || agent.Status == "in_progress" || agent.Status == "hooked" {
+		if agent.Status == "open" || agent.Status == "in_progress" || agent.Status == "hooked" || agent.Status == "pinned" {
 			active = append(active, agent)
 		}
 	}
@@ -901,6 +901,7 @@ func (r *Router) validateRecipient(identity string) error {
 		townBeadsDir := filepath.Join(r.townRoot, ".beads")
 		routes, err := beads.LoadRoutes(townBeadsDir)
 		if err == nil {
+			var queryErrors []string
 			for _, route := range routes {
 				// Skip hq- routes (town-level, already queried)
 				if strings.HasPrefix(route.Prefix, "hq-") {
@@ -909,13 +910,17 @@ func (r *Router) validateRecipient(identity string) error {
 				rigBeadsDir := filepath.Join(r.townRoot, route.Path, ".beads")
 				rigAgents, err := r.queryAgentsFromDir(rigBeadsDir)
 				if err != nil {
-					continue // Skip rigs with errors
+					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", route.Path, err))
+					continue
 				}
 				for _, agent := range rigAgents {
 					if agentBeadToAddress(agent) == identity {
 						return nil // Found matching agent
 					}
 				}
+			}
+			if len(queryErrors) > 0 {
+				return fmt.Errorf("no agent found (query errors: %s)", strings.Join(queryErrors, "; "))
 			}
 		}
 	}
