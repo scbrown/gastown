@@ -243,20 +243,48 @@ func TestSymlinkSessionToCurrentAccount(t *testing.T) {
 		}
 	})
 
-	t.Run("returns nil cleanup for session in current account", func(t *testing.T) {
+	t.Run("returns nil cleanup for session in current account same project", func(t *testing.T) {
 		townRoot, fakeHome, cleanup := setupSeanceTestEnv(t)
 		defer cleanup()
 
-		// Create session in account1 (the current account)
+		// Create session in account1 (the current account) using cwd-based project dir
+		cwd, _ := os.Getwd()
+		cwdProjectDir := strings.ReplaceAll(cwd, "/", "-")
 		account1Dir := filepath.Join(fakeHome, "claude-config-account1")
-		createTestSession(t, account1Dir, "local-project", "session-local456")
+		createTestSession(t, account1Dir, cwdProjectDir, "session-local456")
 
 		cleanupFn, err := symlinkSessionToCurrentAccount(townRoot, "session-local456")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if cleanupFn != nil {
-			t.Error("expected nil cleanup for session in current account")
+			t.Error("expected nil cleanup for session in current account and project dir")
+		}
+	})
+
+	t.Run("symlinks session from different project dir in same account", func(t *testing.T) {
+		townRoot, fakeHome, cleanup := setupSeanceTestEnv(t)
+		defer cleanup()
+
+		// Create session in account1 but with a different project dir
+		account1Dir := filepath.Join(fakeHome, "claude-config-account1")
+		createTestSession(t, account1Dir, "other-project", "session-crossproj789")
+
+		cleanupFn, err := symlinkSessionToCurrentAccount(townRoot, "session-crossproj789")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cleanupFn == nil {
+			t.Fatal("expected non-nil cleanup for cross-project-dir session")
+		}
+		defer cleanupFn()
+
+		// Verify symlink was created in cwd-based project dir
+		cwd, _ := os.Getwd()
+		cwdProjectDir := strings.ReplaceAll(cwd, "/", "-")
+		symlinkPath := filepath.Join(account1Dir, "projects", cwdProjectDir, "session-crossproj789.jsonl")
+		if _, err := os.Lstat(symlinkPath); err != nil {
+			t.Errorf("expected symlink at %s: %v", symlinkPath, err)
 		}
 	})
 

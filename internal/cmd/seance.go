@@ -426,62 +426,86 @@ func findSessionLocation(townRoot, sessionID string) *sessionLocation {
 	// Load accounts config
 	accountsPath := constants.MayorAccountsPath(townRoot)
 	cfg, err := config.LoadAccountsConfig(accountsPath)
-	if err != nil {
-		return nil
-	}
-
-	// Search each account's config directory
-	for _, acct := range cfg.Accounts {
-		if acct.ConfigDir == "" {
-			continue
-		}
-
-		// Expand ~ in path
-		configDir := acct.ConfigDir
-		if strings.HasPrefix(configDir, "~/") {
-			home, _ := os.UserHomeDir()
-			configDir = filepath.Join(home, configDir[2:])
-		}
-
-		// Search all sessions-index.json files in this account
-		projectsDir := filepath.Join(configDir, "projects")
-		if _, err := os.Stat(projectsDir); os.IsNotExist(err) {
-			continue
-		}
-
-		// Walk through project directories
-		entries, err := os.ReadDir(projectsDir)
-		if err != nil {
-			continue
-		}
-
-		for _, entry := range entries {
-			if !entry.IsDir() {
+	if err == nil {
+		// Search each account's config directory
+		for _, acct := range cfg.Accounts {
+			if acct.ConfigDir == "" {
 				continue
 			}
 
-			indexPath := filepath.Join(projectsDir, entry.Name(), "sessions-index.json")
-			if _, err := os.Stat(indexPath); os.IsNotExist(err) {
+			// Expand ~ in path
+			configDir := acct.ConfigDir
+			if strings.HasPrefix(configDir, "~/") {
+				home, _ := os.UserHomeDir()
+				configDir = filepath.Join(home, configDir[2:])
+			}
+
+			// Search all sessions-index.json files in this account
+			projectsDir := filepath.Join(configDir, "projects")
+			if _, err := os.Stat(projectsDir); os.IsNotExist(err) {
 				continue
 			}
 
-			// Read and parse the sessions index
-			data, err := os.ReadFile(indexPath)
+			// Walk through project directories
+			entries, err := os.ReadDir(projectsDir)
 			if err != nil {
 				continue
 			}
 
-			var index sessionsIndex
-			if err := json.Unmarshal(data, &index); err != nil {
-				continue
-			}
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
 
-			// Check if this index contains our session
-			for _, rawEntry := range index.Entries {
-				var e sessionsIndexEntry
-				if json.Unmarshal(rawEntry, &e) == nil && e.SessionID == sessionID {
+				indexPath := filepath.Join(projectsDir, entry.Name(), "sessions-index.json")
+				if _, err := os.Stat(indexPath); os.IsNotExist(err) {
+					continue
+				}
+
+				// Read and parse the sessions index
+				data, err := os.ReadFile(indexPath)
+				if err != nil {
+					continue
+				}
+
+				var index sessionsIndex
+				if err := json.Unmarshal(data, &index); err != nil {
+					continue
+				}
+
+				// Check if this index contains our session
+				for _, rawEntry := range index.Entries {
+					var e sessionsIndexEntry
+					if json.Unmarshal(rawEntry, &e) == nil && e.SessionID == sessionID {
+						return &sessionLocation{
+							configDir:  configDir,
+							projectDir: entry.Name(),
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback: direct scan of ~/.claude/projects/ for single-account setups
+	// where accounts.json is missing or yields no results
+	home, homeErr := os.UserHomeDir()
+	if homeErr == nil {
+		claudeDir := filepath.Join(home, ".claude")
+		resolved, evalErr := filepath.EvalSymlinks(claudeDir)
+		if evalErr != nil {
+			resolved = claudeDir
+		}
+		fallbackProjectsDir := filepath.Join(resolved, "projects")
+		if fallbackEntries, readErr := os.ReadDir(fallbackProjectsDir); readErr == nil {
+			for _, entry := range fallbackEntries {
+				if !entry.IsDir() {
+					continue
+				}
+				sessionFile := filepath.Join(fallbackProjectsDir, entry.Name(), sessionID+".jsonl")
+				if _, statErr := os.Stat(sessionFile); statErr == nil {
 					return &sessionLocation{
-						configDir:  configDir,
+						configDir:  resolved,
 						projectDir: entry.Name(),
 					}
 				}
@@ -522,9 +546,33 @@ func symlinkSessionToConfigDir(townRoot, sessionID, targetConfigDir string) (cle
 		return nil, fmt.Errorf("session not found in any account")
 	}
 
-	// If session is already in the target account, nothing to do
-	if loc.configDir == targetConfigDir {
-		return nil, nil
+	// Session in same account but possibly different project dir.
+	// Symlink into cwd-based project dir so Claude can find it via --resume.
+	// Resolve both paths to handle macOS /var → /private/var symlink differences.
+	resolvedLocDir, _ := filepath.EvalSymlinks(loc.configDir)
+	resolvedTargetDir, _ := filepath.EvalSymlinks(targetConfigDir)
+	if resolvedLocDir == resolvedTargetDir {
+		cwd, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			return nil, nil
+		}
+		cwdProjectDir := strings.ReplaceAll(cwd, "/", "-")
+		if cwdProjectDir == loc.projectDir {
+			return nil, nil // Already in correct project dir
+		}
+		sourceFile := filepath.Join(targetConfigDir, "projects", loc.projectDir, sessionID+".jsonl")
+		targetDir := filepath.Join(targetConfigDir, "projects", cwdProjectDir)
+		if mkErr := os.MkdirAll(targetDir, 0755); mkErr != nil {
+			return nil, nil
+		}
+		targetFile := filepath.Join(targetDir, sessionID+".jsonl")
+		if _, lstatErr := os.Lstat(targetFile); lstatErr == nil {
+			return nil, nil // Already exists
+		}
+		if symlinkErr := os.Symlink(sourceFile, targetFile); symlinkErr != nil {
+			return nil, nil
+		}
+		return func() { _ = os.Remove(targetFile) }, nil
 	}
 
 	// Source: the session file in the other account
