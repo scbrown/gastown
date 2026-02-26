@@ -781,7 +781,7 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	}
 
 	// Parse agent fields from description for role/state info
-	fields := beads.ParseAgentFieldsFromDescription(issue.Description)
+	fields := beads.ParseAgentFields(issue.Description)
 
 	info := &AgentBeadInfo{
 		ID:         issue.ID,

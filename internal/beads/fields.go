@@ -9,12 +9,6 @@ import (
 
 // Note: AgentFields, ParseAgentFields, FormatAgentDescription, and CreateAgentBead are in beads.go
 
-// ParseAgentFieldsFromDescription is an alias for ParseAgentFields.
-// Used by daemon for compatibility.
-func ParseAgentFieldsFromDescription(description string) *AgentFields {
-	return ParseAgentFields(description)
-}
-
 // AttachmentFields holds the attachment info for pinned beads.
 // These fields track which molecule is attached to a handoff/pinned bead.
 type AttachmentFields struct {
