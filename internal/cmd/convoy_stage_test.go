@@ -1439,6 +1439,11 @@ func TestRenderWarnings_Format(t *testing.T) {
 
 // Test detectWarnings clean DAG — no warnings
 func TestDetectWarnings_Clean(t *testing.T) {
+	// Override isRigParkedFn so the test doesn't depend on real rig state.
+	origFn := isRigParkedFn
+	isRigParkedFn = func(townRoot, rigName string) bool { return false }
+	t.Cleanup(func() { isRigParkedFn = origFn })
+
 	// All tasks on same rig, all have deps between them, epic input.
 	dag := &ConvoyDAG{Nodes: map[string]*ConvoyDAGNode{
 		"epic-1": {ID: "epic-1", Type: "epic", Children: []string{"gt-a", "gt-b", "gt-c"}},
