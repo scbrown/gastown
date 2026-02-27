@@ -1043,6 +1043,20 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Ensure dog has an agent bead before sending mail.
+	// Dogs created before agent beads were added, or whose bead creation
+	// failed silently, won't have one. The mail router requires agent beads
+	// to validate recipients.
+	b := beads.New(townRoot)
+	if existing, _ := b.FindDogAgentBead(targetDog.Name); existing == nil {
+		location := filepath.Join("deacon", "dogs", targetDog.Name)
+		if _, beadErr := b.CreateDogAgentBead(targetDog.Name, location); beadErr != nil {
+			if !dogDispatchJSON {
+				fmt.Printf("  Warning: could not create agent bead: %v\n", beadErr)
+			}
+		}
+	}
+
 	// Assign work FIRST (before sending mail) to prevent race condition
 	// If this fails, we haven't sent any mail yet
 	if err := mgr.AssignWork(targetDog.Name, workDesc); err != nil {

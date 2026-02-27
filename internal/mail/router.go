@@ -958,6 +958,11 @@ func (r *Router) validateAgentWorkspace(identity string) bool {
 				return true
 			}
 		}
+	case 3:
+		// Dog addresses: deacon/dogs/<name>
+		if dirExists(filepath.Join(r.townRoot, parts[0], parts[1], parts[2])) {
+			return true
+		}
 	}
 
 	return false
