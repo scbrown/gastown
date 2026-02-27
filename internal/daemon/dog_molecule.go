@@ -166,6 +166,10 @@ func (dm *dogMol) discoverSteps() {
 			dm.stepIDs["probe"] = id
 		case strings.Contains(titleLower, "inspect"):
 			dm.stepIDs["inspect"] = id
+		case strings.Contains(titleLower, "clean"):
+			dm.stepIDs["clean"] = id
+		case strings.Contains(titleLower, "verif"):
+			dm.stepIDs["verify"] = id
 		}
 	}
 }

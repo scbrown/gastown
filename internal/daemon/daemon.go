@@ -418,6 +418,18 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Doctor dog ticker started (interval %v)", interval)
 	}
 
+	// Start janitor dog ticker if configured.
+	// Cleans up orphan test databases on the test server (port 3308).
+	var janitorDogTicker *time.Ticker
+	var janitorDogChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "janitor_dog") {
+		interval := janitorDogInterval(d.patrolConfig)
+		janitorDogTicker = time.NewTicker(interval)
+		janitorDogChan = janitorDogTicker.C
+		defer janitorDogTicker.Stop()
+		d.logger.Printf("Janitor dog ticker started (interval %v)", interval)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -488,6 +500,12 @@ func (d *Daemon) Run() error {
 			// gc, zombie detection, backup staleness, and disk usage checks.
 			if !d.isShutdownInProgress() {
 				d.runDoctorDog()
+			}
+
+		case <-janitorDogChan:
+			// Janitor dog — pours molecule for test server orphan cleanup.
+			if !d.isShutdownInProgress() {
+				d.runJanitorDog()
 			}
 
 		case <-timer.C:

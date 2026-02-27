@@ -125,6 +125,7 @@ type PatrolsConfig struct {
 	JsonlGitBackup *JsonlGitBackupConfig  `json:"jsonl_git_backup,omitempty"`
 	WispReaper     *WispReaperConfig      `json:"wisp_reaper,omitempty"`
 	DoctorDog      *DoctorDogConfig       `json:"doctor_dog,omitempty"`
+	JanitorDog     *JanitorDogConfig      `json:"janitor_dog,omitempty"`
 }
 
 // DoltRemotesConfig holds configuration for the dolt_remotes patrol.
@@ -259,6 +260,12 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 			return false
 		}
 		return config.Patrols.DoctorDog.Enabled
+	}
+	if patrol == "janitor_dog" {
+		if config == nil || config.Patrols == nil || config.Patrols.JanitorDog == nil {
+			return false
+		}
+		return config.Patrols.JanitorDog.Enabled
 	}
 
 	if config == nil || config.Patrols == nil {
