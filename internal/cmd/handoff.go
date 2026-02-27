@@ -952,6 +952,12 @@ func sessionWorkDir(sessionName, townRoot string) (string, error) {
 			return "", fmt.Errorf("unknown session type: %s (%w)", sessionName, err)
 		}
 		switch identity.Role {
+		case session.RoleMayor:
+			return townRoot + "/mayor", nil
+		case session.RoleDeacon:
+			return townRoot + "/deacon", nil
+		case session.RoleOverseer:
+			return townRoot + "/deacon", nil
 		case session.RoleWitness:
 			return fmt.Sprintf("%s/%s/witness", townRoot, identity.Rig), nil
 		case session.RoleRefinery:
