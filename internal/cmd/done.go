@@ -889,6 +889,7 @@ notifyWitness:
 			From:    sender,
 			Subject: fmt.Sprintf("WORK_DONE: %s", issueID),
 			Body:    strings.Join(bodyLines, "\n"),
+			Wisp:    true, // Operational notification — must not create permanent bead
 		}
 		if err := townRouter.Send(workDoneNotification); err != nil {
 			style.PrintWarning("could not notify witness of work done: %v", err)

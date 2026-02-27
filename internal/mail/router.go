@@ -794,6 +794,7 @@ func (r *Router) shouldBeWisp(msg *Message) bool {
 	wispPrefixes := []string{
 		"polecat_started",
 		"polecat_done",
+		"work_done",
 		"start_work",
 		"nudge",
 	}
