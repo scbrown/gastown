@@ -72,6 +72,10 @@ func (d *Daemon) syncJsonlGitBackup() {
 		return
 	}
 
+	// Pour molecule for observability (nil-safe — all methods are no-ops on nil).
+	mol := d.pourDogMolecule("mol-dog-jsonl", nil)
+	defer mol.close()
+
 	config := d.patrolConfig.Patrols.JsonlGitBackup
 
 	// Resolve git repo path.
@@ -134,8 +138,11 @@ func (d *Daemon) syncJsonlGitBackup() {
 
 	if exported == 0 {
 		d.logger.Printf("jsonl_git_backup: no databases exported successfully")
+		mol.failStep("export", "no databases exported successfully")
 		return
 	}
+
+	mol.closeStep("export")
 
 	// Phase D: Pollution firewall — filter test data from exports.
 	removed := d.applyPollutionFilter(gitRepo, databases)
@@ -152,13 +159,17 @@ func (d *Daemon) syncJsonlGitBackup() {
 		report := formatSpikeReport(spikes)
 		d.logger.Printf("jsonl_git_backup: HALTING — spike detected:\n%s", report)
 		d.escalate("jsonl_git_backup", report)
+		mol.failStep("push", "spike detected")
 		return // Do NOT commit — spike detected.
 	}
 
 	// Commit and push if anything changed.
 	// Include failed databases in commit message so staleness is visible.
+	pushStatus := "ok"
 	if err := d.commitAndPushJsonlBackup(gitRepo, databases, counts, failed); err != nil {
 		d.logger.Printf("jsonl_git_backup: git operations failed: %v", err)
+		pushStatus = "failed"
+		mol.failStep("push", err.Error())
 		d.jsonlPushFailures++
 		if d.jsonlPushFailures >= maxConsecutivePushFailures {
 			d.logger.Printf("jsonl_git_backup: ESCALATION: %d consecutive push failures", d.jsonlPushFailures)
@@ -168,9 +179,11 @@ func (d *Daemon) syncJsonlGitBackup() {
 		}
 	} else {
 		d.jsonlPushFailures = 0
+		mol.closeStep("push")
 	}
 
-	d.logger.Printf("jsonl_git_backup: exported %d/%d database(s)", exported, len(databases))
+	d.logger.Printf("jsonl_git_backup: exported %d/%d database(s), push=%s", exported, len(databases), pushStatus)
+	mol.closeStep("report")
 }
 
 // supplementalTables lists non-issues tables to include in JSONL backup.
