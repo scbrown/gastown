@@ -2,17 +2,17 @@
 package dog
 
 import (
-	"github.com/steveyegge/gastown/internal/cli"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // Session errors
@@ -26,19 +26,16 @@ type SessionManager struct {
 	tmux     *tmux.Tmux
 	mgr      *Manager
 	townRoot string
-	townName string
 }
 
 // NewSessionManager creates a new dog session manager.
 // The Manager parameter is used to sync persistent dog state (idle/working)
 // when sessions start and stop.
 func NewSessionManager(t *tmux.Tmux, townRoot string, mgr *Manager) *SessionManager {
-	townName, _ := workspace.GetTownName(townRoot)
 	return &SessionManager{
 		tmux:     t,
 		mgr:      mgr,
 		townRoot: townRoot,
-		townName: townName,
 	}
 }
 
@@ -70,9 +67,12 @@ type SessionInfo struct {
 }
 
 // SessionName generates the tmux session name for a dog.
-// Pattern: gt-{town}-deacon-{name}
+// Pattern: hq-dog-{name}
+// Dogs are town-level (managed by deacon), so they use the hq- prefix.
+// We use "hq-dog-" instead of "hq-deacon-" to avoid tmux prefix-matching
+// collisions with the "hq-deacon" session.
 func (m *SessionManager) SessionName(dogName string) string {
-	return fmt.Sprintf("gt-%s-deacon-%s", m.townName, dogName)
+	return fmt.Sprintf("hq-dog-%s", dogName)
 }
 
 // kennelPath returns the path to the dog's kennel directory.
@@ -96,12 +96,21 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 		return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
 	}
 
-	// Build instructions for the dog
+	// Build instructions for the dog.
+	// For plugin work, explicitly direct the dog to read mail for the full
+	// plugin instructions rather than trying to locate the plugin locally.
+	// This prevents dogs from scanning their worktree's plugins/ directory
+	// and escalating "plugin not found" when the plugin is town-level.
 	workInfo := ""
 	if opts.WorkDesc != "" {
-		workInfo = fmt.Sprintf(" Work assigned: %s.", opts.WorkDesc)
+		if strings.HasPrefix(opts.WorkDesc, "plugin:") {
+			pluginName := strings.TrimPrefix(opts.WorkDesc, "plugin:")
+			workInfo = fmt.Sprintf(" Plugin %s dispatched — full instructions are in your mail. Do NOT look for the plugin locally; read mail instead.", pluginName)
+		} else {
+			workInfo = fmt.Sprintf(" Work assigned: %s.", opts.WorkDesc)
+		}
 	}
-	instructions := fmt.Sprintf("I am Dog %s.%s Check mail for work: `"+cli.Name()+" mail inbox`. Execute assigned formula/bead. When done, send DOG_DONE mail to deacon/ and return to idle.", dogName, workInfo)
+	instructions := fmt.Sprintf("I am Dog %s.%s Check mail for work: `"+cli.Name()+" mail inbox`. Execute the instructions from your mail. When done, run `"+cli.Name()+" dog done` — this clears your work and auto-terminates the session.", dogName, workInfo)
 
 	// Use unified session lifecycle.
 	theme := tmux.DogTheme()
@@ -112,7 +121,7 @@ func (m *SessionManager) Start(dogName string, opts SessionStartOptions) error {
 		TownRoot:  m.townRoot,
 		AgentName: dogName,
 		Beacon: session.BeaconConfig{
-			Recipient: fmt.Sprintf("deacon/dogs/%s", dogName),
+			Recipient: session.BeaconRecipient("dog", dogName, ""),
 			Sender:    "deacon",
 			Topic:     "assigned",
 		},

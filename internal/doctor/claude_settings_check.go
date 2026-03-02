@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -138,20 +139,20 @@ func (c *ClaudeSettingsCheck) Run(ctx *CheckContext) *CheckResult {
 
 	if hasMissingFiles && !hasStaleFiles {
 		message = fmt.Sprintf("Found %d agent(s) missing settings.json", len(c.staleSettings))
-		fixHint = "Run 'gt up --restart' to restart agents and create settings"
+		fixHint = "Run 'gt up --restore' to restart agents and create settings"
 	} else if hasStaleFiles && !hasMissingFiles {
 		message = fmt.Sprintf("Found %d stale Claude config file(s)", len(c.staleSettings))
 		if hasModifiedFiles {
 			fixHint = "Run 'gt doctor --fix' to fix safe issues. Files with local modifications require manual review."
 		} else {
-			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restart' to create new settings"
+			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restore' to create new settings"
 		}
 	} else {
 		message = fmt.Sprintf("Found %d Claude settings issue(s)", len(c.staleSettings))
 		if hasModifiedFiles {
-			fixHint = "Run 'gt doctor --fix' to fix safe issues, then 'gt up --restart'. Files with local modifications require manual review."
+			fixHint = "Run 'gt doctor --fix' to fix safe issues, then 'gt up --restore'. Files with local modifications require manual review."
 		} else {
-			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restart' to create new settings"
+			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restore' to create new settings"
 		}
 	}
 
@@ -301,14 +302,14 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 					path:        witnessCorrectSettings,
 					agentType:   "witness",
 					rigName:     rigName,
-					sessionName: fmt.Sprintf("gt-%s-witness", rigName),
+					sessionName: session.WitnessSessionName(session.PrefixFor(rigName)),
 				})
 			} else {
 				files = append(files, staleSettingsInfo{
 					path:        witnessCorrectSettings,
 					agentType:   "witness",
 					rigName:     rigName,
-					sessionName: fmt.Sprintf("gt-%s-witness", rigName),
+					sessionName: session.WitnessSessionName(session.PrefixFor(rigName)),
 					missingFile: true,
 				})
 			}
@@ -319,7 +320,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 					path:          witnessParentStaleLocal,
 					agentType:     "witness",
 					rigName:       rigName,
-					sessionName:   fmt.Sprintf("gt-%s-witness", rigName),
+					sessionName:   session.WitnessSessionName(session.PrefixFor(rigName)),
 					wrongLocation: true,
 					missing:       []string{"stale settings.local.json (settings now in witness/.claude/settings.json)"},
 				})
@@ -334,7 +335,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 							path:          stalePath,
 							agentType:     "witness",
 							rigName:       rigName,
-							sessionName:   fmt.Sprintf("gt-%s-witness", rigName),
+							sessionName:   session.WitnessSessionName(session.PrefixFor(rigName)),
 							wrongLocation: true,
 							missing:       []string{"stale settings in workdir (settings now in witness/.claude/settings.json)"},
 						})
@@ -353,14 +354,14 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 					path:        refineryCorrectSettings,
 					agentType:   "refinery",
 					rigName:     rigName,
-					sessionName: fmt.Sprintf("gt-%s-refinery", rigName),
+					sessionName: session.RefinerySessionName(session.PrefixFor(rigName)),
 				})
 			} else {
 				files = append(files, staleSettingsInfo{
 					path:        refineryCorrectSettings,
 					agentType:   "refinery",
 					rigName:     rigName,
-					sessionName: fmt.Sprintf("gt-%s-refinery", rigName),
+					sessionName: session.RefinerySessionName(session.PrefixFor(rigName)),
 					missingFile: true,
 				})
 			}
@@ -371,7 +372,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 					path:          refineryParentStaleLocal,
 					agentType:     "refinery",
 					rigName:       rigName,
-					sessionName:   fmt.Sprintf("gt-%s-refinery", rigName),
+					sessionName:   session.RefinerySessionName(session.PrefixFor(rigName)),
 					wrongLocation: true,
 					missing:       []string{"stale settings.local.json (settings now in refinery/.claude/settings.json)"},
 				})
@@ -386,7 +387,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 							path:          stalePath,
 							agentType:     "refinery",
 							rigName:       rigName,
-							sessionName:   fmt.Sprintf("gt-%s-refinery", rigName),
+							sessionName:   session.RefinerySessionName(session.PrefixFor(rigName)),
 							wrongLocation: true,
 							missing:       []string{"stale settings in workdir (settings now in refinery/.claude/settings.json)"},
 						})
@@ -441,7 +442,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 								path:          stalePath,
 								agentType:     "crew",
 								rigName:       rigName,
-								sessionName:   fmt.Sprintf("gt-%s-crew-%s", rigName, crewEntry.Name()),
+								sessionName:   session.CrewSessionName(session.PrefixFor(rigName), crewEntry.Name()),
 								wrongLocation: true,
 								missing:       []string{"stale settings in workdir (settings now in crew/.claude/settings.json)"},
 							})
@@ -495,7 +496,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 							path:          stalePath,
 							agentType:     "polecat",
 							rigName:       rigName,
-							sessionName:   fmt.Sprintf("gt-%s-%s", rigName, pcEntry.Name()),
+							sessionName:   session.PolecatSessionName(session.PrefixFor(rigName), pcEntry.Name()),
 							wrongLocation: true,
 							missing:       []string{"stale settings in intermediate dir (settings now in polecats/.claude/settings.json)"},
 						})
@@ -511,7 +512,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 								path:          stalePath,
 								agentType:     "polecat",
 								rigName:       rigName,
-								sessionName:   fmt.Sprintf("gt-%s-%s", rigName, pcEntry.Name()),
+								sessionName:   session.PolecatSessionName(session.PrefixFor(rigName), pcEntry.Name()),
 								wrongLocation: true,
 								missing:       []string{"stale settings in workdir (settings now in polecats/.claude/settings.json)"},
 							})
@@ -685,9 +686,15 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 		fmt.Printf("  Deleted stale: %s\n", sf.path)
 		needsRestart = true
 
-		// Also delete parent .claude directory if empty
 		claudeDir := filepath.Dir(sf.path)
-		_ = os.Remove(claudeDir) // Best-effort, will fail if not empty
+
+		// Only remove the parent .claude directory for wrong-location files.
+		// For correct-location stale files, the directory is the RIGHT place —
+		// removing it creates a race window where the daemon could recreate
+		// settings before the fix does (gt-99u).
+		if sf.wrongLocation {
+			_ = os.Remove(claudeDir) // Best-effort, will fail if not empty
+		}
 
 		// Handle town-root files: redirect to mayor/ instead of recreating at root.
 		// Town-root settings pollute ALL agents via directory traversal.
@@ -707,7 +714,7 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 			// Warn user to restart agents - don't auto-kill sessions as that's too disruptive,
 			// especially since deacon runs gt doctor automatically which would create a loop.
 			fmt.Printf("\n  %s Town-root settings were moved. Restart agents to pick up new config:\n", style.Warning.Render("⚠"))
-			fmt.Printf("      gt up --restart\n\n")
+			fmt.Printf("      gt up --restore\n\n")
 			continue
 		}
 
@@ -760,7 +767,7 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 	// Tell user to restart agents so they create correct settings
 	if needsRestart && !ctx.RestartSessions {
 		fmt.Printf("\n  %s Restart agents to create new settings:\n", style.Warning.Render("⚠"))
-		fmt.Printf("      gt up --restart\n")
+		fmt.Printf("      gt up --restore\n")
 		fmt.Printf("\n  If you had custom Claude settings edits, re-apply them via 'gt hooks override <role>'.\n\n")
 	}
 
@@ -779,21 +786,20 @@ func fileExists(path string) bool {
 	return !info.IsDir()
 }
 
-// isIdentityAnchor checks if a CLAUDE.md file is the short identity anchor
-// created by the priming system. These files are intentional - they contain
-// a brief message telling agents to run "gt prime" for their role-specific context.
-// They should NOT be flagged as "wrong location" since they don't contain
-// Mayor-specific instructions that would pollute other agents.
+// isIdentityAnchor checks if a CLAUDE.md file is the Gas Town town-root
+// identity file. This includes both the minimal bootstrap anchor (<20 lines)
+// and the expanded version with operational norms (Dolt awareness,
+// communication hygiene, etc.). Both formats are intentional Gas Town files
+// and should NOT be flagged as "wrong location".
 //
-// An identity anchor is identified by:
-// - Being small (<20 lines)
-// - Containing "gt prime" (the recovery instruction)
+// A Gas Town CLAUDE.md is identified by:
+// - Starting with "# Gas Town" (the standard header)
+// - Containing "prime" (the recovery instruction)
 func isIdentityAnchor(path string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
 	content := string(data)
-	lines := strings.Count(content, "\n") + 1
-	return lines < 20 && strings.Contains(content, "gt prime")
+	return strings.HasPrefix(content, "# Gas Town") && strings.Contains(content, "prime")
 }

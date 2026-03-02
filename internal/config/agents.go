@@ -29,12 +29,21 @@ const (
 	AgentAmp AgentPreset = "amp"
 	// AgentOpenCode is OpenCode multi-model CLI.
 	AgentOpenCode AgentPreset = "opencode"
+	// AgentCopilot is GitHub Copilot CLI.
+	AgentCopilot AgentPreset = "copilot"
+	// AgentPi is Pi Coding Agent (extension-based lifecycle).
+	AgentPi AgentPreset = "pi"
+	// AgentOmp is Oh My Pi (OMP) — Pi fork with hook-based lifecycle.
+	// Inspired by github.com/ProbabilityEngineer/pi-mono gastown integration.
+	AgentOmp AgentPreset = "omp"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
-// This extends the basic RuntimeConfig with agent-specific metadata.
+// This is the single source of truth for all agent-specific behavior.
+// Adding a new agent = adding a builtinPresets entry + optional hook installer.
+// No provider-string switch statements should exist outside this registry.
 type AgentPresetInfo struct {
-	// Name is the preset identifier (e.g., "claude", "gemini", "codex", "cursor", "auggie", "amp").
+	// Name is the preset identifier (e.g., "claude", "gemini", "codex", "cursor", "auggie", "amp", "copilot").
 	Name AgentPreset `json:"name"`
 
 	// Command is the CLI binary to invoke.
@@ -57,10 +66,15 @@ type AgentPresetInfo struct {
 	// Used for resuming sessions across restarts.
 	SessionIDEnv string `json:"session_id_env,omitempty"`
 
-	// ResumeFlag is the flag/subcommand for resuming sessions.
+	// ResumeFlag is the flag/subcommand for resuming a specific session.
 	// For claude/gemini: "--resume"
 	// For codex: "resume" (subcommand)
 	ResumeFlag string `json:"resume_flag,omitempty"`
+
+	// ContinueFlag is the flag for auto-resuming the most recent session.
+	// For claude: "--continue" (--resume without args opens interactive picker)
+	// If empty, --resume without a session ID is rejected with a clear error.
+	ContinueFlag string `json:"continue_flag,omitempty"`
 
 	// ResumeStyle indicates how to invoke resume:
 	// "flag" - pass as --resume <id> argument
@@ -71,11 +85,53 @@ type AgentPresetInfo struct {
 	SupportsHooks bool `json:"supports_hooks,omitempty"`
 
 	// SupportsForkSession indicates if --fork-session is available.
-	// Claude-only feature for seance command.
+	// Used by the seance command for session forking.
 	SupportsForkSession bool `json:"supports_fork_session,omitempty"`
 
 	// NonInteractive contains settings for non-interactive mode.
 	NonInteractive *NonInteractiveConfig `json:"non_interactive,omitempty"`
+
+	// --- Runtime default fields (replaces scattered default*() switch statements) ---
+
+	// PromptMode controls how the initial prompt is delivered: "arg" or "none".
+	// Defaults to "arg" if empty.
+	PromptMode string `json:"prompt_mode,omitempty"`
+
+	// ConfigDirEnv is the env var for the agent's config directory (e.g., "CLAUDE_CONFIG_DIR").
+	ConfigDirEnv string `json:"config_dir_env,omitempty"`
+
+	// ConfigDir is the top-level config directory (e.g., ".claude", ".opencode").
+	// Used for slash command provisioning. Empty means no command provisioning.
+	ConfigDir string `json:"config_dir,omitempty"`
+
+	// HooksProvider is the hooks framework provider type (e.g., "claude", "opencode").
+	// Empty or "none" means no hooks support.
+	HooksProvider string `json:"hooks_provider,omitempty"`
+
+	// HooksDir is the directory for hooks/settings (e.g., ".claude", ".opencode/plugins").
+	HooksDir string `json:"hooks_dir,omitempty"`
+
+	// HooksSettingsFile is the settings/plugin filename (e.g., "settings.json", "gastown.js").
+	HooksSettingsFile string `json:"hooks_settings_file,omitempty"`
+
+	// HooksInformational indicates hooks are instructions-only (not executable lifecycle hooks).
+	// For these providers, Gas Town sends startup fallback commands via nudge.
+	HooksInformational bool `json:"hooks_informational,omitempty"`
+
+	// ReadyPromptPrefix is the prompt prefix for tmux readiness detection (e.g., "❯ ").
+	// Empty means delay-based detection only.
+	ReadyPromptPrefix string `json:"ready_prompt_prefix,omitempty"`
+
+	// ReadyDelayMs is the delay-based readiness fallback in milliseconds.
+	ReadyDelayMs int `json:"ready_delay_ms,omitempty"`
+
+	// InstructionsFile is the instructions file for this agent (e.g., "CLAUDE.md", "AGENTS.md").
+	// Defaults to "AGENTS.md" if empty.
+	InstructionsFile string `json:"instructions_file,omitempty"`
+
+	// EmitsPermissionWarning indicates the agent shows a bypass-permissions warning on startup
+	// that needs to be acknowledged via tmux.
+	EmitsPermissionWarning bool `json:"emits_permission_warning,omitempty"`
 }
 
 // NonInteractiveConfig contains settings for running agents non-interactively.
@@ -104,6 +160,7 @@ type AgentRegistry struct {
 const CurrentAgentRegistryVersion = 1
 
 // builtinPresets contains the default presets for supported agents.
+// Each preset is the single source of truth for its agent's behavior.
 var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 	AgentClaude: {
 		Name:                AgentClaude,
@@ -112,10 +169,22 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ProcessNames:        []string{"node", "claude"}, // Claude runs as Node.js
 		SessionIDEnv:        "CLAUDE_SESSION_ID",
 		ResumeFlag:          "--resume",
+		ContinueFlag:        "--continue",
 		ResumeStyle:         "flag",
 		SupportsHooks:       true,
 		SupportsForkSession: true,
 		NonInteractive:      nil, // Claude is native non-interactive
+		// Runtime defaults
+		PromptMode:             "arg",
+		ConfigDirEnv:           "CLAUDE_CONFIG_DIR",
+		ConfigDir:              ".claude",
+		HooksProvider:          "claude",
+		HooksDir:               ".claude",
+		HooksSettingsFile:      "settings.json",
+		ReadyPromptPrefix:      "❯ ",
+		ReadyDelayMs:           10000,
+		InstructionsFile:       "CLAUDE.md",
+		EmitsPermissionWarning: true,
 	},
 	AgentGemini: {
 		Name:                AgentGemini,
@@ -131,13 +200,21 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			PromptFlag: "-p",
 			OutputFlag: "--output-format json",
 		},
+		// Runtime defaults
+		PromptMode:        "arg",
+		ConfigDir:         ".gemini",
+		HooksProvider:     "gemini",
+		HooksDir:          ".gemini",
+		HooksSettingsFile: "settings.json",
+		ReadyDelayMs:      5000,
+		InstructionsFile:  "AGENTS.md",
 	},
 	AgentCodex: {
 		Name:                AgentCodex,
 		Command:             "codex",
-		Args:                []string{"--yolo"},
+		Args:                []string{"--dangerously-bypass-approvals-and-sandbox"},
 		ProcessNames:        []string{"codex"}, // Codex CLI binary
-		SessionIDEnv:        "", // Codex captures from JSONL output
+		SessionIDEnv:        "",                 // Codex captures from JSONL output
 		ResumeFlag:          "resume",
 		ResumeStyle:         "subcommand",
 		SupportsHooks:       false, // Use env/files instead
@@ -146,6 +223,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			Subcommand: "exec",
 			OutputFlag: "--json",
 		},
+		// Runtime defaults
+		PromptMode:       "none",
+		ReadyDelayMs:     3000,
+		InstructionsFile: "AGENTS.md",
 	},
 	AgentCursor: {
 		Name:                AgentCursor,
@@ -161,6 +242,9 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			PromptFlag: "-p",
 			OutputFlag: "--output-format json",
 		},
+		// Runtime defaults
+		PromptMode:       "arg",
+		InstructionsFile: "AGENTS.md",
 	},
 	AgentAuggie: {
 		Name:                AgentAuggie,
@@ -172,6 +256,9 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ResumeStyle:         "flag",
 		SupportsHooks:       false,
 		SupportsForkSession: false,
+		// Runtime defaults
+		PromptMode:       "arg",
+		InstructionsFile: "AGENTS.md",
 	},
 	AgentAmp: {
 		Name:                AgentAmp,
@@ -183,6 +270,9 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ResumeStyle:         "subcommand", // 'amp threads continue <threadId>'
 		SupportsHooks:       false,
 		SupportsForkSession: false,
+		// Runtime defaults
+		PromptMode:       "arg",
+		InstructionsFile: "AGENTS.md",
 	},
 	AgentOpenCode: {
 		Name:    AgentOpenCode,
@@ -193,14 +283,83 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			"OPENCODE_PERMISSION": `{"*":"allow"}`,
 		},
 		ProcessNames:        []string{"opencode", "node", "bun"}, // Runs as Node.js or Bun
-		SessionIDEnv:        "",                           // OpenCode manages sessions internally
-		ResumeFlag:          "",                           // No resume support yet
+		SessionIDEnv:        "",                                   // OpenCode manages sessions internally
+		ResumeFlag:          "",                                   // No resume support yet
 		ResumeStyle:         "",
-		SupportsHooks:       true,  // Uses .opencode/plugin/gastown.js
+		SupportsHooks:       true, // Uses .opencode/plugins/gastown.js
 		SupportsForkSession: false,
 		NonInteractive: &NonInteractiveConfig{
 			Subcommand: "run",
 			OutputFlag: "--format json",
+		},
+		// Runtime defaults
+		PromptMode:        "arg",
+		ConfigDir:         ".opencode",
+		HooksProvider:     "opencode",
+		HooksDir:          ".opencode/plugins",
+		HooksSettingsFile: "gastown.js",
+		ReadyDelayMs:      8000,
+		InstructionsFile:  "AGENTS.md",
+	},
+	AgentCopilot: {
+		Name:                AgentCopilot,
+		Command:             "copilot",
+		Args:                []string{"--yolo"},
+		ProcessNames:        []string{"copilot"}, // Copilot CLI binary (Node.js but reports as "copilot")
+		SessionIDEnv:        "",                   // Session IDs stored on disk, not in env
+		ResumeFlag:          "--resume",
+		ResumeStyle:         "flag",
+		SupportsHooks:       false, // Copilot instructions file is not executable hooks
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "-p",
+		},
+		// Runtime defaults
+		PromptMode:         "arg",
+		ConfigDir:          ".copilot",
+		HooksProvider:      "copilot",
+		HooksDir:           ".copilot",
+		HooksSettingsFile:  "copilot-instructions.md",
+		HooksInformational: true,
+		ReadyPromptPrefix:  "❯ ",
+		ReadyDelayMs:       5000,
+		InstructionsFile:   "AGENTS.md",
+	},
+	AgentPi: {
+		Name:                AgentPi,
+		Command:             "pi",
+		Args:                []string{"-e", ".pi/extensions/gastown-hooks.js"},
+		ProcessNames:        []string{"pi", "node", "bun"}, // Pi runs as Node.js
+		SessionIDEnv:        "PI_SESSION_ID",
+		ResumeFlag:          "",    // No resume support yet
+		ResumeStyle:         "",
+		SupportsHooks:       true,  // Uses .pi/extensions/gastown-hooks.js
+		HooksProvider:       "pi",
+		HooksDir:            ".pi/extensions",
+		HooksSettingsFile:   "gastown-hooks.js",
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "-p",
+			OutputFlag: "--no-session",
+		},
+		// Pi's Node.js TUI takes several seconds to initialize before it can
+		// receive tmux input. Without a readiness delay, the startup nudge
+		// arrives before the TUI is ready and gets dropped silently.
+		ReadyDelayMs: 8000,
+	},
+	AgentOmp: {
+		Name:                AgentOmp,
+		Command:             "omp",
+		Args:                []string{"--hook", ".omp/hooks/gastown-hook.ts"},
+		ProcessNames:        []string{"omp", "node", "bun"},
+		SessionIDEnv:        "OMP_SESSION_ID",
+		SupportsHooks:       true,
+		HooksProvider:       "omp",
+		HooksDir:            ".omp/hooks",
+		HooksSettingsFile:   "gastown-hook.ts",
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "--prompt",
 		},
 	},
 }
@@ -232,13 +391,6 @@ func initRegistryLocked() {
 		globalRegistry.Agents[string(name)] = preset
 	}
 	registryInitialized = true
-}
-
-// ensureRegistry ensures the registry is initialized for read operations.
-func ensureRegistry() {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	initRegistryLocked()
 }
 
 // loadAgentRegistryFromPath loads agent definitions from a JSON file and merges with built-ins.
@@ -312,26 +464,26 @@ func LoadRigAgentRegistry(path string) error {
 // GetAgentPreset returns the preset info for a given agent name.
 // Returns nil if the preset is not found.
 func GetAgentPreset(name AgentPreset) *AgentPresetInfo {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	return globalRegistry.Agents[string(name)]
 }
 
 // GetAgentPresetByName returns the preset info by string name.
 // Returns nil if not found, allowing caller to fall back to defaults.
 func GetAgentPresetByName(name string) *AgentPresetInfo {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	return globalRegistry.Agents[name]
 }
 
 // ListAgentPresets returns all known agent preset names.
 func ListAgentPresets() []string {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	names := make([]string, 0, len(globalRegistry.Agents))
 	for name := range globalRegistry.Agents {
 		names = append(names, name)
@@ -398,7 +550,7 @@ func BuildResumeCommand(agentName, sessionID string) string {
 	// Add resume based on style
 	switch info.ResumeStyle {
 	case "subcommand":
-		// e.g., "codex resume <session_id> --yolo"
+		// e.g., "codex resume <session_id> --dangerously-bypass-approvals-and-sandbox"
 		return info.Command + " " + info.ResumeFlag + " " + sessionID + " " + strings.Join(args, " ")
 	case "flag":
 		fallthrough
@@ -437,6 +589,55 @@ func GetProcessNames(agentName string) []string {
 	return info.ProcessNames
 }
 
+// ResolveProcessNames determines the correct process names for liveness detection
+// given an agent name and the actual command binary. This handles custom agents
+// that shadow built-in preset names (e.g., a custom "codex" agent that runs
+// "opencode" instead of the built-in "codex" binary).
+//
+// Resolution order:
+//  1. If agentName matches a built-in preset AND the preset's Command matches
+//     the actual command → use the preset's ProcessNames (no mismatch).
+//  2. Otherwise, find a built-in preset whose Command matches the actual command
+//     and use its ProcessNames (custom agent using a known launcher).
+//  3. Fallback: [command] (fully custom binary).
+func ResolveProcessNames(agentName, command string) []string {
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
+
+	// Normalize command to basename for comparison. Commands may be
+	// path-resolved (e.g., "/home/user/.claude/local/claude" from
+	// resolveClaudePath), but built-in presets store bare names ("claude").
+	// Process matching (processMatchesNames, pgrep) also uses basenames.
+	cmdBase := command
+	if command != "" {
+		cmdBase = filepath.Base(command)
+	}
+
+	// Check if agentName matches a built-in/registered preset with matching command.
+	// Compare against both the raw command and basename to handle registry entries
+	// that store absolute-path commands (e.g., "/opt/bin/my-tool").
+	if info, ok := globalRegistry.Agents[agentName]; ok && len(info.ProcessNames) > 0 {
+		if info.Command == command || info.Command == cmdBase || filepath.Base(info.Command) == cmdBase || cmdBase == "" {
+			return info.ProcessNames
+		}
+	}
+
+	// Agent name doesn't match or command differs — look up by command
+	if cmdBase != "" {
+		for _, info := range globalRegistry.Agents {
+			if (info.Command == command || filepath.Base(info.Command) == cmdBase) && len(info.ProcessNames) > 0 {
+				return info.ProcessNames
+			}
+		}
+		// Unknown command — use the binary basename itself
+		return []string{cmdBase}
+	}
+
+	// No command provided, agent not in registry — Claude defaults
+	return []string{"node", "claude"}
+}
+
 // MergeWithPreset applies preset defaults to a RuntimeConfig.
 // User-specified values take precedence over preset defaults.
 // Returns a new RuntimeConfig without modifying the original.
@@ -469,9 +670,9 @@ func (rc *RuntimeConfig) MergeWithPreset(preset AgentPreset) *RuntimeConfig {
 
 // IsKnownPreset checks if a string is a known agent preset name.
 func IsKnownPreset(name string) bool {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	_, ok := globalRegistry.Agents[name]
 	return ok
 }
@@ -512,6 +713,29 @@ func NewExampleAgentRegistry() *AgentRegistry {
 	}
 }
 
+// HookInstallerFunc is the signature for agent-specific hook/settings installers.
+// settingsDir is the gastown-managed parent (used by agents with --settings flag).
+// workDir is the agent's working directory.
+// role is the Gas Town role (e.g., "polecat", "crew", "witness").
+// hooksDir and hooksFile come from the preset's HooksDir and HooksSettingsFile.
+type HookInstallerFunc func(settingsDir, workDir, role, hooksDir, hooksFile string) error
+
+// hookInstallers maps provider names to their hook installation functions.
+// Registration happens via RegisterHookInstaller, typically from agent package init() or runtime init().
+var hookInstallers = make(map[string]HookInstallerFunc)
+
+// RegisterHookInstaller registers a hook installation function for an agent provider.
+// This replaces the switch statement in runtime.EnsureSettingsForRole.
+func RegisterHookInstaller(provider string, fn HookInstallerFunc) {
+	hookInstallers[provider] = fn
+}
+
+// GetHookInstaller returns the registered hook installer for a provider.
+// Returns nil if no installer is registered.
+func GetHookInstaller(provider string) HookInstallerFunc {
+	return hookInstallers[provider]
+}
+
 // ResetRegistryForTesting clears all registry state.
 // This is intended for use in tests only to ensure test isolation.
 func ResetRegistryForTesting() {
@@ -520,4 +744,18 @@ func ResetRegistryForTesting() {
 	globalRegistry = nil
 	loadedPaths = make(map[string]bool)
 	registryInitialized = false
+}
+
+// RegisterAgentForTesting adds a custom agent preset to the registry.
+// The registry is initialized first if needed. Intended for test use only.
+func RegisterAgentForTesting(name string, info AgentPresetInfo) {
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
+	globalRegistry.Agents[name] = &info
+}
+
+// ResetHookInstallersForTesting clears all hook installer registrations.
+func ResetHookInstallersForTesting() {
+	hookInstallers = make(map[string]HookInstallerFunc)
 }

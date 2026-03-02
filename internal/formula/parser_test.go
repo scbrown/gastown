@@ -135,6 +135,104 @@ needs = ["{target}.draft"]
 	}
 }
 
+func TestParse_WorkflowWithAcceptance(t *testing.T) {
+	data := []byte(`
+description = "Test workflow with acceptance"
+formula = "test-acceptance"
+type = "workflow"
+version = 1
+
+[[steps]]
+id = "design"
+title = "Design"
+description = "Plan it"
+acceptance = "Design doc committed"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+description = "Build it"
+needs = ["design"]
+acceptance = "All code written and committed"
+
+[[steps]]
+id = "test"
+title = "Test"
+description = "Test it"
+needs = ["implement"]
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if len(f.Steps) != 3 {
+		t.Fatalf("len(Steps) = %d, want 3", len(f.Steps))
+	}
+
+	// Steps with acceptance criteria
+	if f.Steps[0].Acceptance != "Design doc committed" {
+		t.Errorf("step[0].Acceptance = %q, want %q", f.Steps[0].Acceptance, "Design doc committed")
+	}
+	if f.Steps[1].Acceptance != "All code written and committed" {
+		t.Errorf("step[1].Acceptance = %q, want %q", f.Steps[1].Acceptance, "All code written and committed")
+	}
+	// Step without acceptance criteria
+	if f.Steps[2].Acceptance != "" {
+		t.Errorf("step[2].Acceptance = %q, want empty", f.Steps[2].Acceptance)
+	}
+}
+
+func TestParse_PourFlag(t *testing.T) {
+	// pour = true: steps should be materialized as sub-wisps
+	data := []byte(`
+description = "Test pour workflow"
+formula = "test-pour"
+type = "workflow"
+version = 1
+pour = true
+
+[[steps]]
+id = "step1"
+title = "First Step"
+description = "Do the first thing"
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if !f.Pour {
+		t.Error("Pour = false, want true")
+	}
+}
+
+func TestParse_PourFlagDefault(t *testing.T) {
+	// Default: pour is false (inline/root-only)
+	data := []byte(`
+description = "Test inline workflow"
+formula = "test-inline"
+type = "workflow"
+version = 1
+
+[[steps]]
+id = "step1"
+title = "First Step"
+description = "Do the first thing"
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if f.Pour {
+		t.Error("Pour = true, want false (default)")
+	}
+}
+
 func TestValidate_MissingName(t *testing.T) {
 	data := []byte(`
 type = "workflow"
@@ -351,5 +449,71 @@ title = "Leg 3"
 	ready = f.ReadySteps(map[string]bool{"leg1": true})
 	if len(ready) != 2 {
 		t.Errorf("ReadySteps({leg1}) = %v, want 2 legs", ready)
+	}
+}
+
+func TestParse_ConvoyWithAgent(t *testing.T) {
+	t.Parallel()
+	data := []byte(`
+formula = "agent-test"
+type = "convoy"
+version = 1
+agent = "gemini"
+
+[[legs]]
+id = "default-agent"
+title = "Uses formula default"
+description = "No per-leg agent"
+
+[[legs]]
+id = "custom-agent"
+title = "Uses custom agent"
+description = "Has per-leg agent"
+agent = "codex"
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if f.Agent != "gemini" {
+		t.Errorf("Formula.Agent = %q, want %q", f.Agent, "gemini")
+	}
+	if len(f.Legs) != 2 {
+		t.Fatalf("len(Legs) = %d, want 2", len(f.Legs))
+	}
+	if f.Legs[0].Agent != "" {
+		t.Errorf("Legs[0].Agent = %q, want empty", f.Legs[0].Agent)
+	}
+	if f.Legs[1].Agent != "codex" {
+		t.Errorf("Legs[1].Agent = %q, want %q", f.Legs[1].Agent, "codex")
+	}
+}
+
+func TestParse_ConvoyWithoutAgent(t *testing.T) {
+	t.Parallel()
+	// Existing formulas without agent field should continue to work
+	data := []byte(`
+formula = "no-agent"
+type = "convoy"
+version = 1
+
+[[legs]]
+id = "leg1"
+title = "Normal leg"
+description = "No agent override"
+`)
+
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if f.Agent != "" {
+		t.Errorf("Formula.Agent = %q, want empty", f.Agent)
+	}
+	if f.Legs[0].Agent != "" {
+		t.Errorf("Legs[0].Agent = %q, want empty", f.Legs[0].Agent)
 	}
 }

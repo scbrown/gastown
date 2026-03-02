@@ -3,9 +3,12 @@ package cmd
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -15,6 +18,7 @@ import (
 
 var (
 	dashboardPort int
+	dashboardBind string
 	dashboardOpen bool
 )
 
@@ -31,14 +35,16 @@ The dashboard shows real-time convoy status with:
 - Auto-refresh every 30 seconds via htmx
 
 Example:
-  gt dashboard              # Start on default port 8080
-  gt dashboard --port 3000  # Start on port 3000
-  gt dashboard --open       # Start and open browser`,
+  gt dashboard                    # Start on default port 8080
+  gt dashboard --port 3000        # Start on port 3000
+  gt dashboard --bind 0.0.0.0     # Listen on all interfaces
+  gt dashboard --open             # Start and open browser`,
 	RunE: runDashboard,
 }
 
 func init() {
 	dashboardCmd.Flags().IntVar(&dashboardPort, "port", 8080, "HTTP port to listen on")
+	dashboardCmd.Flags().StringVar(&dashboardBind, "bind", "127.0.0.1", "Address to bind to (use 0.0.0.0 for all interfaces)")
 	dashboardCmd.Flags().BoolVar(&dashboardOpen, "open", false, "Open browser automatically")
 	rootCmd.AddCommand(dashboardCmd)
 }
@@ -76,8 +82,17 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Build the URL
-	url := fmt.Sprintf("http://localhost:%d", dashboardPort)
+	// Build the listen address and display URL
+	listenAddr := fmt.Sprintf("%s:%d", dashboardBind, dashboardPort)
+	displayHost := dashboardBind
+	if displayHost == "0.0.0.0" {
+		if hostname, err := os.Hostname(); err == nil {
+			displayHost = hostname
+		} else {
+			displayHost = "localhost"
+		}
+	}
+	url := fmt.Sprintf("http://%s:%d", displayHost, dashboardPort)
 
 	// Open browser if requested
 	if dashboardOpen {
@@ -85,18 +100,21 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start the server with timeouts
-	fmt.Print(`
- __       __  ________  __        ______    ______   __       __  ________                        
-|  \  _  |  \|        \|  \      /      \  /      \ |  \     /  \|        \                       
-| $$ / \ | $$| $$$$$$$$| $$     |  $$$$$$\|  $$$$$$\| $$\   /  $$| $$$$$$$$                       
-| $$/  $\| $$| $$__    | $$     | $$   \$$| $$  | $$| $$$\ /  $$$| $$__                           
-| $$  $$$\ $$| $$  \   | $$     | $$      | $$  | $$| $$$$\  $$$$| $$  \                          
-| $$ $$\$$\$$| $$$$$   | $$     | $$   __ | $$  | $$| $$\$$ $$ $$| $$$$$                          
-| $$$$  \$$$$| $$_____ | $$_____| $$__/  \| $$__/ $$| $$ \$$$| $$| $$_____                        
-| $$$    \$$$| $$     \| $$     \\$$    $$ \$$    $$| $$  \$ | $$| $$     \                       
- \$$      \$$ \$$$$$$$$ \$$$$$$$$ \$$$$$$   \$$$$$$  \$$      \$$ \$$$$$$$$                       
-                                                                                                  
- ________   ______          ______    ______    ______   ________   ______   __       __  __    __ 
+	// Only show the large banner if the terminal is wide enough (98 cols)
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err == nil && width >= 98 {
+		fmt.Print(`
+ __       __  ________  __        ______    ______   __       __  ________
+|  \  _  |  \|        \|  \      /      \  /      \ |  \     /  \|        \
+| $$ / \ | $$| $$$$$$$$| $$     |  $$$$$$\|  $$$$$$\| $$\   /  $$| $$$$$$$$
+| $$/  $\| $$| $$__    | $$     | $$   \$$| $$  | $$| $$$\ /  $$$| $$__
+| $$  $$$\ $$| $$  \   | $$     | $$      | $$  | $$| $$$$\  $$$$| $$  \
+| $$ $$\$$\$$| $$$$$   | $$     | $$   __ | $$  | $$| $$\$$ $$ $$| $$$$$
+| $$$$  \$$$$| $$_____ | $$_____| $$__/  \| $$__/ $$| $$ \$$$| $$| $$_____
+| $$$    \$$$| $$     \| $$     \\$$    $$ \$$    $$| $$  \$ | $$| $$     \
+ \$$      \$$ \$$$$$$$$ \$$$$$$$$ \$$$$$$   \$$$$$$  \$$      \$$ \$$$$$$$$
+
+ ________   ______          ______    ______    ______   ________   ______   __       __  __    __
 |        \ /      \        /      \  /      \  /      \ |        \ /      \ |  \  _  |  \|  \  |  \
  \$$$$$$$$|  $$$$$$\      |  $$$$$$\|  $$$$$$\|  $$$$$$\ \$$$$$$$$|  $$$$$$\| $$ / \ | $$| $$\ | $$
    | $$   | $$  | $$      | $$ __\$$| $$__| $$| $$___\$$   | $$   | $$  | $$| $$/  $\| $$| $$$\| $$
@@ -107,10 +125,13 @@ func runDashboard(cmd *cobra.Command, args []string) error {
     \$$     \$$$$$$         \$$$$$$  \$$   \$$  \$$$$$$     \$$     \$$$$$$  \$$      \$$ \$$   \$$
 
 `)
-	fmt.Printf("  launching dashboard at %s  •  api: %s/api/  •  ctrl+c to stop\n", url, url)
+	} else {
+		fmt.Print("\n  WELCOME TO GASTOWN\n\n")
+	}
+	fmt.Printf("  launching dashboard at %s  •  api: %s/api/  •  listening on %s  •  ctrl+c to stop\n", url, url, listenAddr)
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", dashboardPort),
+		Addr:              listenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,

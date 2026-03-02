@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -503,7 +504,7 @@ func runRefineryAttach(cmd *cobra.Command, args []string) error {
 	}
 
 	// Session name follows the same pattern as refinery manager
-	sessionID := fmt.Sprintf("gt-%s-refinery", rigName)
+	sessionID := session.RefinerySessionName(session.PrefixFor(rigName))
 
 	// Check if session exists
 	t := tmux.NewTmux()
@@ -744,7 +745,7 @@ func runRefineryReady(cmd *cobra.Command, args []string) error {
 	if len(anomalies) > 0 {
 		fmt.Printf("\n%s Queue anomalies:\n\n", style.Bold.Render("⚠"))
 		for i, anomaly := range anomalies {
-			line := fmt.Sprintf("  %d. [%s] %s %s", i+1, anomaly.Severity, anomaly.Type, anomaly.ID)
+			line := fmt.Sprintf("  %d. [%s] %s", i+1, anomaly.Type, anomaly.ID)
 			fmt.Println(line)
 			fmt.Printf("     Branch: %s\n", anomaly.Branch)
 			if anomaly.Assignee != "" {

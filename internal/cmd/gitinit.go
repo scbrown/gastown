@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	gitInitGitHub  string
-	gitInitPublic  bool
+	gitInitGitHub string
+	gitInitPublic bool
 )
 
 var gitInitCmd = &cobra.Command{
@@ -61,18 +61,44 @@ const HQGitignore = `# Gas Town HQ .gitignore
 # =============================================================================
 **/state.json
 **/*.lock
+**/*.flock
+**/locks/
 **/registry.json
 **/*.pid
 **/heartbeat.json
 **/activity.json
 .events.jsonl
 .feed.jsonl
+**/audit.log
+**/last-touched
+**/.local_version
+**/.gt-types-configured
+**/feed-*.json
 
 # =============================================================================
 # Runtime state directories
 # =============================================================================
 daemon/
 logs/
+
+# =============================================================================
+# Centralized Dolt SQL server data directory
+# =============================================================================
+.dolt-data/
+
+# Dolt internal directories at any level (rig databases, nested .beads dolt)
+**/.dolt/
+**/.doltcfg/
+
+# =============================================================================
+# Event stream storage
+# =============================================================================
+events/
+
+# =============================================================================
+# HQ beads directory
+# =============================================================================
+beads_hq/
 
 # =============================================================================
 # Rig git worktrees (recreate with 'gt sling' or 'gt rig add')
@@ -118,7 +144,7 @@ logs/
 # Explicitly track (override above patterns)
 # =============================================================================
 # Note: .beads/ has its own .gitignore that handles database files
-# and keeps issues.jsonl, metadata.json, config file as source of truth
+# and keeps metadata.json, config file as source of truth
 `
 
 func runGitInit(cmd *cobra.Command, args []string) error {
@@ -155,18 +181,6 @@ func runGitInit(cmd *cobra.Command, args []string) error {
 	// Install pre-checkout hook to prevent accidental branch switches
 	if err := InstallPreCheckoutHook(hqRoot); err != nil {
 		fmt.Printf("   %s Could not install pre-checkout hook: %v\n", style.Dim.Render("⚠"), err)
-	}
-
-	// Ensure beads database has repository fingerprint now that git is initialized.
-	// This fixes the case where 'gt install' ran before git, leaving the database
-	// without a fingerprint (causes slow bd commands due to daemon startup failures).
-	beadsDir := filepath.Join(hqRoot, ".beads")
-	if _, err := os.Stat(beadsDir); err == nil {
-		if err := ensureRepoFingerprint(hqRoot); err != nil {
-			fmt.Printf("   %s Could not update beads fingerprint: %v\n", style.Dim.Render("⚠"), err)
-		} else {
-			fmt.Printf("   ✓ Updated beads repository fingerprint\n")
-		}
 	}
 
 	// Create GitHub repo if requested
@@ -334,18 +348,6 @@ func InitGitForHarness(hqRoot string, github string, private bool) error {
 	// Install pre-checkout hook to prevent accidental branch switches
 	if err := InstallPreCheckoutHook(hqRoot); err != nil {
 		fmt.Printf("   %s Could not install pre-checkout hook: %v\n", style.Dim.Render("⚠"), err)
-	}
-
-	// Ensure beads database has repository fingerprint now that git is initialized.
-	// This fixes the case where 'gt install' ran before git, leaving the database
-	// without a fingerprint (causes slow bd commands due to daemon startup failures).
-	beadsDir := filepath.Join(hqRoot, ".beads")
-	if _, err := os.Stat(beadsDir); err == nil {
-		if err := ensureRepoFingerprint(hqRoot); err != nil {
-			fmt.Printf("   %s Could not update beads fingerprint: %v\n", style.Dim.Render("⚠"), err)
-		} else {
-			fmt.Printf("   ✓ Updated beads repository fingerprint\n")
-		}
 	}
 
 	// Create GitHub repo if requested

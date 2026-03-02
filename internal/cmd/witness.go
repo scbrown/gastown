@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -291,7 +291,7 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 
 // witnessSessionName returns the tmux session name for a rig's witness.
 func witnessSessionName(rigName string) string {
-	return fmt.Sprintf("gt-%s-witness", rigName)
+	return session.WitnessSessionName(session.PrefixFor(rigName))
 }
 
 func runWitnessAttach(cmd *cobra.Command, args []string) error {
@@ -327,17 +327,8 @@ func runWitnessAttach(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Started witness session for %s\n", rigName)
 	}
 
-	// Attach to the session
-	tmuxPath, err := exec.LookPath("tmux")
-	if err != nil {
-		return fmt.Errorf("tmux not found: %w", err)
-	}
-
-	attachCmd := exec.Command(tmuxPath, "attach-session", "-t", sessionName)
-	attachCmd.Stdin = os.Stdin
-	attachCmd.Stdout = os.Stdout
-	attachCmd.Stderr = os.Stderr
-	return attachCmd.Run()
+	// Attach to the session (socket-aware: uses the town's tmux socket).
+	return attachToTmuxSession(sessionName)
 }
 
 func runWitnessRestart(cmd *cobra.Command, args []string) error {

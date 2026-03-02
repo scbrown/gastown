@@ -234,10 +234,32 @@ func detectSessionState(ctx RoleContext) SessionState {
 		}
 	}
 
-	// Check for hooked work (autonomous state)
+	// Check for hooked work (autonomous state).
+	// Primary: read hook_bead from the agent bead's DB column (same strategy as gt hook).
+	// Fallback: query hooked/in_progress beads by assignee.
 	agentID := getAgentIdentity(ctx)
 	if agentID != "" {
 		b := beads.New(ctx.WorkDir)
+		// Primary: agent bead's hook_bead field (authoritative, set by bd slot set during sling)
+		agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
+		if agentBeadID != "" {
+			agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
+			ab := beads.New(agentBeadDir)
+			if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil && agentBead.HookBead != "" {
+				// Resolve and verify the target bead exists with active status
+				// (mirrors molecule_status.go and signal_stop.go patterns)
+				hookBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBead.HookBead, ctx.WorkDir)
+				hb := beads.New(hookBeadDir)
+				if hookBead, err := hb.Show(agentBead.HookBead); err == nil && hookBead != nil &&
+					(hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
+					state.State = "autonomous"
+					state.HookedBead = agentBead.HookBead
+					return state
+				}
+			}
+		}
+
+		// Fallback: query by assignee
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
 			Assignee: agentID,
@@ -259,6 +281,29 @@ func detectSessionState(ctx RoleContext) SessionState {
 			state.HookedBead = inProgressBeads[0].ID
 			return state
 		}
+		// Town-level fallback: rig-level agents may have hooked HQ beads
+		// stored in townRoot/.beads. Matches prime.go and molecule_status.go. (gt-dtq7)
+		if !isTownLevelRole(agentID) && ctx.TownRoot != "" {
+			townB := beads.New(filepath.Join(ctx.TownRoot, ".beads"))
+			if townHooked, err := townB.List(beads.ListOptions{
+				Status:   beads.StatusHooked,
+				Assignee: agentID,
+				Priority: -1,
+			}); err == nil && len(townHooked) > 0 {
+				state.State = "autonomous"
+				state.HookedBead = townHooked[0].ID
+				return state
+			}
+			if townIP, err := townB.List(beads.ListOptions{
+				Status:   "in_progress",
+				Assignee: agentID,
+				Priority: -1,
+			}); err == nil && len(townIP) > 0 {
+				state.State = "autonomous"
+				state.HookedBead = townIP[0].ID
+				return state
+			}
+		}
 	}
 
 	return state
@@ -268,6 +313,11 @@ func detectSessionState(ctx RoleContext) SessionState {
 // This prevents the "handoff loop" bug where a new session sees /handoff in context
 // and incorrectly runs it again. The marker tells the new session: "handoff is DONE,
 // the /handoff you see in context was from YOUR PREDECESSOR, not a request for you."
+//
+// The marker format is: "session_id\nreason" (reason is optional, on second line).
+// When present, the reason is stored in primeHandoffReason for compact/resume detection.
+// This enables compaction-triggered handoff cycles to route through the lighter
+// compact/resume path instead of full re-initialization. (GH#1965)
 func checkHandoffMarker(workDir string) {
 	markerPath := filepath.Join(workDir, constants.DirRuntime, constants.FileHandoffMarker)
 	data, err := os.ReadFile(markerPath)
@@ -276,8 +326,12 @@ func checkHandoffMarker(workDir string) {
 		return
 	}
 
-	// Marker found - this is a post-handoff session
-	prevSession := strings.TrimSpace(string(data))
+	// Parse marker: first line is session ID, optional second line is reason
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	prevSession := strings.TrimSpace(lines[0])
+	if len(lines) > 1 {
+		primeHandoffReason = strings.TrimSpace(lines[1])
+	}
 
 	// Remove the marker FIRST so we don't warn twice
 	_ = os.Remove(markerPath)
@@ -296,9 +350,14 @@ func checkHandoffMarkerDryRun(workDir string) {
 		return
 	}
 
-	// Marker found - this is a post-handoff session
-	prevSession := strings.TrimSpace(string(data))
-	explain(true, fmt.Sprintf("Post-handoff: marker found (predecessor: %s), marker NOT removed in dry-run", prevSession))
+	// Parse marker: first line is session ID, optional second line is reason
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	prevSession := strings.TrimSpace(lines[0])
+	if len(lines) > 1 {
+		primeHandoffReason = strings.TrimSpace(lines[1])
+	}
+
+	explain(true, fmt.Sprintf("Post-handoff: marker found (predecessor: %s, reason: %s), marker NOT removed in dry-run", prevSession, primeHandoffReason))
 
 	// Output the warning but don't remove marker
 	outputHandoffWarning(prevSession)

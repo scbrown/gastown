@@ -36,7 +36,6 @@ state.json
 # Beads runtime state (not tracked)
 # Formulas ARE tracked for `go install @latest` - see bottom of file
 .beads/redirect
-.beads/issues.jsonl
 .beads/interactions.jsonl
 .beads/mq/
 .beads/last-touched
@@ -47,9 +46,11 @@ state.json
 
 # Clone-specific CLAUDE.md (regenerated locally per clone)
 CLAUDE.md
+# But keep the embedded template for gt doctor version checks
+!internal/templates/townroot/claude.md
 
-# Embedded formulas are committed so `go install @latest` works
-# Run `go generate ./...` after modifying .beads/formulas/
+# Formulas: source of truth is internal/formula/formulas/ (embedded in binary).
+# .beads/formulas/ is provisioned at runtime by gt install / gt doctor fix.
 
 # Gas Town (added by gt)
 .beads/
@@ -59,5 +60,12 @@ CLAUDE.md
 logs/
 settings/
 .events.jsonl
+.events.jsonl.lock
 .sqlhistory
 .fork-integration.json
+
+# Nix build
+result
+
+# bv (beads viewer) local config and caches
+.bv/

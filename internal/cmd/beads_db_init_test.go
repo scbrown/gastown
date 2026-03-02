@@ -78,8 +78,12 @@ func createTrackedBeadsRepoWithIssues(t *testing.T, path, prefix string, numIssu
 		t.Fatalf("mkdir .beads: %v", err)
 	}
 
-	// Run bd init
-	cmd := exec.Command("bd", "init", "--prefix", prefix, "--backend", "dolt")
+	// Run bd init (pass --server-port if GT_DOLT_PORT is set for ephemeral test servers)
+	bdInitArgs := []string{"init", "--prefix", prefix}
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		bdInitArgs = append(bdInitArgs, "--server-port", p)
+	}
+	cmd := exec.Command("bd", bdInitArgs...)
 	cmd.Dir = path
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed: %v\nOutput: %s", err, output)
@@ -95,17 +99,22 @@ func createTrackedBeadsRepoWithIssues(t *testing.T, path, prefix string, numIssu
 		}
 	}
 
-	// Add .beads to git (simulating tracked beads)
+	// Ensure .beads is committed (bd init may auto-commit in newer versions).
 	cmd = exec.Command("git", "add", ".beads")
 	cmd.Dir = path
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git add .beads: %v\n%s", err, out)
 	}
 
-	cmd = exec.Command("git", "commit", "-m", "Add beads with issues")
+	// Only commit if there are staged changes (bd v0.56.1+ auto-commits).
+	cmd = exec.Command("git", "diff", "--cached", "--quiet")
 	cmd.Dir = path
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git commit beads: %v\n%s", err, out)
+	if err := cmd.Run(); err != nil {
+		cmd = exec.Command("git", "commit", "-m", "Add beads with issues")
+		cmd.Dir = path
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git commit beads: %v\n%s", err, out)
+		}
 	}
 
 	// Remove database files to simulate what a clone would look like
@@ -120,8 +129,12 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping test")
 	}
+	// Dolt server required: bd init auto-detects server on 3307,
+	// and gt rig add --adopt uses --server mode for re-initialization.
+	requireDoltServer(t)
 
 	tmpDir := t.TempDir()
+	configureTestGitIdentity(t, tmpDir)
 	gtBinary := buildGT(t)
 
 	t.Run("TrackedRepoWithExistingPrefix", func(t *testing.T) {
@@ -136,6 +149,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
 		}
+
+		// Bridge test Dolt server PID so subsequent AddRig/IsRunning checks pass.
+		bridgeDoltPidToTown(t, townRoot)
 
 		// Create a repo with existing beads prefix "existing-prefix" AND issues
 		// directly at the expected rig location
@@ -196,6 +212,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 			t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
 		}
 
+		// Bridge test Dolt server PID so subsequent AddRig/IsRunning checks pass.
+		bridgeDoltPidToTown(t, townRoot)
+
 		// Create a tracked beads repo with NO issues at the expected rig location
 		rigDir := filepath.Join(townRoot, "emptyrig")
 		createTrackedBeadsRepoWithNoIssues(t, rigDir, "empty-prefix")
@@ -242,6 +261,8 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 	t.Run("TrackedRepoWithPrefixMismatchErrors", func(t *testing.T) {
 		// Test that when --prefix is explicitly provided but doesn't match
 		// the prefix detected from the database, gt rig add fails with an error.
+		// Prefix detection uses config.yaml (not metadata.json), which survives
+		// clones since it is tracked by git.
 
 		townRoot := filepath.Join(tmpDir, "town-mismatch")
 
@@ -251,6 +272,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
 		}
+
+		// Bridge test Dolt server PID so gt rig add can verify the prefix.
+		bridgeDoltPidToTown(t, townRoot)
 
 		// Create a repo with existing beads prefix "real-prefix" with issues
 		rigDir := filepath.Join(townRoot, "mismatchrig")
@@ -292,6 +316,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
 		}
+
+		// Bridge test Dolt server PID so subsequent AddRig/IsRunning checks pass.
+		bridgeDoltPidToTown(t, townRoot)
 
 		// Create a tracked beads repo with NO issues at the expected rig location
 		rigDir := filepath.Join(townRoot, "testrig")
@@ -344,6 +371,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
 		}
+
+		// Bridge test Dolt server PID so subsequent AddRig/IsRunning checks pass.
+		bridgeDoltPidToTown(t, townRoot)
 
 		// Create a tracked beads repo with issues
 		rigDir := filepath.Join(townRoot, "reinitrig")
@@ -439,24 +469,33 @@ func createTrackedBeadsRepoWithNoIssues(t *testing.T, path, prefix string) {
 		t.Fatalf("mkdir .beads: %v", err)
 	}
 
-	// Run bd init (creates database but no issues)
-	cmd := exec.Command("bd", "init", "--prefix", prefix, "--backend", "dolt")
+	// Run bd init (creates database but no issues; pass --server-port for ephemeral test servers)
+	bdInitArgs2 := []string{"init", "--prefix", prefix}
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		bdInitArgs2 = append(bdInitArgs2, "--server-port", p)
+	}
+	cmd := exec.Command("bd", bdInitArgs2...)
 	cmd.Dir = path
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed: %v\nOutput: %s", err, output)
 	}
 
-	// Add .beads to git (simulating tracked beads)
+	// Ensure .beads is committed (bd init may auto-commit in newer versions).
 	cmd = exec.Command("git", "add", ".beads")
 	cmd.Dir = path
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git add .beads: %v\n%s", err, out)
 	}
 
-	cmd = exec.Command("git", "commit", "-m", "Add beads (no issues)")
+	// Only commit if there are staged changes (bd v0.56.1+ auto-commits).
+	cmd = exec.Command("git", "diff", "--cached", "--quiet")
 	cmd.Dir = path
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git commit beads: %v\n%s", err, out)
+	if err := cmd.Run(); err != nil {
+		cmd = exec.Command("git", "commit", "-m", "Add beads (no issues)")
+		cmd.Dir = path
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git commit beads: %v\n%s", err, out)
+		}
 	}
 
 	// Remove database files to simulate what a clone would look like
@@ -465,11 +504,11 @@ func createTrackedBeadsRepoWithNoIssues(t *testing.T, path, prefix string) {
 
 // removeDBFiles removes gitignored database files from a beads directory to simulate a clone.
 // Only removes files that match patterns in .beads/.gitignore. Files NOT in .gitignore
-// (metadata.json, dolt/, config.yaml, issues.jsonl, etc.) are tracked by git and survive clones.
+// (metadata.json, config.yaml, issues.jsonl, etc.) are tracked by git and survive clones.
 //
-// Anchored to .beads/.gitignore patterns as of 2026-02: *.db, *.db-*, daemon.*, bd.sock,
-// sync-state.json, redirect, db.sqlite, bd.db, export-state/, etc.
-// metadata.json and dolt/ are NOT gitignored — they are tracked and present after clone.
+// Anchored to .beads/.gitignore patterns as of bd v0.56.1: *.db, *.db-*, daemon.*, bd.sock,
+// sync-state.json, redirect, db.sqlite, bd.db, export-state/, dolt/, dolt-access.lock,
+// interactions.jsonl. Note: metadata.json is tracked (not gitignored).
 func removeDBFiles(t *testing.T, beadsDir string) {
 	t.Helper()
 
@@ -481,21 +520,11 @@ func removeDBFiles(t *testing.T, beadsDir string) {
 			os.Remove(m)
 		}
 	}
-	// Remove gitignored runtime state files
-	for _, name := range []string{"sync-state.json", "redirect", ".local_version"} {
+	// Remove gitignored runtime state files (metadata.json is tracked, not removed)
+	for _, name := range []string{"sync-state.json", "redirect", ".local_version", "dolt-access.lock", "interactions.jsonl"} {
 		os.Remove(filepath.Join(beadsDir, name))
 	}
 	os.RemoveAll(filepath.Join(beadsDir, "export-state"))
-
-	// Verify our assumptions: metadata.json and dolt/ must NOT be removed.
-	// If .beads/.gitignore ever starts ignoring these, this assertion catches drift.
-	gitignorePath := filepath.Join(beadsDir, ".gitignore")
-	if content, err := os.ReadFile(gitignorePath); err == nil {
-		for _, tracked := range []string{"metadata.json", "dolt"} {
-			if strings.Contains(string(content), tracked) {
-				t.Fatalf("clone simulation assumption violated: %s found in .beads/.gitignore — "+
-					"removeDBFiles must be updated if tracked file set changes", tracked)
-			}
-		}
-	}
+	// Remove Dolt database directory (gitignored since bd v0.50+; managed by Dolt remotes, not git)
+	os.RemoveAll(filepath.Join(beadsDir, "dolt"))
 }

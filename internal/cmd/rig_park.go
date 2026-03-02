@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/wisp"
@@ -95,7 +96,7 @@ func parkOneRig(rigName string) error {
 	t := tmux.NewTmux()
 
 	// Stop witness if running
-	witnessSession := fmt.Sprintf("gt-%s-witness", rigName)
+	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 	witnessRunning, _ := t.HasSession(witnessSession)
 	if witnessRunning {
 		fmt.Printf("  Stopping witness...\n")
@@ -108,7 +109,7 @@ func parkOneRig(rigName string) error {
 	}
 
 	// Stop refinery if running
-	refinerySession := fmt.Sprintf("gt-%s-refinery", rigName)
+	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 	refineryRunning, _ := t.HasSession(refinerySession)
 	if refineryRunning {
 		fmt.Printf("  Stopping refinery...\n")
@@ -175,9 +176,17 @@ func unparkOneRig(rigName string) error {
 	return nil
 }
 
-// IsRigParked checks if a rig is parked in the wisp layer.
-// This function is exported for use by the daemon.
+// IsRigParked checks if a rig is parked.
+// Checks the wisp layer (ephemeral) first, then falls back to the rig
+// identity bead's status:parked label (persistent). This ensures parked
+// state survives wisp cleanup. (Fixes upstream #2079)
 func IsRigParked(townRoot, rigName string) bool {
+	// Check wisp layer first (fast, local)
 	wispCfg := wisp.NewConfig(townRoot, rigName)
-	return wispCfg.GetString(RigStatusKey) == RigStatusParked
+	if wispCfg.GetString(RigStatusKey) == RigStatusParked {
+		return true
+	}
+
+	// Fall back to persistent bead label
+	return hasRigBeadLabel(townRoot, rigName, "status:parked")
 }

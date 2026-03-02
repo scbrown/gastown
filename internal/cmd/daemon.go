@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/templates"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -40,33 +42,107 @@ The daemon will run until stopped with 'gt daemon stop'.`,
 var daemonStopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop the daemon",
-	Long:  `Stop the running Gas Town daemon.`,
-	RunE:  runDaemonStop,
+	Long: `Stop the running Gas Town daemon.
+
+Sends a stop signal to the daemon process and waits for it to exit.
+The daemon must be running or this command returns an error.
+
+Examples:
+  gt daemon stop`,
+	RunE: runDaemonStop,
 }
 
 var daemonStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon status",
-	Long:  `Show the current status of the Gas Town daemon.`,
-	RunE:  runDaemonStatus,
+	Long: `Show the current status of the Gas Town daemon.
+
+Displays whether the daemon is running, its PID, uptime, heartbeat
+count, and whether the binary has been rebuilt since the daemon started.
+
+Examples:
+  gt daemon status`,
+	RunE: runDaemonStatus,
 }
 
 var daemonLogsCmd = &cobra.Command{
 	Use:   "logs",
 	Short: "View daemon logs",
-	Long:  `View the daemon log file.`,
-	RunE:  runDaemonLogs,
+	Long: `View the daemon log file.
+
+Shows the most recent log entries from the daemon. Use -n to control
+how many lines to display, or -f to follow the log in real time.
+
+Examples:
+  gt daemon logs             # Show last 50 lines
+  gt daemon logs -n 100      # Show last 100 lines
+  gt daemon logs -f           # Follow log output in real time`,
+	RunE: runDaemonLogs,
 }
 
 var daemonRunCmd = &cobra.Command{
-	Use:    "run",
-	Short:  "Run daemon in foreground (internal)",
+	Use:   "run",
+	Short: "Run daemon in foreground (internal)",
+	Long: `Run the Gas Town daemon in the foreground.
+
+This is called internally by the daemon start process and supervisor
+services (launchd/systemd). Use 'gt daemon start' to start the daemon
+normally in the background.`,
 	Hidden: true,
 	RunE:   runDaemonRun,
 }
 
+var daemonEnableSupervisorCmd = &cobra.Command{
+	Use:   "enable-supervisor",
+	Short: "Configure launchd/systemd for daemon auto-restart",
+	Long: `Configure external supervision for the Gas Town daemon.
+
+This command creates and enables a supervisor service (launchd on macOS,
+systemd on Linux) that will automatically restart the daemon if it crashes
+or terminates. The daemon will also start automatically on login/boot.
+
+Examples:
+  gt daemon enable-supervisor    # Configure launchd/systemd`,
+	RunE: runDaemonEnableSupervisor,
+}
+
+var daemonRotateLogsCmd = &cobra.Command{
+	Use:   "rotate-logs",
+	Short: "Rotate daemon log files",
+	Long: `Rotate all daemon-managed log files.
+
+Uses copytruncate for Dolt server logs (safe for processes with open fds).
+daemon.log uses automatic lumberjack rotation and is skipped.
+
+By default, only rotates logs exceeding 100MB. Use --force to rotate all.
+
+Examples:
+  gt daemon rotate-logs           # Rotate logs > 100MB
+  gt daemon rotate-logs --force   # Rotate all logs regardless of size`,
+	RunE: runDaemonRotateLogs,
+}
+
+var daemonRotateLogsForce bool
+
+var daemonClearBackoffCmd = &cobra.Command{
+	Use:   "clear-backoff <agent>",
+	Short: "Clear crash loop backoff for an agent",
+	Long: `Clear the crash loop and restart backoff state for an agent.
+
+When an agent crashes repeatedly, the daemon enters crash loop mode and
+stops restarting it. Use this command to reset the crash loop counter so
+the daemon will resume restarting the agent.
+
+The agent name is the session identity (e.g., "deacon", "mayor").
+
+Examples:
+  gt daemon clear-backoff deacon   # Reset deacon crash loop`,
+	Args: cobra.ExactArgs(1),
+	RunE: runDaemonClearBackoff,
+}
+
 var (
-	daemonLogLines int
+	daemonLogLines  int
 	daemonLogFollow bool
 )
 
@@ -76,9 +152,13 @@ func init() {
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonLogsCmd)
 	daemonCmd.AddCommand(daemonRunCmd)
+	daemonCmd.AddCommand(daemonEnableSupervisorCmd)
+	daemonCmd.AddCommand(daemonClearBackoffCmd)
+	daemonCmd.AddCommand(daemonRotateLogsCmd)
 
 	daemonLogsCmd.Flags().IntVarP(&daemonLogLines, "lines", "n", 50, "Number of lines to show")
 	daemonLogsCmd.Flags().BoolVarP(&daemonLogFollow, "follow", "f", false, "Follow log output")
+	daemonRotateLogsCmd.Flags().BoolVar(&daemonRotateLogsForce, "force", false, "Rotate all logs regardless of size")
 
 	rootCmd.AddCommand(daemonCmd)
 }
@@ -180,6 +260,7 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 			style.Bold.Render("●"),
 			style.Bold.Render("running"),
 			pid)
+		fmt.Printf("  Town: %s\n", townRoot)
 
 		// Load state for more details
 		state, err := daemon.LoadState(townRoot)
@@ -264,4 +345,94 @@ func runDaemonRun(cmd *cobra.Command, args []string) error {
 	}
 
 	return d.Run()
+}
+
+func runDaemonEnableSupervisor(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	msg, err := templates.ProvisionSupervisor(townRoot)
+	if err != nil {
+		return fmt.Errorf("configuring supervisor: %w", err)
+	}
+
+	fmt.Printf("%s %s\n", style.Bold.Render("✓"), msg)
+	fmt.Println("\nThe daemon will now:")
+	fmt.Println("  - Auto-restart if it crashes")
+	fmt.Println("  - Start automatically on login/boot")
+	fmt.Println("\nTo stop the supervised daemon:")
+	if runtime.GOOS == "darwin" {
+		fmt.Println("  launchctl unload ~/Library/LaunchAgents/com.gastown.daemon.plist")
+	} else {
+		fmt.Println("  systemctl --user stop gastown-daemon.service")
+		fmt.Println("  systemctl --user disable gastown-daemon.service")
+	}
+	return nil
+}
+
+func runDaemonClearBackoff(cmd *cobra.Command, args []string) error {
+	agentID := args[0]
+
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Clear the crash loop state on disk
+	if err := daemon.ClearAgentBackoff(townRoot, agentID); err != nil {
+		return fmt.Errorf("clearing backoff for %s: %w", agentID, err)
+	}
+
+	// Signal the daemon to reload its in-memory restart tracker
+	running, pid, err := daemon.IsRunning(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking daemon status: %w", err)
+	}
+	if running {
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			return fmt.Errorf("finding daemon process: %w", err)
+		}
+		if err := signalDaemonReload(process); err != nil {
+			return fmt.Errorf("signaling daemon to reload: %w", err)
+		}
+		fmt.Printf("%s Cleared backoff for %s (daemon reloaded)\n", style.Bold.Render("✓"), agentID)
+	} else {
+		fmt.Printf("%s Cleared backoff for %s (daemon not running, will take effect on next start)\n",
+			style.Bold.Render("✓"), agentID)
+	}
+
+	return nil
+}
+
+func runDaemonRotateLogs(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	var result *daemon.RotateLogsResult
+	if daemonRotateLogsForce {
+		result = daemon.ForceRotateLogs(townRoot)
+	} else {
+		result = daemon.RotateLogs(townRoot)
+	}
+
+	for _, path := range result.Rotated {
+		fmt.Printf("%s Rotated %s\n", style.Bold.Render("✓"), path)
+	}
+	for _, path := range result.Skipped {
+		fmt.Printf("  %s %s (below threshold)\n", style.Dim.Render("·"), path)
+	}
+	for _, err := range result.Errors {
+		fmt.Printf("  %s %v\n", style.Warning.Render("⚠"), err)
+	}
+
+	if len(result.Rotated) == 0 && len(result.Errors) == 0 {
+		fmt.Printf("%s No logs needed rotation\n", style.Bold.Render("✓"))
+	}
+
+	return nil
 }

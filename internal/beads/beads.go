@@ -3,6 +3,7 @@ package beads
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/runtime"
+	"github.com/steveyegge/gastown/internal/telemetry"
 )
 
 // Common errors
@@ -21,7 +24,35 @@ import (
 var (
 	ErrNotInstalled = errors.New("bd not installed: run 'pip install beads-cli' or see https://github.com/anthropics/beads")
 	ErrNotFound     = errors.New("issue not found")
+	ErrFlagTitle    = errors.New("title looks like a CLI flag (starts with '-'); use --title=\"...\" to set flag-like titles intentionally")
 )
+
+// ExtractIssueID strips the external:prefix:id wrapper from bead IDs.
+// bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
+// but consumers need the raw bead ID for display and lookups.
+func ExtractIssueID(id string) string {
+	if strings.HasPrefix(id, "external:") {
+		parts := strings.SplitN(id, ":", 3)
+		if len(parts) == 3 {
+			return parts[2]
+		}
+	}
+	return id
+}
+
+// IsFlagLikeTitle returns true if the title looks like it was accidentally set
+// from a CLI flag (e.g., "--help", "--json", "-v"). This catches a common
+// mistake where `bd create --title --help` consumes --help as the title value
+// instead of showing help. Titles with spaces (e.g., "Fix --help handling")
+// are allowed since they're clearly intentional multi-word titles.
+func IsFlagLikeTitle(title string) bool {
+	if !strings.HasPrefix(title, "-") {
+		return false
+	}
+	// Single-word flag-like strings: "--help", "-h", "--json", "--verbose"
+	// Multi-word titles with flags embedded are fine: "Fix --help handling"
+	return !strings.Contains(title, " ")
+}
 
 // Issue represents a beads issue.
 type Issue struct {
@@ -42,7 +73,10 @@ type Issue struct {
 	Blocks      []string `json:"blocks,omitempty"`
 	BlockedBy   []string `json:"blocked_by,omitempty"`
 	Labels      []string `json:"labels,omitempty"`
-	Ephemeral   bool     `json:"ephemeral,omitempty"` // Wisp/ephemeral issues not synced to git
+	Ephemeral   bool     `json:"ephemeral,omitempty"` // Wisp/ephemeral issues, not synced to git
+
+	// Content fields (parsed from bd show --json)
+	AcceptanceCriteria string `json:"acceptance_criteria,omitempty"`
 
 	// Agent bead slots (type=agent only)
 	HookBead   string `json:"hook_bead,omitempty"`   // Current work attached to agent's hook
@@ -67,6 +101,37 @@ func HasLabel(issue *Issue, label string) bool {
 		}
 	}
 	return false
+}
+
+// HasUncheckedCriteria checks if an issue has acceptance criteria with unchecked items.
+// Returns the count of unchecked items (0 means all checked or no criteria).
+func HasUncheckedCriteria(issue *Issue) int {
+	if issue == nil || issue.AcceptanceCriteria == "" {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(issue.AcceptanceCriteria, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- [ ] ") {
+			count++
+		}
+	}
+	return count
+}
+
+// IsAgentBead checks if an issue is an agent bead by checking for the gt:agent
+// label (preferred) or the legacy type == "agent" field. This handles the migration
+// from type-based to label-based agent identification (see gt-vja7b).
+func IsAgentBead(issue *Issue) bool {
+	if issue == nil {
+		return false
+	}
+	// Check legacy type field first for backward compatibility
+	if issue.Type == "agent" {
+		return true
+	}
+	// Check for gt:agent label (current standard)
+	return HasLabel(issue, "gt:agent")
 }
 
 // IssueDep represents a dependency or dependent issue with its relation.
@@ -99,7 +164,7 @@ type CreateOptions struct {
 	Description string
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
-	Ephemeral   bool   // Create as ephemeral (wisp) - not exported to JSONL
+	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
 }
 
 // UpdateOptions specifies options for updating an issue.
@@ -124,9 +189,10 @@ type SyncStatus struct {
 
 // Beads wraps bd CLI operations for a working directory.
 type Beads struct {
-	workDir  string
-	beadsDir string // Optional BEADS_DIR override for cross-database access
-	isolated bool   // If true, suppress inherited beads env vars (for test isolation)
+	workDir    string
+	beadsDir   string // Optional BEADS_DIR override for cross-database access
+	isolated   bool   // If true, suppress inherited beads env vars (for test isolation)
+	serverPort int    // If set, pass --server-port to bd init and GT_DOLT_PORT to env
 
 	// Lazy-cached town root for routing resolution.
 	// Populated on first call to getTownRoot() to avoid filesystem walk on every operation.
@@ -144,6 +210,14 @@ func New(workDir string) *Beads {
 // tests from accidentally routing to production databases.
 func NewIsolated(workDir string) *Beads {
 	return &Beads{workDir: workDir, isolated: true}
+}
+
+// NewIsolatedWithPort creates a Beads wrapper for test isolation that targets
+// a specific Dolt server port. Init() passes --server-port to bd init, and all
+// commands get GT_DOLT_PORT in their environment. This prevents tests from
+// creating databases on the production Dolt server (port 3307).
+func NewIsolatedWithPort(workDir string, serverPort int) *Beads {
+	return &Beads{workDir: workDir, isolated: true, serverPort: serverPort}
 }
 
 // NewWithBeadsDir creates a Beads wrapper with an explicit BEADS_DIR.
@@ -184,15 +258,31 @@ func (b *Beads) getResolvedBeadsDir() string {
 
 // Init initializes a new beads database in the working directory.
 // This uses the same environment isolation as other commands.
+// If ServerPort is set (via NewIsolatedWithPort), passes --server-port to bd init
+// so the database is created on the test Dolt server.
 func (b *Beads) Init(prefix string) error {
-	_, err := b.run("init", "--prefix", prefix, "--quiet")
+	args := []string{"init"}
+	if prefix != "" {
+		args = append(args, "--prefix", prefix)
+	}
+	args = append(args, "--quiet")
+	if b.serverPort > 0 {
+		args = append(args, "--server-port", fmt.Sprintf("%d", b.serverPort))
+	}
+	_, err := b.run(args...)
 	return err
 }
 
 // run executes a bd command and returns stdout.
-func (b *Beads) run(args ...string) ([]byte, error) {
-	// Use --allow-stale to prevent failures when db is out of sync with JSONL
-	// (e.g., after daemon is killed during shutdown before syncing).
+func (b *Beads) run(args ...string) (_ []byte, retErr error) {
+	start := time.Now()
+	// Declare buffers before defer so the closure captures them after cmd.Run.
+	var stdout, stderr bytes.Buffer
+	defer func() {
+		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
+	}()
+	// Use --allow-stale to prevent failures when db is temporarily stale
+	// (e.g., after daemon is killed during shutdown).
 	fullArgs := append([]string{"--allow-stale"}, args...)
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
@@ -215,17 +305,9 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = b.workDir
 
-	// Build environment: filter beads env vars when in isolated mode (tests)
-	// to prevent routing to production databases.
-	var env []string
-	if b.isolated {
-		env = filterBeadsEnv(os.Environ())
-	} else {
-		env = os.Environ()
-	}
-	cmd.Env = append(env, "BEADS_DIR="+beadsDir)
+	cmd.Env = append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
+	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 
-	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -237,6 +319,40 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 	// Handle bd exit code 0 bug: when issue not found,
 	// bd may exit 0 but write error to stderr with empty stdout.
 	// Detect this case and treat as error to avoid JSON parse failures.
+	if stdout.Len() == 0 && stderr.Len() > 0 {
+		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
+	}
+
+	return stdout.Bytes(), nil
+}
+
+// runWithRouting executes a bd command without setting BEADS_DIR, allowing bd's
+// native prefix-based routing via routes.jsonl to resolve cross-prefix beads.
+// This is needed for slot operations that reference beads with different prefixes
+// (e.g., setting an hq-* hook bead on a gt-* agent bead).
+// See: sling_helpers.go verifyBeadExists/hookBeadWithRetry for the same pattern.
+func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //nolint:unparam // mirrors run() signature for consistency
+	start := time.Now()
+	var stdout, stderr bytes.Buffer
+	defer func() {
+		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
+	}()
+	fullArgs := append([]string{"--allow-stale"}, args...)
+
+	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	cmd.Dir = b.workDir
+
+	cmd.Env = b.buildRoutingEnv()
+	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, b.wrapError(err, stderr.String(), args)
+	}
+
 	if stdout.Len() == 0 && stderr.Len() > 0 {
 		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
 	}
@@ -276,12 +392,72 @@ func (b *Beads) wrapError(err error, stderr string, args []string) error {
 	return fmt.Errorf("bd %s: %w", strings.Join(args, " "), err)
 }
 
+// isSubprocessCrash returns true if the error indicates the subprocess crashed
+// (e.g., Dolt nil pointer dereference causing SIGSEGV). This is used to detect
+// recoverable failures where a fallback strategy should be attempted (GH#1769).
+func isSubprocessCrash(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Detect signals from crashed subprocesses (bd panic → SIGSEGV)
+	return strings.Contains(errStr, "signal:") ||
+		strings.Contains(errStr, "segmentation") ||
+		strings.Contains(errStr, "nil pointer") ||
+		strings.Contains(errStr, "panic:")
+}
+
+// buildRunEnv builds the environment for run() calls.
+// In isolated mode: strips all beads-related env vars for test isolation.
+// Otherwise: strips inherited BEADS_DIR so the caller can append the correct value.
+// Without this, getenv() returns the first occurrence, so an inherited BEADS_DIR
+// (e.g., from a parent process or shell context) would shadow the explicit value
+// appended by run(). This was the root cause of gt-uygpe / GH #803.
+func (b *Beads) buildRunEnv() []string {
+	if b.isolated {
+		env := filterBeadsEnv(os.Environ())
+		if b.serverPort > 0 {
+			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
+			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+		}
+		return env
+	}
+	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	return translateDoltPort(env)
+}
+
+// buildRoutingEnv builds the environment for runWithRouting() calls.
+// Always strips BEADS_DIR so bd uses native routing.
+// In isolated mode: also strips BD_ACTOR, BEADS_*, GT_ROOT, HOME.
+func (b *Beads) buildRoutingEnv() []string {
+	if b.isolated {
+		env := filterBeadsEnv(os.Environ())
+		if b.serverPort > 0 {
+			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
+			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+		}
+		return env
+	}
+	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	return translateDoltPort(env)
+}
+
 // filterBeadsEnv removes beads-related environment variables from the given
 // environment slice. This ensures test isolation by preventing inherited
 // BD_ACTOR, BEADS_DB, GT_ROOT, HOME etc. from routing commands to production databases.
+//
+// Preserves GT_DOLT_PORT and BEADS_DOLT_PORT so that isolated-mode tests can
+// reach a test Dolt server on a non-default port.
 func filterBeadsEnv(environ []string) []string {
 	filtered := make([]string, 0, len(environ))
 	for _, env := range environ {
+		// Preserve port env vars needed to reach test Dolt servers.
+		// These must be checked before the broad BEADS_ prefix strip below.
+		if strings.HasPrefix(env, "BEADS_DOLT_PORT=") ||
+			strings.HasPrefix(env, "GT_DOLT_PORT=") {
+			filtered = append(filtered, env)
+			continue
+		}
 		// Skip beads-related env vars that could interfere with test isolation
 		// BD_ACTOR, BEADS_* - direct beads config
 		// GT_ROOT - causes bd to find global routes file
@@ -293,6 +469,46 @@ func filterBeadsEnv(environ []string) []string {
 			continue
 		}
 		filtered = append(filtered, env)
+	}
+	return filtered
+}
+
+// translateDoltPort ensures BEADS_DOLT_PORT is set when GT_DOLT_PORT is present.
+// Gas Town uses GT_DOLT_PORT; beads uses BEADS_DOLT_PORT. This translation
+// prevents bd subprocesses from falling back to metadata.json's port 3307
+// (production) when a test or daemon has set GT_DOLT_PORT to an alternate port.
+func translateDoltPort(env []string) []string {
+	var gtPort string
+	hasBDP := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "GT_DOLT_PORT=") {
+			gtPort = strings.TrimPrefix(e, "GT_DOLT_PORT=")
+		}
+		if strings.HasPrefix(e, "BEADS_DOLT_PORT=") {
+			hasBDP = true
+		}
+	}
+	if gtPort != "" && !hasBDP {
+		env = append(env, "BEADS_DOLT_PORT="+gtPort)
+	}
+	return env
+}
+
+// stripEnvPrefixes removes entries matching any of the given prefixes from an
+// environment variable slice. Used by runWithRouting to strip BEADS_DIR.
+func stripEnvPrefixes(environ []string, prefixes ...string) []string {
+	filtered := make([]string, 0, len(environ))
+	for _, env := range environ {
+		skip := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(env, prefix) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, env)
+		}
 	}
 	return filtered
 }
@@ -353,47 +569,27 @@ func (b *Beads) ListByAssignee(assignee string) ([]*Issue, error) {
 	})
 }
 
-// GetAssignedIssue returns the first open or hooked issue assigned to the given assignee.
-// Returns nil if no open or hooked issue is assigned.
+// GetAssignedIssue returns the first issue assigned to the given assignee.
+// Checks open, in_progress, and hooked statuses (hooked = work on agent's hook).
+// Returns nil if no matching issue is assigned.
 func (b *Beads) GetAssignedIssue(assignee string) (*Issue, error) {
-	issues, err := b.List(ListOptions{
-		Status:   "open",
-		Assignee: assignee,
-		Priority: -1,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Also check in_progress status explicitly
-	if len(issues) == 0 {
-		issues, err = b.List(ListOptions{
-			Status:   "in_progress",
+	// Check all active work statuses: open, in_progress, and hooked
+	// "hooked" status is set by gt sling when work is attached to an agent's hook
+	for _, status := range []string{"open", "in_progress", StatusHooked} {
+		issues, err := b.List(ListOptions{
+			Status:   status,
 			Assignee: assignee,
 			Priority: -1,
 		})
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	// Also check hooked status - polecat may have work attached but not yet started
-	if len(issues) == 0 {
-		issues, err = b.List(ListOptions{
-			Status:   "hooked",
-			Assignee: assignee,
-			Priority: -1,
-		})
-		if err != nil {
-			return nil, err
+		if len(issues) > 0 {
+			return issues[0], nil
 		}
 	}
 
-	if len(issues) == 0 {
-		return nil, nil
-	}
-
-	return issues[0], nil
+	return nil, nil
 }
 
 // Ready returns issues that are ready to work (not blocked).
@@ -406,6 +602,24 @@ func (b *Beads) Ready() ([]*Issue, error) {
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, fmt.Errorf("parsing bd ready output: %w", err)
+	}
+
+	return issues, nil
+}
+
+// ReadyForMol returns ready steps within a specific molecule.
+// Delegates to bd ready --mol which uses beads' canonical blocking semantics
+// (blocked_issues_cache), handling all blocking types, transitive propagation,
+// and conditional-blocks resolution.
+func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {
+	out, err := b.run("ready", "--mol", moleculeID, "--json", "-n", "100")
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd ready --mol output: %w", err)
 	}
 
 	return issues, nil
@@ -502,6 +716,11 @@ func (b *Beads) Blocked() ([]*Issue, error) {
 // If opts.Actor is empty, it defaults to the BD_ACTOR environment variable.
 // This ensures created_by is populated for issue provenance tracking.
 func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(opts.Title) {
+		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
 	args := []string{"create", "--json"}
 
 	if opts.Title != "" {
@@ -550,6 +769,11 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 // This is useful for agent beads, role beads, and other beads that need
 // deterministic IDs rather than auto-generated ones.
 func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(opts.Title) {
+		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
 	args := []string{"create", "--json", "--id=" + id}
 	if NeedsForceForID(id) {
 		args = append(args, "--force")
@@ -592,6 +816,115 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 	}
 
 	return &issue, nil
+}
+
+// SearchOptions specifies options for searching issues.
+type SearchOptions struct {
+	Query        string // Text query to search titles and descriptions
+	Status       string // "open", "closed", "all"
+	Label        string // Label filter (e.g., "gt:bug")
+	Limit        int    // Max results (0 = default)
+	DescContains string // Filter by description substring
+}
+
+// Search searches issues by text query across title, description, and ID.
+func (b *Beads) Search(opts SearchOptions) ([]*Issue, error) {
+	args := []string{"search", "--json"}
+
+	if opts.Query != "" {
+		args = append(args, opts.Query)
+	}
+	if opts.Status != "" {
+		args = append(args, "--status="+opts.Status)
+	}
+	if opts.Label != "" {
+		args = append(args, "--label="+opts.Label)
+	}
+	if opts.Limit > 0 {
+		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	}
+	if opts.DescContains != "" {
+		args = append(args, "--desc-contains="+opts.DescContains)
+	}
+
+	out, err := b.run(args...)
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd search output: %w", err)
+	}
+
+	return issues, nil
+}
+
+// FindOpenBugsByTitle searches for existing open bugs with titles similar to the given title.
+// Used for duplicate detection before filing new test-failure bugs.
+// Returns matching issues sorted by relevance (best match first).
+func (b *Beads) FindOpenBugsByTitle(title string) ([]*Issue, error) {
+	// Extract key terms from the title for searching.
+	// Test failure titles typically contain the test name or error description.
+	issues, err := b.Search(SearchOptions{
+		Query:  title,
+		Status: "open",
+		Label:  "gt:bug",
+		Limit:  10,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("searching for duplicate bugs: %w", err)
+	}
+
+	return issues, nil
+}
+
+// CreateIfNoDuplicate creates a new bug only if no existing open bug has a similar title.
+// If a duplicate is found, it returns the existing issue and a nil error.
+// The returned bool is true if a new issue was created, false if an existing duplicate was found.
+func (b *Beads) CreateIfNoDuplicate(opts CreateOptions) (*Issue, bool, error) {
+	if opts.Title == "" {
+		return nil, false, fmt.Errorf("title is required for duplicate detection")
+	}
+
+	// Search for existing open bugs with similar titles
+	existing, err := b.FindOpenBugsByTitle(opts.Title)
+	if err != nil {
+		// If search fails, fall through to create (fail-open)
+		issue, createErr := b.Create(opts)
+		if createErr != nil {
+			return nil, false, createErr
+		}
+		return issue, true, nil
+	}
+
+	// Check for title similarity using normalized comparison
+	normalizedTitle := normalizeBugTitle(opts.Title)
+	for _, issue := range existing {
+		if normalizeBugTitle(issue.Title) == normalizedTitle {
+			// Exact normalized match — this is a duplicate
+			return issue, false, nil
+		}
+	}
+
+	// No duplicate found, create the new bug
+	issue, err := b.Create(opts)
+	if err != nil {
+		return nil, false, err
+	}
+	return issue, true, nil
+}
+
+// normalizeBugTitle normalizes a bug title for duplicate comparison.
+// Strips common prefixes, whitespace, and case differences so that
+// "Pre-existing failure: test_foo fails" matches "pre-existing failure: test_foo fails".
+func normalizeBugTitle(title string) string {
+	t := strings.ToLower(strings.TrimSpace(title))
+	// Strip common prefixes that the refinery adds
+	for _, prefix := range []string{"pre-existing failure: ", "pre-existing: ", "test failure: "} {
+		t = strings.TrimPrefix(t, prefix)
+	}
+	return t
 }
 
 // Update updates an existing issue.

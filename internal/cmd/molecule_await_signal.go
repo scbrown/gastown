@@ -5,13 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
@@ -26,11 +31,11 @@ var (
 var moleculeAwaitSignalCmd = &cobra.Command{
 	Use:   "await-signal",
 	Short: "Wait for activity feed signal with timeout",
-	Long: `Wait for any activity on the beads feed, with optional backoff.
+	Long: `Wait for any activity on the events feed, with optional backoff.
 
-This command is the primary wake mechanism for patrol agents. It subscribes
-to 'bd activity --follow' and returns immediately when any line of output
-is received (indicating beads activity).
+This command is the primary wake mechanism for patrol agents. It tails
+~/gt/.events.jsonl and returns immediately when a new event is appended
+(indicating Gas Town activity such as slings, nudges, mail, spawns, etc.).
 
 If no activity occurs within the timeout, the command returns with exit code 0
 but sets the AWAIT_SIGNAL_REASON environment variable to "timeout".
@@ -48,10 +53,13 @@ received, the caller should reset idle:0 on the agent bead.
 
 EXIT CODES:
   0 - Signal received or timeout (check output for which)
-  1 - Error starting feed subscription
+  1 - Error opening events file
 
 EXAMPLES:
-  # Simple wait with 60s timeout
+  # Simple wait with 60s timeout (canonical form)
+  gt mol step await-signal --timeout 60s
+
+  # Short form (alias)
   gt mol await-signal --timeout 60s
 
   # Backoff mode with agent bead tracking:
@@ -64,6 +72,17 @@ EXAMPLES:
   # Quiet mode (no output, for scripting)
   gt mol await-signal --timeout 30s --quiet`,
 	RunE: runMoleculeAwaitSignal,
+}
+
+// moleculeAwaitSignalShortcutCmd is a separate command instance that allows
+// "gt mol await-signal" in addition to the canonical "gt mol step await-signal".
+// A separate instance is required because cobra does not support a single
+// command having two parents (AddCommand overwrites the parent pointer).
+var moleculeAwaitSignalShortcutCmd = &cobra.Command{
+	Use:   "await-signal",
+	Short: "Wait for activity feed signal with timeout (alias: gt mol step await-signal)",
+	Long:  moleculeAwaitSignalCmd.Long,
+	RunE:  runMoleculeAwaitSignal,
 }
 
 // AwaitSignalResult is the result of an await-signal operation.
@@ -91,13 +110,38 @@ func init() {
 		"Output as JSON")
 
 	moleculeStepCmd.AddCommand(moleculeAwaitSignalCmd)
+
+	// Register shortcut flags on the shortcut command (shares the same global vars)
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalTimeout, "timeout", "60s",
+		"Maximum time to wait for signal (e.g., 30s, 5m)")
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalBackoffBase, "backoff-base", "",
+		"Base interval for exponential backoff (e.g., 30s)")
+	moleculeAwaitSignalShortcutCmd.Flags().IntVar(&awaitSignalBackoffMult, "backoff-mult", 2,
+		"Multiplier for exponential backoff (default: 2)")
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalBackoffMax, "backoff-max", "",
+		"Maximum interval cap for backoff (e.g., 10m)")
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
+		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
+	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
+		"Suppress output (for scripting)")
+	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&moleculeJSON, "json", false,
+		"Output as JSON")
+
+	// alias: gt mol await-signal (in addition to gt mol step await-signal)
+	moleculeCmd.AddCommand(moleculeAwaitSignalShortcutCmd)
 }
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
-	// Find beads directory
+	// Find beads directory (rig-local for bead operations)
 	workDir, err := findLocalBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
+	}
+
+	// Find town root for events file (events are always at <townRoot>/.events.jsonl)
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
 	beadsDir := beads.ResolveBeadsDir(workDir)
@@ -176,11 +220,11 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 
-	// Start bd activity --follow
+	// Tail events file for new activity
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForActivitySignal(ctx, workDir)
+	result, err := waitForActivitySignal(ctx, townRoot)
 	if err != nil {
 		return fmt.Errorf("feed subscription failed: %w", err)
 	}
@@ -197,6 +241,13 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 			}
 		} else {
 			result.IdleCycles = newIdleCycles
+		}
+		// Update last_activity so watchers know agent is still alive
+		if err := updateAgentHeartbeat(awaitSignalAgentBead, beadsDir); err != nil {
+			if !awaitSignalQuiet {
+				fmt.Printf("%s Failed to update agent heartbeat: %v\n",
+					style.Dim.Render("⚠"), err)
+			}
 		}
 		// Clear the backoff window — timeout completed normally
 		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
@@ -284,60 +335,55 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 	return time.ParseDuration(awaitSignalTimeout)
 }
 
-// waitForActivitySignal starts bd activity --follow and waits for any output.
-// Returns immediately when a line is received, or when context is canceled.
-func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalResult, error) {
-	// Start bd activity --follow
-	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
-	cmd.Dir = workDir
+// waitForActivitySignal tails the events file for new activity.
+// townRoot is the Gas Town workspace root; the events file is at
+// <townRoot>/.events.jsonl. Returns immediately when a new event line is
+// appended, or when context is canceled.
+func waitForActivitySignal(ctx context.Context, townRoot string) (*AwaitSignalResult, error) {
+	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile))
+}
 
-	stdout, err := cmd.StdoutPipe()
+// waitForEventsFile tails the events file for new lines.
+// This replaces the former bd activity --follow subprocess approach.
+func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResult, error) {
+
+	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("creating stdout pipe: %w", err)
+		return nil, fmt.Errorf("opening events file %s: %w", eventsPath, err)
+	}
+	defer f.Close()
+
+	// Seek to end — we only want new events, not historical ones
+	if _, err := f.Seek(0, 2); err != nil {
+		return nil, fmt.Errorf("seeking to end of events file: %w", err)
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting bd activity: %w", err)
-	}
+	// Poll for new lines using bufio.Reader (not Scanner, which doesn't
+	// resume after EOF). Reader.ReadString properly retries the underlying
+	// file reader, picking up appended data between polls.
+	reader := bufio.NewReader(f)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
-	// Channel for results
-	signalCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-
-	// Read lines in goroutine
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		if scanner.Scan() {
-			// Got a line - this is our signal
-			signalCh <- scanner.Text()
-		} else if err := scanner.Err(); err != nil {
-			errCh <- err
+	for {
+		select {
+		case <-ctx.Done():
+			return &AwaitSignalResult{
+				Reason: "timeout",
+			}, nil
+		case <-ticker.C:
+			line, err := reader.ReadString('\n')
+			if err == nil && line != "" {
+				return &AwaitSignalResult{
+					Reason: "signal",
+					Signal: strings.TrimRight(line, "\n"),
+				}, nil
+			}
+			// io.EOF means no new data yet — keep polling
+			if err != nil && err != io.EOF {
+				return nil, fmt.Errorf("reading events file: %w", err)
+			}
 		}
-	}()
-
-	// Wait for signal, error, or timeout
-	select {
-	case signal := <-signalCh:
-		// Got activity signal - kill the process and return
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return &AwaitSignalResult{
-			Reason: "signal",
-			Signal: signal,
-		}, nil
-
-	case err := <-errCh:
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("reading from feed: %w", err)
-
-	case <-ctx.Done():
-		// Timeout - kill process and return timeout result
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return &AwaitSignalResult{
-			Reason: "timeout",
-		}, nil
 	}
 }
 

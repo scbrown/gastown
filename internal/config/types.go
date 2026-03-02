@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 )
 
 // TownConfig represents the main town identity (mayor/town.json).
@@ -47,7 +49,7 @@ type TownSettings struct {
 	CLITheme string `json:"cli_theme,omitempty"`
 
 	// DefaultAgent is the name of the agent preset to use by default.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent name defined in settings/agents.json.
 	// Default: "claude"
 	DefaultAgent string `json:"default_agent,omitempty"`
@@ -78,6 +80,22 @@ type TownSettings struct {
 
 	// FeedCurator configures event deduplication and aggregation windows.
 	FeedCurator *FeedCuratorConfig `json:"feed_curator,omitempty"`
+
+	// Convoy configures convoy behavior settings.
+	Convoy *ConvoyConfig `json:"convoy,omitempty"`
+
+	// CostTier tracks which cost tier preset was applied (informational).
+	// Actual model assignments live in RoleAgents and Agents.
+	// Values: "standard", "economy", "budget", or empty for custom configs.
+	CostTier string `json:"cost_tier,omitempty"`
+
+	// Scheduler configures the capacity scheduler for polecat dispatch.
+	Scheduler *capacity.SchedulerConfig `json:"scheduler,omitempty"`
+
+	// Operational configures operational thresholds (timeouts, retries, intervals).
+	// These were previously hardcoded as Go constants throughout the codebase.
+	// All values are optional — omitted values use compiled-in defaults.
+	Operational *OperationalConfig `json:"operational,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.
@@ -165,6 +183,238 @@ func DefaultFeedCuratorConfig() *FeedCuratorConfig {
 		SlingAggregateWindow: "30s",
 		MinAggregateCount:    3,
 	}
+}
+
+// OperationalConfig groups operational thresholds that were previously hardcoded
+// as Go constants. All fields are optional — omitted values use compiled-in defaults.
+// This enables per-town tuning without code changes (ZFC: Zero Fixed Constants).
+type OperationalConfig struct {
+	// Session configures session management thresholds.
+	Session *SessionThresholds `json:"session,omitempty"`
+
+	// Nudge configures nudge delivery thresholds.
+	Nudge *NudgeThresholds `json:"nudge,omitempty"`
+
+	// Daemon configures daemon lifecycle thresholds.
+	Daemon *DaemonThresholds `json:"daemon,omitempty"`
+
+	// Deacon configures deacon health-check thresholds.
+	Deacon *DeaconThresholds `json:"deacon,omitempty"`
+
+	// Polecat configures polecat session thresholds.
+	Polecat *PolecatThresholds `json:"polecat,omitempty"`
+
+	// Dolt configures Dolt server operation thresholds.
+	Dolt *DoltThresholds `json:"dolt,omitempty"`
+
+	// Mail configures mail system thresholds.
+	Mail *MailThresholds `json:"mail,omitempty"`
+
+	// Web configures web API thresholds.
+	Web *WebThresholds `json:"web,omitempty"`
+}
+
+// SessionThresholds configures session management timeouts.
+type SessionThresholds struct {
+	// ClaudeStartTimeout is how long to wait for Claude to start (default "60s").
+	ClaudeStartTimeout string `json:"claude_start_timeout,omitempty"`
+
+	// ShellReadyTimeout is how long to wait for shell prompt after command (default "5s").
+	ShellReadyTimeout string `json:"shell_ready_timeout,omitempty"`
+
+	// GracefulShutdownTimeout is wait after Ctrl-C before force-kill (default "3s").
+	GracefulShutdownTimeout string `json:"graceful_shutdown_timeout,omitempty"`
+
+	// BdCommandTimeout is timeout for bd CLI command execution (default "30s").
+	BdCommandTimeout string `json:"bd_command_timeout,omitempty"`
+
+	// BdSubprocessTimeout is timeout for bd subprocess calls in TUI (default "5s").
+	BdSubprocessTimeout string `json:"bd_subprocess_timeout,omitempty"`
+
+	// GUPPViolationTimeout is how long an agent can have hooked work
+	// without progressing before GUPP violation (default "30m").
+	GUPPViolationTimeout string `json:"gupp_violation_timeout,omitempty"`
+
+	// HungSessionThreshold is how long a tmux session can be inactive
+	// before considered hung (default "30m").
+	HungSessionThreshold string `json:"hung_session_threshold,omitempty"`
+
+	// StartupNudgeVerifyDelay is wait after startup nudge before checking (default "5s").
+	StartupNudgeVerifyDelay string `json:"startup_nudge_verify_delay,omitempty"`
+
+	// StartupNudgeMaxRetries is max retries for startup nudge (default 3).
+	StartupNudgeMaxRetries *int `json:"startup_nudge_max_retries,omitempty"`
+}
+
+// NudgeThresholds configures nudge queue and delivery timeouts.
+type NudgeThresholds struct {
+	// ReadyTimeout is how long NudgeSession waits for pane to accept input (default "10s").
+	ReadyTimeout string `json:"ready_timeout,omitempty"`
+
+	// RetryInterval is base interval between send-keys retry attempts (default "500ms").
+	RetryInterval string `json:"retry_interval,omitempty"`
+
+	// LockTimeout is how long to hold the nudge lock (default "30s").
+	LockTimeout string `json:"lock_timeout,omitempty"`
+
+	// NormalTTL is time-to-live for normal-priority nudges (default "30m").
+	NormalTTL string `json:"normal_ttl,omitempty"`
+
+	// UrgentTTL is time-to-live for urgent-priority nudges (default "2h").
+	UrgentTTL string `json:"urgent_ttl,omitempty"`
+
+	// MaxQueueDepth is max pending nudges per session (default 50).
+	MaxQueueDepth *int `json:"max_queue_depth,omitempty"`
+
+	// StaleClaimThreshold is how long a .claimed file must be untouched
+	// before treated as orphan (default "5m").
+	StaleClaimThreshold string `json:"stale_claim_threshold,omitempty"`
+}
+
+// DaemonThresholds configures daemon lifecycle and patrol thresholds.
+type DaemonThresholds struct {
+	// MassDeathWindow is time window for detecting mass session death (default "30s").
+	MassDeathWindow string `json:"mass_death_window,omitempty"`
+
+	// MassDeathThreshold is session deaths within window to trigger alert (default 3).
+	MassDeathThreshold *int `json:"mass_death_threshold,omitempty"`
+
+	// DogIdleSessionTimeout is how long a dog can be idle with tmux before kill (default "1h").
+	DogIdleSessionTimeout string `json:"dog_idle_session_timeout,omitempty"`
+
+	// DogIdleRemoveTimeout is how long a dog can be idle before removal (default "4h").
+	DogIdleRemoveTimeout string `json:"dog_idle_remove_timeout,omitempty"`
+
+	// StaleWorkingTimeout is how long a dog in state=working with no activity
+	// before considered stuck (default "2h").
+	StaleWorkingTimeout string `json:"stale_working_timeout,omitempty"`
+
+	// MaxDogPoolSize is target dog pool size (default 4).
+	MaxDogPoolSize *int `json:"max_dog_pool_size,omitempty"`
+
+	// MaxLifecycleMessageAge is max age of lifecycle mail before discard (default "6h").
+	MaxLifecycleMessageAge string `json:"max_lifecycle_message_age,omitempty"`
+
+	// SyncFailureEscalationThreshold is consecutive git pull failures before
+	// logging escalates from WARN to ERROR (default 3).
+	SyncFailureEscalationThreshold *int `json:"sync_failure_escalation_threshold,omitempty"`
+
+	// DoctorMolCooldown is min interval between mol-dog-doctor molecules (default "5m").
+	DoctorMolCooldown string `json:"doctor_mol_cooldown,omitempty"`
+
+	// RecoveryHeartbeatInterval is the fixed interval for recovery-focused daemon heartbeat (default "3m").
+	RecoveryHeartbeatInterval string `json:"recovery_heartbeat_interval,omitempty"`
+
+	// BootSpawnCooldown prevents Boot from spawning on every daemon heartbeat (default "2m").
+	BootSpawnCooldown string `json:"boot_spawn_cooldown,omitempty"`
+
+	// DeaconGracePeriod is time to wait after starting Deacon before checking heartbeat (default "5m").
+	DeaconGracePeriod string `json:"deacon_grace_period,omitempty"`
+}
+
+// DeaconThresholds configures deacon health-check and dispatch thresholds.
+type DeaconThresholds struct {
+	// PingTimeout is how long to wait for HEALTH_CHECK nudge response (default "30s").
+	PingTimeout string `json:"ping_timeout,omitempty"`
+
+	// ConsecutiveFailures is health check failures before force-kill (default 3).
+	ConsecutiveFailures *int `json:"consecutive_failures,omitempty"`
+
+	// Cooldown is minimum time between force-kills of same agent (default "5m").
+	Cooldown string `json:"cooldown,omitempty"`
+
+	// HeartbeatStaleThreshold is age at which deacon heartbeat is stale (default "5m").
+	HeartbeatStaleThreshold string `json:"heartbeat_stale_threshold,omitempty"`
+
+	// HeartbeatVeryStaleThreshold is age at which heartbeat is very stale (default "15m").
+	HeartbeatVeryStaleThreshold string `json:"heartbeat_very_stale_threshold,omitempty"`
+
+	// MaxRedispatches is max times a bead can be re-dispatched before escalating (default 3).
+	MaxRedispatches *int `json:"max_redispatches,omitempty"`
+
+	// RedispatchCooldown is min time between re-dispatches of same bead (default "5m").
+	RedispatchCooldown string `json:"redispatch_cooldown,omitempty"`
+
+	// MaxFeedsPerCycle is max stranded convoys to feed per invocation (default 3).
+	MaxFeedsPerCycle *int `json:"max_feeds_per_cycle,omitempty"`
+
+	// FeedCooldown is min time between feeding same convoy (default "10m").
+	FeedCooldown string `json:"feed_cooldown,omitempty"`
+}
+
+// PolecatThresholds configures polecat session and retry thresholds.
+type PolecatThresholds struct {
+	// HeartbeatStaleThreshold is age at which polecat heartbeat is stale (default "3m").
+	HeartbeatStaleThreshold string `json:"heartbeat_stale_threshold,omitempty"`
+
+	// DoltMaxRetries is max retries for Dolt operations (default 10).
+	DoltMaxRetries *int `json:"dolt_max_retries,omitempty"`
+
+	// DoltBaseBackoff is base backoff for Dolt retry loop (default "500ms").
+	DoltBaseBackoff string `json:"dolt_base_backoff,omitempty"`
+
+	// DoltBackoffMax is cap for Dolt retry backoff (default "30s").
+	DoltBackoffMax string `json:"dolt_backoff_max,omitempty"`
+
+	// PendingMaxAge is max age for .pending reservation marker (default "5m").
+	PendingMaxAge string `json:"pending_max_age,omitempty"`
+
+	// NamepoolSize is number of name slots in pool (default 50).
+	NamepoolSize *int `json:"namepool_size,omitempty"`
+}
+
+// DoltThresholds configures Dolt server operation thresholds.
+type DoltThresholds struct {
+	// HealthCheckInterval is how often Dolt health check fires (default "30s").
+	HealthCheckInterval string `json:"health_check_interval,omitempty"`
+
+	// CmdTimeout is timeout for individual dolt CLI commands (default "15s").
+	CmdTimeout string `json:"cmd_timeout,omitempty"`
+
+	// MaxConnections is max concurrent connections (default 1000).
+	MaxConnections *int `json:"max_connections,omitempty"`
+
+	// SlowQueryThreshold is duration above which a query is flagged slow (default "1s").
+	SlowQueryThreshold string `json:"slow_query_threshold,omitempty"`
+}
+
+// MailThresholds configures mail system thresholds.
+type MailThresholds struct {
+	// IdleNotifyTimeout is how long to wait for idle notify (default "3s").
+	IdleNotifyTimeout string `json:"idle_notify_timeout,omitempty"`
+
+	// BdReadTimeout is timeout for bd read operations (default "60s").
+	BdReadTimeout string `json:"bd_read_timeout,omitempty"`
+
+	// BdWriteTimeout is timeout for bd write operations (default "60s").
+	BdWriteTimeout string `json:"bd_write_timeout,omitempty"`
+
+	// MaxConcurrentAckOps is max concurrent mail acknowledge operations (default 8).
+	MaxConcurrentAckOps *int `json:"max_concurrent_ack_ops,omitempty"`
+}
+
+// WebThresholds configures web API thresholds.
+type WebThresholds struct {
+	// MaxConcurrentCommands is max concurrent gt subprocesses via web API (default 12).
+	MaxConcurrentCommands *int `json:"max_concurrent_commands,omitempty"`
+
+	// MaxSubjectLen is max subject length for mail API (default 500).
+	MaxSubjectLen *int `json:"max_subject_len,omitempty"`
+
+	// MaxBodyLen is max body length for mail API (default 100000).
+	MaxBodyLen *int `json:"max_body_len,omitempty"`
+}
+
+// DefaultOperationalConfig returns an OperationalConfig with all defaults.
+func DefaultOperationalConfig() *OperationalConfig {
+	return &OperationalConfig{}
+}
+
+// ConvoyConfig configures convoy behavior settings.
+type ConvoyConfig struct {
+	// NotifyOnComplete controls whether convoy completion pushes a notification
+	// into the active Mayor session (in addition to mail). Opt-in; default false.
+	NotifyOnComplete bool `json:"notify_on_complete,omitempty"`
 }
 
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
@@ -263,6 +513,8 @@ type RigsConfig struct {
 // RigEntry represents a single rig in the registry.
 type RigEntry struct {
 	GitURL      string       `json:"git_url"`
+	PushURL     string       `json:"push_url,omitempty"`
+	UpstreamURL string       `json:"upstream_url,omitempty"` // optional upstream URL (for fork workflows)
 	LocalRepo   string       `json:"local_repo,omitempty"`
 	AddedAt     time.Time    `json:"added_at"`
 	BeadsConfig *BeadsConfig `json:"beads,omitempty"`
@@ -290,13 +542,15 @@ const CurrentRigSettingsVersion = 1
 // RigConfig represents per-rig identity (rig/config.json).
 // This contains only identity - behavioral config is in settings/config.json.
 type RigConfig struct {
-	Type      string       `json:"type"`    // "rig"
-	Version   int          `json:"version"` // schema version
-	Name      string       `json:"name"`    // rig name
-	GitURL    string       `json:"git_url"` // git repository URL
-	LocalRepo string       `json:"local_repo,omitempty"`
-	CreatedAt time.Time    `json:"created_at"` // when the rig was created
-	Beads     *BeadsConfig `json:"beads,omitempty"`
+	Type        string       `json:"type"`                   // "rig"
+	Version     int          `json:"version"`                // schema version
+	Name        string       `json:"name"`                   // rig name
+	GitURL      string       `json:"git_url"`                // git repository URL
+	PushURL     string       `json:"push_url,omitempty"`     // optional push URL (fork for read-only upstreams)
+	UpstreamURL string       `json:"upstream_url,omitempty"` // optional upstream URL (for fork workflows)
+	LocalRepo   string       `json:"local_repo,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"` // when the rig was created
+	Beads       *BeadsConfig `json:"beads,omitempty"`
 }
 
 // WorkflowConfig represents workflow settings for a rig.
@@ -318,7 +572,7 @@ type RigSettings struct {
 	Runtime    *RuntimeConfig    `json:"runtime,omitempty"`     // LLM runtime settings (deprecated: use Agent)
 
 	// Agent selects which agent preset to use for this rig.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent defined in settings/agents.json.
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
@@ -335,6 +589,12 @@ type RigSettings struct {
 	// Overrides TownSettings.RoleAgents for this specific rig.
 	// Example: {"witness": "claude-haiku", "polecat": "claude-sonnet"}
 	RoleAgents map[string]string `json:"role_agents,omitempty"`
+
+	// WorkerAgents maps individual crew worker names to agent aliases.
+	// Allows per-worker agent selection, overriding RoleAgents["crew"].
+	// Takes precedence over RoleAgents["crew"] but is overridden by explicit --agent flags.
+	// Example: {"denali": "codex", "glacier": "gemini"}
+	WorkerAgents map[string]string `json:"worker_agents,omitempty"`
 }
 
 // CrewConfig represents crew workspace settings for a rig.
@@ -394,6 +654,12 @@ type RuntimeConfig struct {
 
 	// Instructions controls the per-workspace instruction file name.
 	Instructions *RuntimeInstructionsConfig `json:"instructions,omitempty"`
+
+	// ResolvedAgent is the agent name that was resolved during config lookup.
+	// Set by ResolveRoleAgentConfig / resolveAgentConfigInternal so that
+	// BuildStartupCommand can export GT_AGENT for process detection.
+	// Not serialized — this is a runtime-only field.
+	ResolvedAgent string `json:"-"`
 }
 
 // RuntimeSessionConfig configures how Gas Town discovers runtime session IDs.
@@ -409,7 +675,7 @@ type RuntimeSessionConfig struct {
 
 // RuntimeHooksConfig configures runtime hook installation.
 type RuntimeHooksConfig struct {
-	// Provider controls which hook templates to install: "claude", "opencode", or "none".
+	// Provider controls which hook templates to install: "claude", "opencode", "copilot", or "none".
 	Provider string `json:"provider,omitempty"`
 
 	// Dir is the settings directory (e.g., ".claude").
@@ -417,6 +683,12 @@ type RuntimeHooksConfig struct {
 
 	// SettingsFile is the settings file name (e.g., "settings.json").
 	SettingsFile string `json:"settings_file,omitempty"`
+
+	// Informational indicates the hooks provider installs instructions files only,
+	// not executable lifecycle hooks. When true, Gas Town sends startup fallback
+	// commands (gt prime) via nudge since hooks won't run automatically.
+	// Defaults to false (backwards compatible with claude/opencode which have real hooks).
+	Informational bool `json:"informational,omitempty"`
 }
 
 // RuntimeTmuxConfig controls tmux heuristics for detecting runtime readiness.
@@ -502,6 +774,7 @@ func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	return args
 }
 
+
 func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 	if rc == nil {
 		rc = &RuntimeConfig{}
@@ -573,6 +846,13 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 		rc.Hooks.SettingsFile = defaultHooksFile(rc.Provider)
 	}
 
+	// Set informational flag for providers whose "hooks" are instructions files,
+	// not executable lifecycle hooks. This tells startup fallback logic to send
+	// gt prime via nudge since hooks won't run automatically.
+	if !rc.Hooks.Informational {
+		rc.Hooks.Informational = defaultHooksInformational(rc.Provider)
+	}
+
 	if rc.Tmux == nil {
 		rc.Tmux = &RuntimeTmuxConfig{}
 	}
@@ -601,16 +881,18 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 }
 
 func defaultRuntimeCommand(provider string) string {
-	switch provider {
-	case "codex":
-		return "codex"
-	case "opencode":
-		return "opencode"
-	case "generic":
+	if provider == "generic" {
 		return ""
-	default:
-		return resolveClaudePath()
 	}
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		cmd := preset.Command
+		// Resolve claude path for Claude preset (handles alias installations)
+		if preset.Name == AgentClaude && cmd == "claude" {
+			return resolveClaudePath()
+		}
+		return cmd
+	}
+	return resolveClaudePath() // fallback for unknown providers
 }
 
 // resolveClaudePath finds the claude binary, checking PATH first then common installation locations.
@@ -639,82 +921,67 @@ func resolveClaudePath() string {
 }
 
 func defaultRuntimeArgs(provider string) []string {
-	switch provider {
-	case "claude":
-		return []string{"--dangerously-skip-permissions"}
-	default:
-		return nil
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.Args != nil {
+		return append([]string(nil), preset.Args...) // copy to avoid mutation
 	}
+	return nil
 }
 
 func defaultPromptMode(provider string) string {
-	switch provider {
-	case "codex":
-		return "none"
-	case "opencode":
-		return "none"
-	default:
-		return "arg"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.PromptMode != "" {
+		return preset.PromptMode
 	}
+	return "arg"
 }
 
 func defaultSessionIDEnv(provider string) string {
-	if provider == "claude" {
-		return "CLAUDE_SESSION_ID"
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.SessionIDEnv
 	}
 	return ""
 }
 
 func defaultConfigDirEnv(provider string) string {
-	if provider == "claude" {
-		return "CLAUDE_CONFIG_DIR"
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ConfigDirEnv
 	}
 	return ""
 }
 
 func defaultHooksProvider(provider string) string {
-	switch provider {
-	case "claude":
-		return "claude"
-	case "opencode":
-		return "opencode"
-	default:
-		return "none"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.HooksProvider != "" {
+		return preset.HooksProvider
 	}
+	return "none"
 }
 
 func defaultHooksDir(provider string) string {
-	switch provider {
-	case "claude":
-		return ".claude"
-	case "opencode":
-		return ".opencode/plugin"
-	default:
-		return ""
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksDir
 	}
+	return ""
 }
 
 func defaultHooksFile(provider string) string {
-	switch provider {
-	case "claude":
-		// Use settings.json installed via --settings flag in a gastown-managed
-		// parent directory, keeping customer repos untouched.
-		return "settings.json"
-	case "opencode":
-		return "gastown.js"
-	default:
-		return ""
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksSettingsFile
 	}
+	return ""
+}
+
+// defaultHooksInformational returns true for providers whose hooks are instructions
+// files only (not executable lifecycle hooks). For these providers, Gas Town sends
+// startup fallback commands (gt prime) via nudge since hooks won't auto-run.
+func defaultHooksInformational(provider string) bool {
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksInformational
+	}
+	return false
 }
 
 func defaultProcessNames(provider, command string) []string {
-	if provider == "claude" {
-		return []string{"node"}
-	}
-	if provider == "opencode" {
-		// OpenCode runs as Node.js process, need both for IsAgentRunning detection.
-		// tmux pane_current_command may show "node" or "opencode" depending on how invoked.
-		return []string{"opencode", "node"}
+	if preset := GetAgentPresetByName(provider); preset != nil && len(preset.ProcessNames) > 0 {
+		return append([]string(nil), preset.ProcessNames...) // copy to avoid mutation
 	}
 	if command != "" {
 		return []string{filepath.Base(command)}
@@ -723,37 +990,24 @@ func defaultProcessNames(provider, command string) []string {
 }
 
 func defaultReadyPromptPrefix(provider string) string {
-	if provider == "claude" {
-		// Claude Code uses ❯ (U+276F) as the prompt character
-		return "❯ "
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ReadyPromptPrefix
 	}
 	return ""
 }
 
 func defaultReadyDelayMs(provider string) int {
-	if provider == "claude" {
-		return 10000
-	}
-	if provider == "codex" {
-		return 3000
-	}
-	if provider == "opencode" {
-		// OpenCode requires delay-based detection because its TUI uses
-		// box-drawing characters (┃) that break prompt prefix matching.
-		// 8000ms provides reliable startup detection across models.
-		return 8000
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ReadyDelayMs
 	}
 	return 0
 }
 
 func defaultInstructionsFile(provider string) string {
-	if provider == "codex" {
-		return "AGENTS.md"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.InstructionsFile != "" {
+		return preset.InstructionsFile
 	}
-	if provider == "opencode" {
-		return "AGENTS.md"
-	}
-	return "CLAUDE.md"
+	return "AGENTS.md"
 }
 
 // quoteForShell quotes a string for safe shell usage.
@@ -869,6 +1123,10 @@ type MergeQueueConfig struct {
 
 	// MaxConcurrent is the maximum number of concurrent merges.
 	MaxConcurrent int `json:"max_concurrent"`
+
+	// StaleClaimTimeout is how long a claimed MR can go without updates before
+	// being considered abandoned and eligible for re-claim (e.g., "30m").
+	StaleClaimTimeout string `json:"stale_claim_timeout,omitempty"`
 }
 
 // OnConflict strategy constants.
@@ -941,6 +1199,7 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		RetryFlakyTests:                  1,
 		PollInterval:                     "30s",
 		MaxConcurrent:                    1,
+		StaleClaimTimeout:               "30m",
 	}
 }
 
@@ -993,6 +1252,38 @@ func DefaultAccountsConfigDir() (string, error) {
 	}
 	return home + "/.claude-accounts", nil
 }
+
+// QuotaState represents the quota management state (mayor/quota.json).
+// Tracks which accounts are rate-limited and when they were last rotated.
+type QuotaState struct {
+	Version  int                         `json:"version"`  // schema version
+	Accounts map[string]AccountQuotaState `json:"accounts"` // handle -> quota state
+}
+
+// AccountQuotaStatus is the rate-limit status of an account.
+type AccountQuotaStatus string
+
+const (
+	// QuotaStatusAvailable means the account is not rate-limited.
+	QuotaStatusAvailable AccountQuotaStatus = "available"
+
+	// QuotaStatusLimited means the account has been detected as rate-limited.
+	QuotaStatusLimited AccountQuotaStatus = "limited"
+
+	// QuotaStatusCooldown means the account was limited and is in cooldown.
+	QuotaStatusCooldown AccountQuotaStatus = "cooldown"
+)
+
+// AccountQuotaState tracks the quota status of a single account.
+type AccountQuotaState struct {
+	Status    AccountQuotaStatus `json:"status"`              // current status
+	LimitedAt string             `json:"limited_at,omitempty"` // RFC3339 when limit was detected
+	ResetsAt  string             `json:"resets_at,omitempty"`  // Human-readable reset time from provider (e.g. "7pm (America/Los_Angeles)")
+	LastUsed  string             `json:"last_used,omitempty"`  // RFC3339 when account was last assigned to a session
+}
+
+// CurrentQuotaVersion is the current schema version for QuotaState.
+const CurrentQuotaVersion = 1
 
 // MessagingConfig represents the messaging configuration (config/messaging.json).
 // This defines mailing lists, work queues, and announcement channels.

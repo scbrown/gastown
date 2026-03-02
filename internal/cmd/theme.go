@@ -9,6 +9,7 @@ import (
 	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -16,7 +17,6 @@ import (
 
 var (
 	themeListFlag     bool
-	themeApplyFlag    bool
 	themeApplyAllFlag bool
 )
 
@@ -146,14 +146,10 @@ func runThemeApply(cmd *cobra.Command, args []string) error {
 	// Determine current rig
 	rigName := detectCurrentRig()
 
-	// Get session names for comparison
-	mayorSession := session.MayorSessionName()
-	deaconSession := session.DeaconSessionName()
-
 	// Apply to matching sessions
 	applied := 0
 	for _, sess := range sessions {
-		if !strings.HasPrefix(sess, "gt-") {
+		if !session.IsKnownSession(sess) {
 			continue
 		}
 
@@ -161,43 +157,38 @@ func runThemeApply(cmd *cobra.Command, args []string) error {
 		var theme tmux.Theme
 		var rig, worker, role string
 
-		if sess == mayorSession {
+		identity, err := session.ParseSessionName(sess)
+		if err != nil {
+			continue
+		}
+
+		switch identity.Role {
+		case session.RoleMayor:
 			theme = tmux.MayorTheme()
 			worker = "Mayor"
 			role = "coordinator"
-		} else if sess == deaconSession {
+		case session.RoleDeacon:
 			theme = tmux.DeaconTheme()
 			worker = "Deacon"
 			role = "health-check"
-		} else if strings.HasSuffix(sess, "-witness") && strings.HasPrefix(sess, "gt-") {
-			// Witness sessions: gt-<rig>-witness
-			rig = strings.TrimPrefix(strings.TrimSuffix(sess, "-witness"), "gt-")
-			theme = getThemeForRole(rig, "witness")
-			worker = "witness"
-			role = "witness"
-		} else {
-			// Parse session name: gt-<rig>-<worker> or gt-<rig>-crew-<name>
-			parts := strings.SplitN(sess, "-", 3)
-			if len(parts) < 3 {
-				continue
-			}
-			rig = parts[1]
+		default:
+			rig = identity.Rig
 
 			// Skip if not matching current rig (unless --all flag)
 			if !themeApplyAllFlag && rigName != "" && rig != rigName {
 				continue
 			}
 
-			workerPart := parts[2]
-			if strings.HasPrefix(workerPart, "crew-") {
-				worker = strings.TrimPrefix(workerPart, "crew-")
-				role = "crew"
-			} else if workerPart == "refinery" {
-				worker = "refinery"
-				role = "refinery"
-			} else {
-				worker = workerPart
-				role = "polecat"
+			role = string(identity.Role)
+			switch identity.Role {
+			case session.RoleWitness:
+				worker = constants.RoleWitness
+			case session.RoleRefinery:
+				worker = constants.RoleRefinery
+			case session.RoleCrew:
+				worker = identity.Name
+			default:
+				worker = identity.Name
 			}
 
 			// Use role-based theme resolution
@@ -239,11 +230,9 @@ func detectCurrentRig() string {
 	}
 
 	// Try to extract from tmux session name
-	if session := detectCurrentSession(); session != "" {
-		// Extract rig from session name: gt-<rig>-...
-		parts := strings.SplitN(session, "-", 3)
-		if len(parts) >= 2 && parts[0] == "gt" && parts[1] != "mayor" && parts[1] != "deacon" {
-			return parts[1]
+	if sessName := detectCurrentSession(); sessName != "" {
+		if identity, err := session.ParseSessionName(sessName); err == nil && identity.Rig != "" {
+			return identity.Rig
 		}
 	}
 
@@ -268,7 +257,7 @@ func detectCurrentRig() string {
 	// Extract first path component (rig name)
 	// Patterns: <rig>/..., mayor/..., deacon/...
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) > 0 && parts[0] != "." && parts[0] != "mayor" && parts[0] != "deacon" {
+	if len(parts) > 0 && parts[0] != "." && parts[0] != constants.RoleMayor && parts[0] != constants.RoleDeacon {
 		return parts[0]
 	}
 

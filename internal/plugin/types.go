@@ -9,7 +9,8 @@
 package plugin
 
 import (
-	"time"
+	"fmt"
+	"strings"
 )
 
 // Plugin represents a discovered plugin definition.
@@ -154,12 +155,28 @@ func (p *Plugin) Summary() PluginSummary {
 	}
 }
 
-// PluginRun represents a single execution of a plugin.
-type PluginRun struct {
-	PluginName string    `json:"plugin_name"`
-	RigName    string    `json:"rig_name,omitempty"`
-	StartTime  time.Time `json:"start_time"`
-	EndTime    time.Time `json:"end_time,omitempty"`
-	Result     string    `json:"result"` // "success" or "failure"
-	Message    string    `json:"message,omitempty"`
+// FormatMailBody formats the plugin as instructions for a dog worker.
+// This is the canonical formatting used by both the daemon dispatcher
+// and the gt dog dispatch command.
+func (p *Plugin) FormatMailBody() string {
+	var sb strings.Builder
+
+	sb.WriteString("Execute the following plugin:\n\n")
+	sb.WriteString(fmt.Sprintf("**Plugin**: %s\n", p.Name))
+	sb.WriteString(fmt.Sprintf("**Description**: %s\n", p.Description))
+	if p.RigName != "" {
+		sb.WriteString(fmt.Sprintf("**Rig**: %s\n", p.RigName))
+	}
+	if p.Execution != nil && p.Execution.Timeout != "" {
+		sb.WriteString(fmt.Sprintf("**Timeout**: %s\n", p.Execution.Timeout))
+	}
+	sb.WriteString("\n---\n\n")
+	sb.WriteString("## Instructions\n\n")
+	sb.WriteString(p.Instructions)
+	sb.WriteString("\n\n---\n\n")
+	sb.WriteString("After completion:\n")
+	sb.WriteString("1. Create a wisp to record the result (success/failure)\n")
+	sb.WriteString("2. Run `gt dog done` — this clears your work and auto-terminates the session\n")
+
+	return sb.String()
 }

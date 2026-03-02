@@ -2,14 +2,15 @@ package plugin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // RunResult represents the outcome of a plugin execution.
@@ -77,7 +78,9 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 		args = append(args, "--description="+record.Body)
 	}
 
-	cmd := exec.Command("bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
+	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = r.townRoot
 	// Set BEADS_DIR explicitly to prevent inherited env vars from causing
 	// prefix mismatches when redirects are in play.
@@ -134,16 +137,21 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 		args = append(args, fmt.Sprintf("--limit=%d", limit))
 	}
 	if since != "" {
-		// Convert duration like "1h" to created-after format
-		// bd supports relative dates with - prefix (e.g., -1h, -24h)
-		sinceArg := since
-		if !strings.HasPrefix(since, "-") {
-			sinceArg = "-" + since
+		// Parse as Go duration and compute an absolute RFC3339 cutoff.
+		// bd's compact duration uses "m" for months, but plugin gate
+		// durations use Go's time.ParseDuration where "m" means minutes.
+		// Passing an absolute timestamp avoids this unit mismatch.
+		d, err := time.ParseDuration(since)
+		if err != nil {
+			return nil, fmt.Errorf("parsing duration %q: %w", since, err)
 		}
-		args = append(args, "--created-after="+sinceArg)
+		cutoff := time.Now().Add(-d).UTC().Format(time.RFC3339)
+		args = append(args, "--created-after="+cutoff)
 	}
 
-	cmd := exec.Command("bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
+	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = r.townRoot
 	// Set BEADS_DIR explicitly to prevent inherited env vars from causing
 	// prefix mismatches when redirects are in play.

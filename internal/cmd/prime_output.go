@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -19,34 +20,39 @@ import (
 )
 
 // outputPrimeContext outputs the role-specific context using templates or fallback.
-func outputPrimeContext(ctx RoleContext) error {
+// Returns the rendered template content (empty string when using fallback path).
+func outputPrimeContext(ctx RoleContext) (string, error) {
 	// Try to use templates first
 	tmpl, err := templates.New()
 	if err != nil {
 		// Fall back to hardcoded output if templates fail
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Map role to template name
 	var roleName string
 	switch ctx.Role {
 	case RoleMayor:
-		roleName = "mayor"
+		roleName = constants.RoleMayor
 	case RoleDeacon:
-		roleName = "deacon"
+		roleName = constants.RoleDeacon
 	case RoleWitness:
-		roleName = "witness"
+		roleName = constants.RoleWitness
 	case RoleRefinery:
-		roleName = "refinery"
+		roleName = constants.RoleRefinery
 	case RolePolecat:
-		roleName = "polecat"
+		roleName = constants.RolePolecat
 	case RoleCrew:
-		roleName = "crew"
+		roleName = constants.RoleCrew
 	case RoleBoot:
 		roleName = "boot"
+	case RoleDog:
+		roleName = "dog"
 	default:
 		// Unknown role - use fallback
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Build template data
@@ -70,6 +76,7 @@ func outputPrimeContext(ctx RoleContext) error {
 		WorkDir:       ctx.WorkDir,
 		DefaultBranch: defaultBranch,
 		Polecat:       ctx.Polecat,
+		DogName:       ctx.Polecat, // ctx.Polecat holds the dog name for RoleDog
 		MayorSession:  session.MayorSessionName(),
 		DeaconSession: session.DeaconSessionName(),
 	}
@@ -77,14 +84,14 @@ func outputPrimeContext(ctx RoleContext) error {
 	// Render and output
 	output, err := tmpl.RenderRole(roleName, data)
 	if err != nil {
-		return fmt.Errorf("rendering template: %w", err)
+		return "", fmt.Errorf("rendering template: %w", err)
 	}
 
 	fmt.Print(output)
-	return nil
+	return output, nil
 }
 
-func outputPrimeContextFallback(ctx RoleContext) error {
+func outputPrimeContextFallback(ctx RoleContext) {
 	switch ctx.Role {
 	case RoleMayor:
 		outputMayorContext(ctx)
@@ -101,7 +108,6 @@ func outputPrimeContextFallback(ctx RoleContext) error {
 	default:
 		outputUnknownContext(ctx)
 	}
-	return nil
 }
 
 func outputMayorContext(ctx RoleContext) {
@@ -206,6 +212,9 @@ func outputCrewContext(ctx RoleContext) {
 	fmt.Println("- User-managed (not Witness-monitored)")
 	fmt.Println("- Long-lived identity across sessions")
 	fmt.Println()
+	fmt.Println("**Identity**: You are the AI agent. The human sending you messages is the")
+	fmt.Println("**Overseer** — the only non-agent role in Gas Town. Do not confuse your identity with theirs.")
+	fmt.Println()
 	fmt.Println("## Key Commands")
 	fmt.Println("- `" + cli.Name() + " mail inbox` - Check your inbox")
 	fmt.Println("- `bd ready` - Available issues")
@@ -250,7 +259,8 @@ func outputUnknownContext(ctx RoleContext) {
 	fmt.Println("- `<rig>/polecats/<name>/` - Polecat role")
 	fmt.Println("- `<rig>/witness/rig/` - Witness role")
 	fmt.Println("- `<rig>/refinery/rig/` - Refinery role")
-	fmt.Println("- Town root or `mayor/` - Mayor role")
+	fmt.Println("- `mayor/` or `<rig>/mayor/` - Mayor role")
+	fmt.Println("- Town root is neutral (set GT_ROLE or cd into a role directory)")
 	fmt.Println()
 	fmt.Printf("Town root: %s\n", style.Dim.Render(ctx.TownRoot))
 }
@@ -289,7 +299,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Println("|------------|----------------|----------------|")
 		fmt.Printf("| Signal work complete | `%s done` | ~~bd close <root-issue>~~ (Refinery closes it) |\n", c)
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
-		fmt.Println("| Check workflow steps | `bd ready` | ~~gt mol status~~ (less useful) |")
+		fmt.Println("| Check workflow steps | `bd mol current` | ~~bd ready~~ (excludes molecule steps) |")
 		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
 		fmt.Printf("| Escalate blocker | `%s escalate \"desc\" -s HIGH` | ~~waiting for human~~ (never wait) |\n", c)
 
@@ -518,8 +528,29 @@ func outputAttachmentStatus(ctx RoleContext) {
 	}
 	fmt.Println()
 
-	// Show current step from molecule
-	showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+	// Show inline formula steps if formula name is known, else fall back to bd mol current
+	if attachment.AttachedFormula != "" {
+		showFormulaStepsFull(attachment.AttachedFormula)
+	} else {
+		showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+	}
+}
+
+// outputContinuationDirective displays a brief continuation prompt for post-compact/resume.
+// Unlike outputAutonomousDirective, this does NOT ask the agent to re-announce or
+// re-run startup protocol — it just reminds the agent what's on the hook. (GH#1965)
+func outputContinuationDirective(hookedBead *beads.Issue, hasMolecule bool) {
+	fmt.Println()
+	fmt.Printf("%s\n\n", style.Bold.Render("## ▶ CONTINUE HOOKED WORK"))
+	fmt.Println("Your context was compacted/resumed. **Continue working on your hooked bead.**")
+	fmt.Println("Do NOT re-announce, re-initialize, or re-read the bead from scratch.")
+	fmt.Println("Pick up where you left off.")
+	fmt.Println()
+	fmt.Printf("  Hooked: %s — %s\n", style.Bold.Render(hookedBead.ID), hookedBead.Title)
+	if hasMolecule {
+		fmt.Println("  (Has attached molecule — check `bd mol current` for next step)")
+	}
+	fmt.Println()
 }
 
 // outputHandoffWarning outputs the post-handoff warning message.

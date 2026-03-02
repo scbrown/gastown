@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 // mockEnvReader implements SessionEnvReader for testing.
@@ -54,6 +55,21 @@ func expectedEnv(role, rig, agentName string) map[string]string {
 // testCtx returns a CheckContext with the test town root.
 func testCtx() *CheckContext {
 	return &CheckContext{TownRoot: testTownRoot}
+}
+
+// setupEnvTestRegistry sets up a prefix registry for env check tests.
+// Maps: mr→myrig, r1→rig1, fb→foo-bar, plus standard prefixes.
+func setupEnvTestRegistry(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	reg.Register("mr", "myrig")
+	reg.Register("r1", "rig1")
+	reg.Register("fb", "foo-bar")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
 
 func TestEnvVarsCheck_NoSessions(t *testing.T) {
@@ -134,11 +150,12 @@ func TestEnvVarsCheck_MayorMissing(t *testing.T) {
 }
 
 func TestEnvVarsCheck_WitnessCorrect(t *testing.T) {
+	setupEnvTestRegistry(t)
 	expected := expectedEnv("witness", "myrig", "")
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness"},
+		sessions: []string{"mr-witness"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-witness": expected,
+			"mr-witness": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -150,10 +167,11 @@ func TestEnvVarsCheck_WitnessCorrect(t *testing.T) {
 }
 
 func TestEnvVarsCheck_WitnessMismatch(t *testing.T) {
+	setupEnvTestRegistry(t)
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness"},
+		sessions: []string{"mr-witness"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-witness": {
+			"mr-witness": {
 				"GT_ROLE": "witness",
 				"GT_RIG":  "wrongrig", // Wrong rig
 			},
@@ -168,11 +186,12 @@ func TestEnvVarsCheck_WitnessMismatch(t *testing.T) {
 }
 
 func TestEnvVarsCheck_RefineryCorrect(t *testing.T) {
+	setupEnvTestRegistry(t)
 	expected := expectedEnv("refinery", "myrig", "")
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-refinery"},
+		sessions: []string{"mr-refinery"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-refinery": expected,
+			"mr-refinery": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -184,11 +203,12 @@ func TestEnvVarsCheck_RefineryCorrect(t *testing.T) {
 }
 
 func TestEnvVarsCheck_PolecatCorrect(t *testing.T) {
+	setupEnvTestRegistry(t)
 	expected := expectedEnv("polecat", "myrig", "Toast")
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-Toast"},
+		sessions: []string{"mr-Toast"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-Toast": expected,
+			"mr-Toast": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -200,10 +220,11 @@ func TestEnvVarsCheck_PolecatCorrect(t *testing.T) {
 }
 
 func TestEnvVarsCheck_PolecatMissing(t *testing.T) {
+	setupEnvTestRegistry(t)
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-Toast"},
+		sessions: []string{"mr-Toast"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-Toast": {
+			"mr-Toast": {
 				"GT_ROLE": "polecat",
 				// Missing GT_RIG, GT_POLECAT, BD_ACTOR, GIT_AUTHOR_NAME
 			},
@@ -218,11 +239,12 @@ func TestEnvVarsCheck_PolecatMissing(t *testing.T) {
 }
 
 func TestEnvVarsCheck_CrewCorrect(t *testing.T) {
+	setupEnvTestRegistry(t)
 	expected := expectedEnv("crew", "myrig", "worker1")
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-crew-worker1"},
+		sessions: []string{"mr-crew-worker1"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-crew-worker1": expected,
+			"mr-crew-worker1": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -234,16 +256,17 @@ func TestEnvVarsCheck_CrewCorrect(t *testing.T) {
 }
 
 func TestEnvVarsCheck_MultipleSessions(t *testing.T) {
+	setupEnvTestRegistry(t)
 	mayorEnv := expectedEnv("mayor", "", "")
 	witnessEnv := expectedEnv("witness", "rig1", "")
 	polecatEnv := expectedEnv("polecat", "rig1", "Toast")
 
 	reader := &mockEnvReader{
-		sessions: []string{"hq-mayor", "gt-rig1-witness", "gt-rig1-Toast"},
+		sessions: []string{"hq-mayor", "r1-witness", "r1-Toast"},
 		sessionEnvs: map[string]map[string]string{
-			"hq-mayor":        mayorEnv,
-			"gt-rig1-witness": witnessEnv,
-			"gt-rig1-Toast":   polecatEnv,
+			"hq-mayor":   mayorEnv,
+			"r1-witness": witnessEnv,
+			"r1-Toast":   polecatEnv,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -258,13 +281,14 @@ func TestEnvVarsCheck_MultipleSessions(t *testing.T) {
 }
 
 func TestEnvVarsCheck_MixedCorrectAndMismatch(t *testing.T) {
+	setupEnvTestRegistry(t)
 	mayorEnv := expectedEnv("mayor", "", "")
 
 	reader := &mockEnvReader{
-		sessions: []string{"hq-mayor", "gt-rig1-witness"},
+		sessions: []string{"hq-mayor", "r1-witness"},
 		sessionEnvs: map[string]map[string]string{
 			"hq-mayor": mayorEnv,
-			"gt-rig1-witness": {
+			"r1-witness": {
 				"GT_ROLE": "witness",
 				// Missing GT_RIG and other vars
 			},
@@ -310,10 +334,11 @@ func TestEnvVarsCheck_DeaconMissing(t *testing.T) {
 }
 
 func TestEnvVarsCheck_GetEnvError(t *testing.T) {
+	setupEnvTestRegistry(t)
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness"},
+		sessions: []string{"mr-witness"},
 		envErrs: map[string]error{
-			"gt-myrig-witness": errors.New("session not found"),
+			"mr-witness": errors.New("session not found"),
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -325,12 +350,13 @@ func TestEnvVarsCheck_GetEnvError(t *testing.T) {
 }
 
 func TestEnvVarsCheck_HyphenatedRig(t *testing.T) {
-	// Test rig name with hyphens: "foo-bar"
+	setupEnvTestRegistry(t)
+	// Test rig name with hyphens: "foo-bar" has prefix "fb"
 	expected := expectedEnv("witness", "foo-bar", "")
 	reader := &mockEnvReader{
-		sessions: []string{"gt-foo-bar-witness"},
+		sessions: []string{"fb-witness"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-foo-bar-witness": expected,
+			"fb-witness": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -342,13 +368,13 @@ func TestEnvVarsCheck_HyphenatedRig(t *testing.T) {
 }
 
 func TestEnvVarsCheck_BootCorrect(t *testing.T) {
-	// Boot watchdog session (gt-boot) uses "boot" role in AgentEnv,
+	// Boot watchdog session (hq-boot) uses "boot" role in AgentEnv,
 	// even though ParseSessionName returns Role=deacon, Name="boot".
 	expected := expectedEnv("boot", "", "boot")
 	reader := &mockEnvReader{
-		sessions: []string{"gt-boot"},
+		sessions: []string{"hq-boot"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-boot": expected,
+			"hq-boot": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -359,14 +385,47 @@ func TestEnvVarsCheck_BootCorrect(t *testing.T) {
 	}
 }
 
+func TestEnvVarsCheck_MissingEmptyExpectedIsOK(t *testing.T) {
+	setupEnvTestRegistry(t)
+	// When expected value is "" and the key is absent from tmux env,
+	// it should NOT be flagged as a mismatch. Absent == empty for
+	// clearing vars like CLAUDECODE.
+	expected := expectedEnv("crew", "myrig", "worker1")
+
+	// Build actual env with all non-empty expected vars, but omit empty ones
+	actual := make(map[string]string)
+	for k, v := range expected {
+		if v != "" {
+			actual[k] = v
+		}
+	}
+
+	reader := &mockEnvReader{
+		sessions: []string{"mr-crew-worker1"},
+		sessionEnvs: map[string]map[string]string{
+			"mr-crew-worker1": actual,
+		},
+	}
+	check := NewEnvVarsCheckWithReader(reader)
+	result := check.Run(testCtx())
+
+	if result.Status != StatusOK {
+		t.Errorf("Status = %v, want StatusOK; absent empty-expected vars should not mismatch", result.Status)
+		if result.Details != nil {
+			t.Errorf("Details: %v", result.Details)
+		}
+	}
+}
+
 func TestEnvVarsCheck_BeadsDirWarning(t *testing.T) {
+	setupEnvTestRegistry(t)
 	// BEADS_DIR being set breaks prefix-based routing
 	expected := expectedEnv("witness", "myrig", "")
 	expected["BEADS_DIR"] = "/some/path/.beads" // This shouldn't be set!
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness"},
+		sessions: []string{"mr-witness"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-witness": expected,
+			"mr-witness": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -384,13 +443,14 @@ func TestEnvVarsCheck_BeadsDirWarning(t *testing.T) {
 }
 
 func TestEnvVarsCheck_BeadsDirEmptyIsOK(t *testing.T) {
+	setupEnvTestRegistry(t)
 	// Empty BEADS_DIR should not warn
 	expected := expectedEnv("witness", "myrig", "")
 	expected["BEADS_DIR"] = "" // Empty is fine
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness"},
+		sessions: []string{"mr-witness"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-witness": expected,
+			"mr-witness": expected,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -402,16 +462,17 @@ func TestEnvVarsCheck_BeadsDirEmptyIsOK(t *testing.T) {
 }
 
 func TestEnvVarsCheck_BeadsDirMultipleSessions(t *testing.T) {
+	setupEnvTestRegistry(t)
 	// Multiple sessions, only one has BEADS_DIR
 	witnessEnv := expectedEnv("witness", "myrig", "")
 	polecatEnv := expectedEnv("polecat", "myrig", "Toast")
 	polecatEnv["BEADS_DIR"] = "/bad/path" // This shouldn't be set!
 
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness", "gt-myrig-Toast"},
+		sessions: []string{"mr-witness", "mr-Toast"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-witness": witnessEnv,
-			"gt-myrig-Toast":   polecatEnv,
+			"mr-witness": witnessEnv,
+			"mr-Toast":   polecatEnv,
 		},
 	}
 	check := NewEnvVarsCheckWithReader(reader)
@@ -426,11 +487,12 @@ func TestEnvVarsCheck_BeadsDirMultipleSessions(t *testing.T) {
 }
 
 func TestEnvVarsCheck_BeadsDirWithOtherMismatches(t *testing.T) {
+	setupEnvTestRegistry(t)
 	// Session has BEADS_DIR AND other mismatches - both should be reported
 	reader := &mockEnvReader{
-		sessions: []string{"gt-myrig-witness"},
+		sessions: []string{"mr-witness"},
 		sessionEnvs: map[string]map[string]string{
-			"gt-myrig-witness": {
+			"mr-witness": {
 				"GT_ROLE":   "witness",
 				"GT_RIG":    "wrongrig", // Mismatch
 				"BEADS_DIR": "/bad/path",
@@ -454,5 +516,102 @@ func TestEnvVarsCheck_BeadsDirWithOtherMismatches(t *testing.T) {
 	}
 	if !strings.Contains(detailsStr, "Other env var issues") {
 		t.Errorf("Details should mention other issues")
+	}
+}
+
+// mockEnvAccessor extends mockEnvReader with SetEnvironment support for Fix() tests.
+type mockEnvAccessor struct {
+	mockEnvReader
+	setCalls map[string]map[string]string // session -> key -> value
+	setErr   error
+}
+
+func (m *mockEnvAccessor) SetEnvironment(sess, key, val string) error {
+	if m.setErr != nil {
+		return m.setErr
+	}
+	if m.setCalls == nil {
+		m.setCalls = make(map[string]map[string]string)
+	}
+	if m.setCalls[sess] == nil {
+		m.setCalls[sess] = make(map[string]string)
+	}
+	m.setCalls[sess][key] = val
+	return nil
+}
+
+func TestEnvVarsCheck_CanFix(t *testing.T) {
+	check := NewEnvVarsCheck()
+	if !check.CanFix() {
+		t.Error("CanFix() should return true after implementing Fix()")
+	}
+}
+
+func TestEnvVarsCheck_FixNoSessions(t *testing.T) {
+	mock := &mockEnvAccessor{
+		mockEnvReader: mockEnvReader{
+			listErr: errors.New("no tmux server"),
+		},
+	}
+	check := NewEnvVarsCheckWithAccessor(mock)
+
+	err := check.Fix(testCtx())
+	if err != nil {
+		t.Fatalf("Fix() should not error when no sessions: %v", err)
+	}
+	if len(mock.setCalls) != 0 {
+		t.Errorf("Fix() made unexpected SetEnvironment calls: %v", mock.setCalls)
+	}
+}
+
+func TestEnvVarsCheck_FixAppliesMissingVars(t *testing.T) {
+	mock := &mockEnvAccessor{
+		mockEnvReader: mockEnvReader{
+			sessions: []string{"hq-mayor"},
+			sessionEnvs: map[string]map[string]string{
+				"hq-mayor": {}, // All env vars missing
+			},
+		},
+	}
+	check := NewEnvVarsCheckWithAccessor(mock)
+
+	err := check.Fix(testCtx())
+	if err != nil {
+		t.Fatalf("Fix() returned error: %v", err)
+	}
+
+	expected := expectedEnv("mayor", "", "")
+	for key, wantVal := range expected {
+		sessionCalls, ok := mock.setCalls["hq-mayor"]
+		if !ok {
+			t.Fatalf("Fix() made no SetEnvironment calls for hq-mayor")
+		}
+		gotVal, found := sessionCalls[key]
+		if !found {
+			t.Errorf("Fix() did not call SetEnvironment for key %s", key)
+		} else if gotVal != wantVal {
+			t.Errorf("Fix() SetEnvironment(%s) = %q, want %q", key, gotVal, wantVal)
+		}
+	}
+}
+
+func TestEnvVarsCheck_FixSkipsCorrectVars(t *testing.T) {
+	expected := expectedEnv("mayor", "", "")
+	mock := &mockEnvAccessor{
+		mockEnvReader: mockEnvReader{
+			sessions: []string{"hq-mayor"},
+			sessionEnvs: map[string]map[string]string{
+				"hq-mayor": expected, // All vars already correct
+			},
+		},
+	}
+	check := NewEnvVarsCheckWithAccessor(mock)
+
+	err := check.Fix(testCtx())
+	if err != nil {
+		t.Fatalf("Fix() returned error: %v", err)
+	}
+	if len(mock.setCalls) != 0 {
+		t.Errorf("Fix() should not call SetEnvironment when vars are correct, got: %v", mock.setCalls)
 	}
 }

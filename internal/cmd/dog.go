@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/plugin"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -34,6 +36,11 @@ var (
 	dogDispatchDog    string
 	dogDispatchJSON   bool
 	dogDispatchDryRun bool
+
+	// Health-check flags
+	dogHealthJSON          bool
+	dogHealthAutoClear     bool
+	dogHealthMaxInactivity time.Duration
 )
 
 var dogCmd = &cobra.Command{
@@ -219,6 +226,34 @@ Examples:
 	RunE: runDogDispatch,
 }
 
+var dogHealthCheckCmd = &cobra.Command{
+	Use:   "health-check [name]",
+	Short: "Check dog health (zombies, hung, orphans)",
+	Long: `Check dog health and detect problems.
+
+Detects:
+  - Zombies: state=working but tmux session or agent process is dead
+  - Hung: agent alive but no tmux activity for too long
+  - Orphans: dog idle but tmux session still exists
+
+With --auto-clear, zombies are automatically returned to idle state.
+Hung dogs are reported only (Deacon decides per ZFC principle).
+
+Exit codes:
+  0 = all healthy
+  1 = error
+  2 = needs attention
+
+Examples:
+  gt dog health-check
+  gt dog health-check alpha
+  gt dog health-check --json
+  gt dog health-check --auto-clear
+  gt dog health-check --max-inactivity 1h`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runDogHealthCheck,
+}
+
 func init() {
 	// List flags
 	dogListCmd.Flags().BoolVar(&dogListJSON, "json", false, "Output as JSON")
@@ -245,6 +280,11 @@ func init() {
 	dogDispatchCmd.Flags().BoolVarP(&dogDispatchDryRun, "dry-run", "n", false, "Show what would be done without doing it")
 	_ = dogDispatchCmd.MarkFlagRequired("plugin")
 
+	// Health-check flags
+	dogHealthCheckCmd.Flags().BoolVar(&dogHealthJSON, "json", false, "Output as JSON")
+	dogHealthCheckCmd.Flags().BoolVar(&dogHealthAutoClear, "auto-clear", false, "Auto-clear zombie dogs")
+	dogHealthCheckCmd.Flags().DurationVar(&dogHealthMaxInactivity, "max-inactivity", 30*time.Minute, "Max inactivity before considering hung")
+
 	// Add subcommands
 	dogCmd.AddCommand(dogAddCmd)
 	dogCmd.AddCommand(dogRemoveCmd)
@@ -254,6 +294,7 @@ func init() {
 	dogCmd.AddCommand(dogDoneCmd)
 	dogCmd.AddCommand(dogStatusCmd)
 	dogCmd.AddCommand(dogDispatchCmd)
+	dogCmd.AddCommand(dogHealthCheckCmd)
 
 	rootCmd.AddCommand(dogCmd)
 }
@@ -353,7 +394,7 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 	for _, name := range names {
 		d, err := mgr.Get(name)
 		if err != nil {
-			fmt.Printf("Warning: dog %s not found, skipping\n", name)
+			style.PrintWarning("dog %s not found, skipping", name)
 			continue
 		}
 
@@ -420,22 +461,28 @@ func runDogList(cmd *cobra.Command, args []string) error {
 
 	if dogListJSON {
 		type DogListItem struct {
-			Name       string            `json:"name"`
-			State      dog.State         `json:"state"`
-			Work       string            `json:"work,omitempty"`
-			LastActive time.Time         `json:"last_active"`
-			Worktrees  map[string]string `json:"worktrees,omitempty"`
+			Name          string            `json:"name"`
+			State         dog.State         `json:"state"`
+			Work          string            `json:"work,omitempty"`
+			WorkStartedAt *time.Time        `json:"work_started_at,omitempty"`
+			LastActive    time.Time         `json:"last_active"`
+			Worktrees     map[string]string `json:"worktrees,omitempty"`
 		}
 
 		var items []DogListItem
 		for _, d := range dogs {
-			items = append(items, DogListItem{
+			item := DogListItem{
 				Name:       d.Name,
 				State:      d.State,
 				Work:       d.Work,
 				LastActive: d.LastActive,
 				Worktrees:  d.Worktrees,
-			})
+			}
+			if !d.WorkStartedAt.IsZero() {
+				t := d.WorkStartedAt
+				item.WorkStartedAt = &t
+			}
+			items = append(items, item)
 		}
 
 		enc := json.NewEncoder(os.Stdout)
@@ -491,7 +538,7 @@ func runDogCall(cmd *cobra.Command, args []string) error {
 		for _, d := range dogs {
 			if d.State == dog.StateIdle {
 				if err := mgr.SetState(d.Name, dog.StateIdle); err != nil {
-					fmt.Printf("Warning: failed to wake %s: %v\n", d.Name, err)
+					style.PrintWarning("failed to wake %s: %v", d.Name, err)
 					continue
 				}
 				woken++
@@ -567,15 +614,11 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check for live tmux session
-	townRoot, _ := workspace.FindFromCwd()
-	if townRoot != "" && !dogForce {
-		townName, err := workspace.GetTownName(townRoot)
-		if err == nil {
-			sessionName := fmt.Sprintf("gt-%s-deacon-%s", townName, name)
-			tm := tmux.NewTmux()
-			if has, _ := tm.HasSession(sessionName); has {
-				return fmt.Errorf("dog %s has an active session (%s)\nUse --force to clear anyway", name, sessionName)
-			}
+	if !dogForce {
+		sessionName := fmt.Sprintf("hq-dog-%s", name)
+		tm := tmux.NewTmux()
+		if has, _ := tm.HasSession(sessionName); has {
+			return fmt.Errorf("dog %s has an active session (%s)\nUse --force to clear anyway", name, sessionName)
 		}
 	}
 
@@ -637,6 +680,27 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("✓ Dog %s returned to kennel (idle)\n", name)
+
+	// Auto-terminate the tmux session after a short delay.
+	// Dogs run inside tmux sessions (hq-dog-<name>). Without this, the
+	// Claude agent idles at the prompt indefinitely after completing work,
+	// wasting resources until the stale-working detector kills it (2 hours).
+	// The delay lets the agent see the success output before termination.
+	//
+	// We disable remain-on-exit first — otherwise kill-session leaves a
+	// dead pane that the deacon's health-check reports as an orphan.
+	sessionID := fmt.Sprintf("hq-dog-%s", name)
+	t := tmux.NewTmux()
+	_ = t.SetRemainOnExit(sessionID, false)
+	fmt.Printf("  Session %s will terminate in 3s\n", sessionID)
+	killCmd := exec.Command("bash", "-c",
+		fmt.Sprintf("sleep 3 && tmux kill-session -t '%s' 2>/dev/null", sessionID))
+	util.SetProcessGroup(killCmd)
+	if err := killCmd.Start(); err != nil {
+		// Non-fatal: session may not be tmux-based (e.g., manual testing).
+		fmt.Fprintf(os.Stderr, "warning: failed to schedule session termination: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -702,16 +766,10 @@ func showDogStatus(mgr *dog.Manager, name string) error {
 	}
 
 	// Check for tmux session
-	townRoot, _ := workspace.FindFromCwd()
-	if townRoot != "" {
-		townName, err := workspace.GetTownName(townRoot)
-		if err == nil {
-			sessionName := fmt.Sprintf("gt-%s-deacon-%s", townName, name)
-			tm := tmux.NewTmux()
-			if has, _ := tm.HasSession(sessionName); has {
-				fmt.Printf("\nSession: %s (running)\n", sessionName)
-			}
-		}
+	sessionName := fmt.Sprintf("hq-dog-%s", name)
+	tm := tmux.NewTmux()
+	if has, _ := tm.HasSession(sessionName); has {
+		fmt.Printf("\nSession: %s (running)\n", sessionName)
 	}
 
 	return nil
@@ -810,6 +868,88 @@ func dogFormatTimeAgo(t time.Time) string {
 		}
 		return fmt.Sprintf("%d days ago", days)
 	}
+}
+
+func runDogHealthCheck(cmd *cobra.Command, args []string) error {
+	mgr, err := getDogManager()
+	if err != nil {
+		return err
+	}
+
+	tm := tmux.NewTmux()
+	hc := dog.NewHealthChecker(mgr, tm)
+
+	var results []dog.DogHealthResult
+
+	if len(args) > 0 {
+		// Single dog
+		d, err := mgr.Get(args[0])
+		if err != nil {
+			return fmt.Errorf("getting dog %s: %w", args[0], err)
+		}
+		r := hc.Check(d, dogHealthMaxInactivity, dogHealthAutoClear)
+		results = []dog.DogHealthResult{r}
+	} else {
+		// All dogs
+		results, err = hc.CheckAll(dogHealthMaxInactivity, dogHealthAutoClear)
+		if err != nil {
+			return err
+		}
+	}
+
+	attention := dog.NeedsAttentionCount(results)
+
+	if dogHealthJSON {
+		type HealthReport struct {
+			Dogs           []dog.DogHealthResult `json:"dogs"`
+			NeedsAttention int                   `json:"needs_attention"`
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(HealthReport{Dogs: results, NeedsAttention: attention}); err != nil {
+			return err
+		}
+	} else {
+		if len(results) == 0 {
+			fmt.Println("No dogs in kennel")
+			return nil
+		}
+
+		fmt.Println(style.Bold.Render("Dog Health Check"))
+		fmt.Println()
+
+		for _, r := range results {
+			icon := "✓"
+			if r.NeedsAttention {
+				icon = "✗"
+			}
+			line := fmt.Sprintf("  %s %s [%s] session=%s", icon, r.Name, r.State, r.SessionStatus)
+			if r.WorkDuration > 0 {
+				line += fmt.Sprintf(" duration=%s", r.WorkDuration.Truncate(time.Second))
+			}
+			if r.AutoCleared {
+				line += " (auto-cleared)"
+			}
+			fmt.Println(line)
+			if r.Recommendation != "" && r.NeedsAttention {
+				fmt.Printf("    → %s\n", r.Recommendation)
+			}
+		}
+
+		fmt.Println()
+		if attention > 0 {
+			fmt.Printf("  %d dog(s) need attention\n", attention)
+		} else {
+			fmt.Println("  All dogs healthy")
+		}
+	}
+
+	// Exit code 2 for needs-attention
+	if attention > 0 {
+		os.Exit(2)
+	}
+
+	return nil
 }
 
 // runDogDispatch dispatches plugin execution to a dog worker.
@@ -926,6 +1066,20 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Ensure dog has an agent bead before sending mail.
+	// Dogs created before agent beads were added, or whose bead creation
+	// failed silently, won't have one. The mail router requires agent beads
+	// to validate recipients.
+	b := beads.New(townRoot)
+	if existing, _ := b.FindDogAgentBead(targetDog.Name); existing == nil {
+		location := filepath.Join("deacon", "dogs", targetDog.Name)
+		if _, beadErr := b.CreateDogAgentBead(targetDog.Name, location); beadErr != nil {
+			if !dogDispatchJSON {
+				fmt.Printf("  Warning: could not create agent bead: %v\n", beadErr)
+			}
+		}
+	}
+
 	// Assign work FIRST (before sending mail) to prevent race condition
 	// If this fails, we haven't sent any mail yet
 	if err := mgr.AssignWork(targetDog.Name, workDesc); err != nil {
@@ -935,9 +1089,10 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	// Create and send mail message with plugin instructions
 	dogAddress := fmt.Sprintf("deacon/dogs/%s", targetDog.Name)
 	subject := fmt.Sprintf("Plugin: %s", p.Name)
-	body := formatPluginMailBody(p)
+	body := p.FormatMailBody()
 
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	defer router.WaitPendingNotifications()
 	msg := &mail.Message{
 		From:      "deacon/",
 		To:        dogAddress,
@@ -998,27 +1153,3 @@ func ifStr(cond bool, ifTrue, ifFalse string) string {
 	return ifFalse
 }
 
-// formatPluginMailBody formats the plugin as instructions for the dog.
-func formatPluginMailBody(p *plugin.Plugin) string {
-	var sb strings.Builder
-
-	sb.WriteString("Execute the following plugin:\n\n")
-	sb.WriteString(fmt.Sprintf("**Plugin**: %s\n", p.Name))
-	sb.WriteString(fmt.Sprintf("**Description**: %s\n", p.Description))
-	if p.RigName != "" {
-		sb.WriteString(fmt.Sprintf("**Rig**: %s\n", p.RigName))
-	}
-	if p.Execution != nil && p.Execution.Timeout != "" {
-		sb.WriteString(fmt.Sprintf("**Timeout**: %s\n", p.Execution.Timeout))
-	}
-	sb.WriteString("\n---\n\n")
-	sb.WriteString("## Instructions\n\n")
-	sb.WriteString(p.Instructions)
-	sb.WriteString("\n\n---\n\n")
-	sb.WriteString("After completion:\n")
-	sb.WriteString("1. Create a wisp to record the result (success/failure)\n")
-	sb.WriteString("2. Send DOG_DONE mail to deacon/\n")
-	sb.WriteString("3. Return to idle state\n")
-
-	return sb.String()
-}

@@ -2,9 +2,12 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/daemon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -158,6 +161,11 @@ func runMayorAttach(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("finding workspace: %w", err)
 	}
 
+	// Ensure daemon and dolt are running before attaching.
+	if err := ensureMayorInfra(townRoot); err != nil {
+		return err
+	}
+
 	t := tmux.NewTmux()
 	sessionID := mgr.SessionName()
 
@@ -269,4 +277,57 @@ func runMayorRestart(cmd *cobra.Command, args []string) error {
 
 	// Start fresh
 	return runMayorStart(cmd, args)
+}
+
+// ensureMayorInfra checks that daemon and dolt are running before attaching
+// to the Mayor session. Warns and auto-starts each if absent.
+// Returns an error if Dolt fails to start — a missing Dolt server is fatal
+// for the Mayor (it cannot operate without database access).
+// Daemon failures are non-fatal (warned but do not block).
+func ensureMayorInfra(townRoot string) error {
+	// Load daemon.json env vars (e.g., GT_DOLT_PORT) so Dolt uses the right port.
+	if patrolCfg := daemon.LoadPatrolConfig(townRoot); patrolCfg != nil {
+		for k, v := range patrolCfg.Env {
+			os.Setenv(k, v)
+		}
+	}
+
+	// Daemon (non-fatal)
+	daemonRunning, _, _ := daemon.IsRunning(townRoot)
+	if !daemonRunning {
+		style.PrintWarning("daemon is not running, starting...")
+		if err := ensureDaemon(townRoot); err != nil {
+			style.PrintWarning("daemon start failed: %v", err)
+		} else {
+			fmt.Printf("  %s Daemon started\n", style.Bold.Render("✓"))
+		}
+	}
+
+	// Dolt (fatal on failure — Mayor requires database access)
+	doltCfg := doltserver.DefaultConfig(townRoot)
+	if !doltCfg.IsRemote() {
+		if _, err := os.Stat(doltCfg.DataDir); err == nil {
+			doltRunning, _, _ := doltserver.IsRunning(townRoot)
+			if !doltRunning {
+				style.PrintWarning("Dolt server is not running, starting...")
+				if err := doltserver.Start(townRoot); err != nil {
+					// Enrich port-conflict errors with a concrete free-port suggestion.
+					msg := fmt.Sprintf("Dolt server start failed: %v", err)
+					if pid, dataDir := doltserver.PortHolder(doltCfg.Port); pid > 0 {
+						if dataDir != "" {
+							msg += fmt.Sprintf("\n  port %d held by dolt PID %d serving %s", doltCfg.Port, pid, dataDir)
+						} else {
+							msg += fmt.Sprintf("\n  port %d held by PID %d", doltCfg.Port, pid)
+						}
+					}
+					if freePort := doltserver.FindFreePort(doltCfg.Port + 1); freePort > 0 {
+						msg += fmt.Sprintf("\n\nConfigure a free port for this town, then retry:\n  gt config set dolt.port %d && gt mayor at", freePort)
+					}
+					return fmt.Errorf("%s", msg)
+				}
+				fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltCfg.Port)
+			}
+		}
+	}
+	return nil
 }

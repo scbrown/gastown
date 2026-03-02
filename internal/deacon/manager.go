@@ -24,6 +24,8 @@ var (
 type tmuxOps interface {
 	HasSession(name string) (bool, error)
 	IsAgentAlive(session string) bool
+	IsPaneDead(session string) bool
+	RespawnPaneDefault(session string) error
 	KillSessionWithProcesses(name string) error
 	NewSessionWithCommand(name, workDir, command string) error
 	SetRemainOnExit(pane string, on bool) error
@@ -31,6 +33,8 @@ type tmuxOps interface {
 	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
 	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
 	SetAutoRespawnHook(session string) error
+	AcceptStartupDialogs(session string) error
+	AcceptWorkspaceTrustDialog(session string) error
 	AcceptBypassPermissionsWarning(session string) error
 	SendKeysRaw(session, keys string) error
 	GetSessionInfo(name string) (*tmux.SessionInfo, error)
@@ -80,6 +84,23 @@ func (m *Manager) Start(agentOverride string) error {
 		if t.IsAgentAlive(sessionID) {
 			return ErrAlreadyRunning
 		}
+
+		// Pane dead (remain-on-exit) vs zombie shell: different recovery paths.
+		// A dead pane means the agent exited cleanly (e.g., patrol cycle complete)
+		// and the pane is waiting for respawn. Use respawn-pane to restart in place,
+		// which is cheaper and avoids incrementing the daemon's crash counter.
+		// A zombie shell (pane alive but agent dead) needs kill+recreate.
+		if t.IsPaneDead(sessionID) {
+			if err := t.RespawnPaneDefault(sessionID); err == nil {
+				// Give the respawned process a moment to start
+				time.Sleep(500 * time.Millisecond)
+				if t.IsAgentAlive(sessionID) {
+					return ErrAlreadyRunning
+				}
+			}
+			// Respawn failed or agent didn't come back — fall through to kill+recreate
+		}
+
 		// Zombie - tmux alive but agent dead. Kill and recreate.
 		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 		if err := t.KillSessionWithProcesses(sessionID); err != nil {
@@ -103,8 +124,14 @@ func (m *Manager) Start(agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon running in PERSISTENT PATROL MODE. My patrol loop: 1. Run gt deacon heartbeat. 2. Check gt hook - if exists, execute it. 3. If no hook, create and execute: gt wisp create mol-deacon-patrol --hook --execute. 4. After patrol completes, use await-signal to wait for next cycle. 5. Return to step 1. I NEVER exit voluntarily.")
-	startupCmd, err := config.BuildAgentStartupCommandWithAgentOverride("deacon", "", m.townRoot, "", initialPrompt, agentOverride)
+	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, create mol-deacon-patrol wisp and execute it.")
+	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:        "deacon",
+		TownRoot:    m.townRoot,
+		Prompt:      initialPrompt,
+		Topic:       "patrol",
+		SessionName: sessionID,
+	}, "", initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
 	}
@@ -125,7 +152,9 @@ func (m *Manager) Start(agentOverride string) error {
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:     "deacon",
 		TownRoot: m.townRoot,
+		Agent:    agentOverride,
 	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
@@ -156,8 +185,8 @@ func (m *Manager) Start(agentOverride string) error {
 		fmt.Printf("warning: failed to set auto-respawn hook for deacon: %v\n", err)
 	}
 
-	// Accept bypass permissions warning dialog if it appears.
-	_ = t.AcceptBypassPermissionsWarning(sessionID)
+	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
+	_ = t.AcceptStartupDialogs(sessionID)
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 

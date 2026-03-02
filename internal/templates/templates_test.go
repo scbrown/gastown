@@ -1,8 +1,11 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 func TestNew(t *testing.T) {
@@ -117,7 +120,7 @@ func TestRenderRole_Deacon(t *testing.T) {
 	if !strings.Contains(output, "Startup Protocol: Propulsion") {
 		t.Error("output missing startup protocol section")
 	}
-	if !strings.Contains(output, "mol-deacon-patrol") {
+	if !strings.Contains(output, constants.MolDeaconPatrol) {
 		t.Error("output missing patrol molecule reference")
 	}
 }
@@ -145,15 +148,29 @@ func TestRenderRole_Refinery_DefaultBranch(t *testing.T) {
 		t.Fatalf("RenderRole() error = %v", err)
 	}
 
-	// Check that the custom default branch is used in git commands
-	if !strings.Contains(output, "origin/develop") {
-		t.Error("output missing 'origin/develop' - DefaultBranch not being used for rebase")
+	// Check that the custom default branch is used in target-resolution guidance.
+	// The refinery template intentionally uses placeholders
+	// (<rebase-target>/<merge-target>) instead of literal branch commands, so this
+	// test verifies the rendered rule text + placeholders.
+	fallback := fmt.Sprintf("fallback `%s`", data.DefaultBranch)
+	alwaysUse := fmt.Sprintf("always use `%s`", data.DefaultBranch)
+	if !strings.Contains(output, "Target Resolution Rule (single source):") {
+		t.Error("output missing target resolution rule heading")
 	}
-	if !strings.Contains(output, "git checkout develop") {
-		t.Error("output missing 'git checkout develop' - DefaultBranch not being used for checkout")
+	if !strings.Contains(output, fallback) {
+		t.Errorf("output missing %q - DefaultBranch not being used in target fallback guidance", fallback)
 	}
-	if !strings.Contains(output, "git push origin develop") {
-		t.Error("output missing 'git push origin develop' - DefaultBranch not being used for push")
+	if !strings.Contains(output, alwaysUse) {
+		t.Errorf("output missing %q - DefaultBranch not being used in integration-disabled guidance", alwaysUse)
+	}
+	if !strings.Contains(output, "git rebase origin/<rebase-target>") {
+		t.Error("output missing placeholder rebase command")
+	}
+	if !strings.Contains(output, "git checkout <merge-target>") {
+		t.Error("output missing placeholder checkout command")
+	}
+	if !strings.Contains(output, "git push origin <merge-target>") {
+		t.Error("output missing placeholder push command")
 	}
 
 	// Verify it does NOT contain hardcoded "main" in git commands
@@ -228,6 +245,277 @@ func TestRenderMessage_Nudge(t *testing.T) {
 	}
 }
 
+func TestRenderRole_Dog(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	data := RoleData{
+		Role:          "dog",
+		DogName:       "Fido",
+		TownRoot:      "/test/town",
+		TownName:      "town",
+		WorkDir:       "/test/town/deacon/dogs/Fido",
+		DefaultBranch: "main",
+		MayorSession:  "gt-town-mayor",
+		DeaconSession: "gt-town-deacon",
+	}
+
+	output, err := tmpl.RenderRole("dog", data)
+	if err != nil {
+		t.Fatalf("RenderRole() error = %v", err)
+	}
+
+	// Check for key content
+	if !strings.Contains(output, "Dog Context") {
+		t.Error("output missing 'Dog Context'")
+	}
+	if !strings.Contains(output, "Fido") {
+		t.Error("output missing dog name")
+	}
+	if !strings.Contains(output, "/test/town") {
+		t.Error("output missing town root")
+	}
+}
+
+// TestRenderRole_Dog_NoHardcodedGtPath verifies the dog template uses {{ .TownRoot }}
+// and does not contain hardcoded ~/gt paths.
+func TestRenderRole_Dog_NoHardcodedGtPath(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	const customTownRoot = "/custom/test/instance"
+
+	data := RoleData{
+		Role:          "dog",
+		DogName:       "Rover",
+		TownRoot:      customTownRoot,
+		TownName:      "instance",
+		WorkDir:       customTownRoot + "/deacon/dogs/Rover",
+		DefaultBranch: "main",
+		MayorSession:  "gt-instance-mayor",
+		DeaconSession: "gt-instance-deacon",
+	}
+
+	output, err := tmpl.RenderRole("dog", data)
+	if err != nil {
+		t.Fatalf("RenderRole() error = %v", err)
+	}
+
+	if strings.Contains(output, "~/gt") {
+		var offending []string
+		for i, line := range strings.Split(output, "\n") {
+			if strings.Contains(line, "~/gt") {
+				offending = append(offending, fmt.Sprintf("  line %d: %s", i+1, strings.TrimSpace(line)))
+			}
+		}
+		t.Errorf("rendered dog template still contains hardcoded ~/gt (TownRoot=%q):\n%s",
+			customTownRoot, strings.Join(offending, "\n"))
+	}
+
+	if !strings.Contains(output, customTownRoot) {
+		t.Errorf("rendered dog template does not contain TownRoot %q — paths may be hardcoded", customTownRoot)
+	}
+}
+
+// TestRenderRole_NoHardcodedGtPath verifies that no role template renders
+// a literal "~/gt" path — all path references must use {{ .TownRoot }}.
+// This is a regression test for instances running outside ~/gt
+// (e.g., test instances at a custom path).
+func TestRenderRole_NoHardcodedGtPath(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	const customTownRoot2 = "/custom/test/instance"
+
+	roles := []struct {
+		role string
+		data RoleData
+	}{
+		{
+			role: "polecat",
+			data: RoleData{
+				Role: "polecat", RigName: "myrig", Polecat: "TestCat",
+				TownRoot: customTownRoot2, TownName: "instance",
+				WorkDir:       customTownRoot2 + "/myrig/polecats/TestCat",
+				DefaultBranch: "main",
+				MayorSession:  "gt-instance-mayor", DeaconSession: "gt-instance-deacon",
+			},
+		},
+		{
+			role: "mayor",
+			data: RoleData{
+				Role: "mayor", TownRoot: customTownRoot2, TownName: "instance",
+				WorkDir:       customTownRoot2,
+				DefaultBranch: "main",
+				MayorSession:  "gt-instance-mayor", DeaconSession: "gt-instance-deacon",
+			},
+		},
+		{
+			role: "witness",
+			data: RoleData{
+				Role: "witness", RigName: "myrig",
+				TownRoot: customTownRoot2, TownName: "instance",
+				WorkDir:       customTownRoot2 + "/myrig/witness",
+				DefaultBranch: "main",
+				Polecats:      []string{"Cat1", "Cat2"},
+				MayorSession:  "gt-instance-mayor", DeaconSession: "gt-instance-deacon",
+			},
+		},
+		{
+			role: "crew",
+			data: RoleData{
+				Role: "crew", RigName: "myrig", Polecat: "TestCrew",
+				TownRoot: customTownRoot2, TownName: "instance",
+				WorkDir:       customTownRoot2 + "/myrig/crew/TestCrew",
+				DefaultBranch: "main",
+				MayorSession:  "gt-instance-mayor", DeaconSession: "gt-instance-deacon",
+			},
+		},
+		{
+			role: "deacon",
+			data: RoleData{
+				Role: "deacon", TownRoot: customTownRoot2, TownName: "instance",
+				WorkDir:       customTownRoot2,
+				DefaultBranch: "main",
+				MayorSession:  "gt-instance-mayor", DeaconSession: "gt-instance-deacon",
+			},
+		},
+		// dog tested separately in TestRenderRole_Dog_NoHardcodedGtPath
+		// (requires DogName field)
+	}
+
+	for _, tc := range roles {
+		t.Run(tc.role, func(t *testing.T) {
+			output, err := tmpl.RenderRole(tc.role, tc.data)
+			if err != nil {
+				t.Fatalf("RenderRole(%q) error = %v", tc.role, err)
+			}
+			if strings.Contains(output, "~/gt") {
+				var offending []string
+				for i, line := range strings.Split(output, "\n") {
+					if strings.Contains(line, "~/gt") {
+						offending = append(offending, fmt.Sprintf("  line %d: %s", i+1, strings.TrimSpace(line)))
+					}
+				}
+				t.Errorf("rendered %q template still contains hardcoded ~/gt (TownRoot=%q):\n%s",
+					tc.role, customTownRoot2, strings.Join(offending, "\n"))
+			}
+		})
+	}
+}
+
+// TestRenderRole_TownRootInOutput verifies that the actual TownRoot value
+// appears in the rendered output for roles that reference it in path instructions.
+func TestRenderRole_TownRootInOutput(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	const customRoot = "/Users/pa/dev/gastown-tests/my-instance"
+
+	roles := []struct {
+		role string
+		data RoleData
+	}{
+		{
+			role: "polecat",
+			data: RoleData{
+				Role: "polecat", RigName: "myrig", Polecat: "Sparky",
+				TownRoot: customRoot, TownName: "my-instance",
+				WorkDir: customRoot + "/myrig/polecats/Sparky", DefaultBranch: "main",
+				MayorSession: "gt-my-instance-mayor", DeaconSession: "gt-my-instance-deacon",
+			},
+		},
+		{
+			role: "mayor",
+			data: RoleData{
+				Role: "mayor", TownRoot: customRoot, TownName: "my-instance",
+				WorkDir: customRoot, DefaultBranch: "main",
+				MayorSession: "gt-my-instance-mayor", DeaconSession: "gt-my-instance-deacon",
+			},
+		},
+		{
+			role: "witness",
+			data: RoleData{
+				Role: "witness", RigName: "myrig",
+				TownRoot: customRoot, TownName: "my-instance",
+				WorkDir: customRoot + "/myrig/witness", DefaultBranch: "main",
+				MayorSession: "gt-my-instance-mayor", DeaconSession: "gt-my-instance-deacon",
+			},
+		},
+		{
+			role: "crew",
+			data: RoleData{
+				Role: "crew", RigName: "myrig", Polecat: "Sparky",
+				TownRoot: customRoot, TownName: "my-instance",
+				WorkDir: customRoot + "/myrig/crew/Sparky", DefaultBranch: "main",
+				MayorSession: "gt-my-instance-mayor", DeaconSession: "gt-my-instance-deacon",
+			},
+		},
+		{
+			role: "deacon",
+			data: RoleData{
+				Role: "deacon", TownRoot: customRoot, TownName: "my-instance",
+				WorkDir: customRoot, DefaultBranch: "main",
+				MayorSession: "gt-my-instance-mayor", DeaconSession: "gt-my-instance-deacon",
+			},
+		},
+	}
+
+	for _, tc := range roles {
+		t.Run(tc.role, func(t *testing.T) {
+			output, err := tmpl.RenderRole(tc.role, tc.data)
+			if err != nil {
+				t.Fatalf("RenderRole(%q) error = %v", tc.role, err)
+			}
+			if !strings.Contains(output, customRoot) {
+				t.Errorf("rendered %q template does not contain TownRoot %q — paths may be hardcoded", tc.role, customRoot)
+			}
+		})
+	}
+}
+
+// TestRenderRole_Polecat_CwdInstruction verifies the critical cwd instruction
+// uses the actual town root, not a hardcoded ~/gt path.
+// Regression test: agents were following hardcoded ~/gt even in test instances.
+func TestRenderRole_Polecat_CwdInstruction(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	const customRoot = "/srv/gastown-ci"
+
+	data := RoleData{
+		Role: "polecat", RigName: "rig1", Polecat: "Worker",
+		TownRoot: customRoot, TownName: "gastown-ci",
+		WorkDir: customRoot + "/rig1/polecats/Worker", DefaultBranch: "main",
+		MayorSession: "gt-gastown-ci-mayor", DeaconSession: "gt-gastown-ci-deacon",
+	}
+
+	output, err := tmpl.RenderRole("polecat", data)
+	if err != nil {
+		t.Fatalf("RenderRole() error = %v", err)
+	}
+
+	wantCwd := customRoot + "/rig1/polecats/Worker/"
+	if !strings.Contains(output, wantCwd) {
+		t.Errorf("cwd instruction missing %q\n(agent would use wrong path for non-default instance)", wantCwd)
+	}
+
+	wantNeverEdit := customRoot + "/rig1/"
+	if !strings.Contains(output, wantNeverEdit) {
+		t.Errorf("NEVER edit instruction missing %q", wantNeverEdit)
+	}
+}
+
 func TestRoleNames(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {
@@ -244,55 +532,6 @@ func TestRoleNames(t *testing.T) {
 	for i, name := range names {
 		if name != expected[i] {
 			t.Errorf("RoleNames()[%d] = %q, want %q", i, name, expected[i])
-		}
-	}
-}
-
-func TestGetAllRoleTemplates(t *testing.T) {
-	templates, err := GetAllRoleTemplates()
-	if err != nil {
-		t.Fatalf("GetAllRoleTemplates() error = %v", err)
-	}
-
-	if len(templates) == 0 {
-		t.Fatal("GetAllRoleTemplates() returned empty map")
-	}
-
-	expectedFiles := []string{
-		"deacon.md.tmpl",
-		"witness.md.tmpl",
-		"refinery.md.tmpl",
-		"mayor.md.tmpl",
-		"polecat.md.tmpl",
-		"crew.md.tmpl",
-		"boot.md.tmpl",
-	}
-
-	for _, file := range expectedFiles {
-		content, ok := templates[file]
-		if !ok {
-			t.Errorf("GetAllRoleTemplates() missing %s", file)
-			continue
-		}
-		if len(content) == 0 {
-			t.Errorf("GetAllRoleTemplates()[%s] has empty content", file)
-		}
-	}
-}
-
-func TestGetAllRoleTemplates_ContentValidity(t *testing.T) {
-	templates, err := GetAllRoleTemplates()
-	if err != nil {
-		t.Fatalf("GetAllRoleTemplates() error = %v", err)
-	}
-
-	for name, content := range templates {
-		if !strings.HasSuffix(name, ".md.tmpl") {
-			t.Errorf("unexpected file %s (should end with .md.tmpl)", name)
-		}
-		contentStr := string(content)
-		if !strings.Contains(contentStr, "Context") {
-			t.Errorf("%s doesn't contain 'Context' - may not be a valid role template", name)
 		}
 	}
 }

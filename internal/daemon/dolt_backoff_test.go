@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+const (
+	// testDeadlockTimeout is the maximum time to wait for a goroutine to
+	// complete before assuming a deadlock. Generous to avoid flakes on slow CI.
+	testDeadlockTimeout = 5 * time.Second
+
+	// testConcurrentHold is how long a test goroutine holds a lock or sleeps
+	// to give other goroutines a chance to contend.
+	testConcurrentHold = 200 * time.Millisecond
+)
+
 func TestAdvanceBackoff(t *testing.T) {
 	m := &DoltServerManager{
 		config: &DoltServerConfig{
@@ -418,7 +428,7 @@ func TestRestartWithBackoff_SkipsIfStartedDuringSleep(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected nil error when server started during backoff, got: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadlockTimeout):
 		t.Fatal("restartWithBackoff never completed — possible deadlock")
 	}
 
@@ -452,14 +462,14 @@ func TestWriteAndClearUnhealthySignal(t *testing.T) {
 	}
 
 	// Initially no signal
-	if IsDoltUnhealthy(tmpDir) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err == nil {
 		t.Error("expected no unhealthy signal initially")
 	}
 
 	// Write signal
 	m.writeUnhealthySignal("server_dead", "PID 12345 is dead")
 
-	if !IsDoltUnhealthy(tmpDir) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err != nil {
 		t.Error("expected unhealthy signal after write")
 	}
 
@@ -476,14 +486,17 @@ func TestWriteAndClearUnhealthySignal(t *testing.T) {
 	// Clear signal
 	m.clearUnhealthySignal()
 
-	if IsDoltUnhealthy(tmpDir) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err == nil {
 		t.Error("expected no unhealthy signal after clear")
 	}
 }
 
 func TestUnhealthySignalFile_Path(t *testing.T) {
+	// Port 3307 (production) uses canonical DOLT_UNHEALTHY path
+	prodConfig := DefaultDoltServerConfig("/tmp/test-town")
+	prodConfig.Port = 3307
 	m := &DoltServerManager{
-		config:   DefaultDoltServerConfig("/tmp/test-town"),
+		config:   prodConfig,
 		townRoot: "/tmp/test-town",
 		logger:   func(format string, v ...interface{}) {},
 	}
@@ -491,6 +504,20 @@ func TestUnhealthySignalFile_Path(t *testing.T) {
 	expected := filepath.Join("/tmp", "test-town", "daemon", "DOLT_UNHEALTHY")
 	if got := m.unhealthySignalFile(); got != expected {
 		t.Errorf("expected %s, got %s", expected, got)
+	}
+
+	// Non-3307 ports get a port-suffixed path
+	testConfig := DefaultDoltServerConfig("/tmp/test-town")
+	testConfig.Port = 3308
+	m2 := &DoltServerManager{
+		config:   testConfig,
+		townRoot: "/tmp/test-town",
+		logger:   func(format string, v ...interface{}) {},
+	}
+
+	expected2 := filepath.Join("/tmp", "test-town", "daemon", "DOLT_UNHEALTHY_3308")
+	if got := m2.unhealthySignalFile(); got != expected2 {
+		t.Errorf("expected %s, got %s", expected2, got)
 	}
 }
 
@@ -529,6 +556,7 @@ func newTestManager(t *testing.T) *DoltServerManager {
 		logger:           func(format string, v ...interface{}) { t.Logf(format, v...) },
 		runningFn:        func() (int, bool) { return 0, false },
 		healthCheckFn:    func() error { return nil },
+		identityCheckFn:  func() error { return nil },
 		startFn:          func() error { return nil },
 		stopFn:           func() {},
 		unhealthyAlertFn: func(error) {},
@@ -548,7 +576,7 @@ func TestConcurrentEnsureRunning_OnlyOneRestart(t *testing.T) {
 		return nil
 	}
 	m.sleepFn = func(d time.Duration) {
-		time.Sleep(200 * time.Millisecond) // Hold to let other goroutines try
+		time.Sleep(testConcurrentHold) // Hold to let other goroutines try
 	}
 
 	const n = 10
@@ -606,7 +634,7 @@ func TestConcurrentEnsureRunning_BackoffSleepReleasesLock(t *testing.T) {
 		if err != nil {
 			t.Errorf("concurrent caller got error: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testDeadlockTimeout):
 		t.Fatal("concurrent caller blocked while restart was sleeping")
 	}
 
@@ -618,7 +646,7 @@ func TestConcurrentEnsureRunning_BackoffSleepReleasesLock(t *testing.T) {
 		if err != nil {
 			t.Errorf("first caller got error: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testDeadlockTimeout):
 		t.Fatal("first caller never completed")
 	}
 }
@@ -1071,9 +1099,8 @@ func TestEnsureRunning_ReadOnlyWritesUnhealthySignal(t *testing.T) {
 
 	_ = m.EnsureRunning()
 
-	// Check the DOLT_UNHEALTHY signal file was written
-	signalFile := filepath.Join(m.townRoot, "daemon", "DOLT_UNHEALTHY")
-	data, err := os.ReadFile(signalFile)
+	// Check the DOLT_UNHEALTHY signal file was written (port-specific path)
+	data, err := os.ReadFile(m.unhealthySignalFile())
 	if err != nil {
 		t.Fatalf("expected DOLT_UNHEALTHY signal file: %v", err)
 	}
@@ -1126,7 +1153,7 @@ func TestEnsureRunning_HealthyAfterReadOnlyRecovery(t *testing.T) {
 	}
 
 	// Unhealthy signal should be cleared
-	if IsDoltUnhealthy(m.townRoot) {
+	if _, err := os.Stat(m.unhealthySignalFile()); err == nil {
 		t.Error("expected DOLT_UNHEALTHY signal to be cleared after recovery")
 	}
 }

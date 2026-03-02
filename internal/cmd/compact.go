@@ -55,7 +55,7 @@ var compactCmd = &cobra.Command{
 
 For non-closed wisps past TTL: promotes to permanent beads (something is stuck).
 For closed wisps past TTL: deletes them (Dolt AS OF preserves history).
-Wisps with comments, references, or keep labels are always promoted.
+Wisps with comments or keep labels are always promoted.
 
 TTLs by wisp type:
   heartbeat, ping:              6h
@@ -82,18 +82,13 @@ func init() {
 
 // loadTTLConfig loads TTL configuration with layered precedence:
 //
-//	role bead > rig config (wisp layer + bead labels) > hardcoded defaults
-//
-// The roleName parameter enables role bead overrides (e.g., "deacon", "witness").
-// Pass empty string to skip the role bead layer.
+//	rig config (wisp layer + bead labels) > hardcoded defaults
 func loadTTLConfig(townRoot, rigName string) map[string]time.Duration {
-	roleName := os.Getenv("GT_ROLE")
-	return loadTTLConfigWithRole(townRoot, rigName, roleName)
+	return loadTTLConfigWithRole(townRoot, rigName)
 }
 
-// loadTTLConfigWithRole is the testable version of loadTTLConfig that accepts
-// an explicit role name parameter instead of reading from environment.
-func loadTTLConfigWithRole(townRoot, rigName, roleName string) map[string]time.Duration {
+// loadTTLConfigWithRole is the testable version of loadTTLConfig.
+func loadTTLConfigWithRole(townRoot, rigName string) map[string]time.Duration {
 	// Layer 1: Hardcoded defaults (lowest precedence)
 	ttls := make(map[string]time.Duration)
 	for k, v := range defaultTTLs {
@@ -125,11 +120,6 @@ func loadTTLConfigWithRole(townRoot, rigName, roleName string) map[string]time.D
 		applyRigBeadTTLOverrides(ttls, townRoot, rigName)
 	}
 
-	// Layer 3: Role bead description (highest precedence)
-	if roleName != "" {
-		applyRoleBeadTTLOverrides(ttls, townRoot, roleName)
-	}
-
 	return ttls
 }
 
@@ -157,25 +147,6 @@ func applyRigBeadTTLOverrides(ttls map[string]time.Duration, townRoot, rigName s
 			if dur, err := time.ParseDuration(value); err == nil {
 				ttls[wispType] = dur
 			}
-		}
-	}
-}
-
-// applyRoleBeadTTLOverrides reads wisp_ttl_* fields from the role bead description
-// and applies them as overrides (highest precedence).
-func applyRoleBeadTTLOverrides(ttls map[string]time.Duration, townRoot, roleName string) {
-	beadsDir := beads.ResolveBeadsDir(townRoot)
-	bd := beads.NewWithBeadsDir(townRoot, beadsDir)
-
-	roleBeadID := beads.RoleBeadIDTown(roleName)
-	roleConfig, err := bd.GetRoleConfig(roleBeadID)
-	if err != nil || roleConfig == nil {
-		return
-	}
-
-	for wispType, ttlStr := range roleConfig.WispTTLs {
-		if dur, err := time.ParseDuration(ttlStr); err == nil {
-			ttls[wispType] = dur
 		}
 	}
 }
@@ -238,18 +209,28 @@ func runCompact(cmd *cobra.Command, args []string) error {
 		}
 
 		ttl := getTTL(ttls, w.WispType)
-		shouldPromote := hasComments(w) || isReferenced(w) || hasKeepLabel(w)
+		shouldPromote := hasComments(w) || hasKeepLabel(w)
+
+		// Molecule step wisps (those with a Parent) should never be promoted.
+		// They are subordinate steps of a molecule and should be deleted when
+		// past TTL, not elevated to permanent beads. This prevents patrol
+		// molecule steps from polluting the issues table.
+		isMoleculeStep := w.Parent != ""
 
 		if w.Status != "closed" {
 			// Non-closed wisps
-			if shouldPromote {
+			if shouldPromote && !isMoleculeStep {
 				promoteWisp(bd, w, "proven value", result)
 			} else if age > ttl {
-				reason := "open past TTL"
-				if w.Status == "in_progress" {
-					reason = "stuck in_progress past TTL"
+				if isMoleculeStep {
+					deleteWisp(bd, w, "molecule step past TTL", result)
+				} else {
+					reason := "open past TTL"
+					if w.Status == "in_progress" {
+						reason = "stuck in_progress past TTL"
+					}
+					promoteWisp(bd, w, reason, result)
 				}
-				promoteWisp(bd, w, reason, result)
 			} else {
 				result.Skipped++
 				if compactVerbose && !compactJSON {
@@ -259,7 +240,7 @@ func runCompact(cmd *cobra.Command, args []string) error {
 			}
 		} else {
 			// Closed wisps
-			if shouldPromote {
+			if shouldPromote && !isMoleculeStep {
 				promoteWisp(bd, w, "proven value", result)
 			} else if age > ttl {
 				deleteWisp(bd, w, "TTL expired", result)

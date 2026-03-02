@@ -4,14 +4,17 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 // AgentEnvConfig specifies the configuration for generating agent environment variables.
 // This is the single source of truth for all agent environment configuration.
 type AgentEnvConfig struct {
-	// Role is the agent role: mayor, deacon, witness, refinery, crew, polecat, boot
+	// Role is the agent role: mayor, deacon, witness, refinery, crew, polecat, dog, boot
 	Role string
 
 	// Rig is the rig name (empty for town-level agents like mayor/deacon)
@@ -31,6 +34,32 @@ type AgentEnvConfig struct {
 	// SessionIDEnv is the environment variable name that holds the session ID.
 	// Sets GT_SESSION_ID_ENV so the runtime knows where to find the session ID.
 	SessionIDEnv string
+
+	// Agent is the agent override (e.g., "codex", "gemini").
+	// If set, GT_AGENT is written to the tmux session table via SetEnvironment
+	// so that IsAgentAlive and waitForPolecatReady can read it via GetEnvironment.
+	// Without this, GetEnvironment returns empty (tmux show-environment reads the
+	// session table, not the process env set via exec env in the startup command).
+	Agent string
+
+	// Prompt is the initial startup prompt/beacon given to the agent.
+	// When set, the first line (truncated) is added as gt.prompt to OTEL_RESOURCE_ATTRIBUTES
+	// so logs can be correlated to the specific task the agent was working on.
+	Prompt string
+
+	// Issue is the molecule/bead ID being worked (e.g., "gt-abc12").
+	// Added as gt.issue to OTEL_RESOURCE_ATTRIBUTES for filtering by ticket.
+	Issue string
+
+	// Topic is the beacon topic describing why the session was started.
+	// Examples: "assigned", "patrol", "start", "restart", "handoff".
+	// Added as gt.topic to OTEL_RESOURCE_ATTRIBUTES for filtering by work type.
+	Topic string
+
+	// SessionName is the tmux session name for this agent (e.g., "hq-mayor", "gt-witness").
+	// Added as gt.session to OTEL_RESOURCE_ATTRIBUTES so all Claude logs from a
+	// single GT session can be correlated, and as GT_SESSION env var.
+	SessionName string
 }
 
 // AgentEnv returns all environment variables for an agent based on the config.
@@ -42,34 +71,34 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// GT_ROLE is set in compound format (e.g., "beads/crew/jane") so that
 	// beads can parse it without knowing about Gas Town role types.
 	switch cfg.Role {
-	case "mayor":
-		env["GT_ROLE"] = "mayor"
-		env["BD_ACTOR"] = "mayor"
-		env["GIT_AUTHOR_NAME"] = "mayor"
+	case constants.RoleMayor:
+		env["GT_ROLE"] = constants.RoleMayor
+		env["BD_ACTOR"] = constants.RoleMayor
+		env["GIT_AUTHOR_NAME"] = constants.RoleMayor
 
-	case "deacon":
-		env["GT_ROLE"] = "deacon"
-		env["BD_ACTOR"] = "deacon"
-		env["GIT_AUTHOR_NAME"] = "deacon"
+	case constants.RoleDeacon:
+		env["GT_ROLE"] = constants.RoleDeacon
+		env["BD_ACTOR"] = constants.RoleDeacon
+		env["GIT_AUTHOR_NAME"] = constants.RoleDeacon
 
 	case "boot":
 		env["GT_ROLE"] = "deacon/boot"
 		env["BD_ACTOR"] = "deacon-boot"
 		env["GIT_AUTHOR_NAME"] = "boot"
 
-	case "witness":
+	case constants.RoleWitness:
 		env["GT_ROLE"] = fmt.Sprintf("%s/witness", cfg.Rig)
 		env["GT_RIG"] = cfg.Rig
 		env["BD_ACTOR"] = fmt.Sprintf("%s/witness", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/witness", cfg.Rig)
 
-	case "refinery":
+	case constants.RoleRefinery:
 		env["GT_ROLE"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		env["GT_RIG"] = cfg.Rig
 		env["BD_ACTOR"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 
-	case "polecat":
+	case constants.RolePolecat:
 		env["GT_ROLE"] = fmt.Sprintf("%s/polecats/%s", cfg.Rig, cfg.AgentName)
 		env["GT_RIG"] = cfg.Rig
 		env["GT_POLECAT"] = cfg.AgentName
@@ -81,12 +110,24 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		// contention leading to Dolt read-only mode (gt-5cc2p).
 		env["BD_DOLT_AUTO_COMMIT"] = "off"
 
-	case "crew":
+	case constants.RoleCrew:
 		env["GT_ROLE"] = fmt.Sprintf("%s/crew/%s", cfg.Rig, cfg.AgentName)
 		env["GT_RIG"] = cfg.Rig
 		env["GT_CREW"] = cfg.AgentName
 		env["BD_ACTOR"] = fmt.Sprintf("%s/crew/%s", cfg.Rig, cfg.AgentName)
 		env["GIT_AUTHOR_NAME"] = cfg.AgentName
+
+	case "dog":
+		// Dogs are town-level workers with role_agents key "dog".
+		// GT_ROLE must be set so startup command resolution can honor role_agents.dog.
+		env["GT_ROLE"] = "dog"
+		if cfg.AgentName != "" {
+			env["BD_ACTOR"] = fmt.Sprintf("dog/%s", cfg.AgentName)
+			env["GIT_AUTHOR_NAME"] = cfg.AgentName
+		} else {
+			env["BD_ACTOR"] = "dog"
+			env["GIT_AUTHOR_NAME"] = "dog"
+		}
 	}
 
 	// Only set GT_ROOT if provided
@@ -100,7 +141,7 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	}
 
 	// Set BEADS_AGENT_NAME for polecat/crew (uses same format as BD_ACTOR)
-	if cfg.Role == "polecat" || cfg.Role == "crew" {
+	if cfg.Role == constants.RolePolecat || cfg.Role == constants.RoleCrew {
 		env["BEADS_AGENT_NAME"] = fmt.Sprintf("%s/%s", cfg.Rig, cfg.AgentName)
 	}
 
@@ -114,6 +155,29 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["GT_SESSION_ID_ENV"] = cfg.SessionIDEnv
 	}
 
+	// Set GT_SESSION when a session name is provided, so gt commands and
+	// cost reports can correlate activity to a specific tmux session.
+	if cfg.SessionName != "" {
+		env["GT_SESSION"] = cfg.SessionName
+	}
+
+	// Set GT_AGENT when an agent override is in use.
+	// This makes the override visible via tmux show-environment so that
+	// IsAgentAlive and waitForPolecatReady use the correct process names.
+	if cfg.Agent != "" {
+		env["GT_AGENT"] = cfg.Agent
+	}
+
+	// Disable bd's per-repo JSONL auto-backup for all Gas Town agents.
+	// bd auto-enables backup when a git remote exists, then force-adds
+	// .beads/backup/ files (bypassing .gitignore) and commits/pushes them
+	// to the project repo. In Gas Town, Dolt is the persistent data store
+	// and the daemon provides centralized backup patrols (dolt_backup,
+	// jsonl_git_backup), making per-repo backup redundant and harmful —
+	// it pollutes rig git history on both main and feature branches.
+	// See: https://github.com/steveyegge/beads/issues/2241
+	env["BD_BACKUP_ENABLED"] = "false"
+
 	// Clear NODE_OPTIONS to prevent debugger flags (e.g., --inspect from VSCode)
 	// from being inherited through tmux into Claude's Node.js runtime.
 	// This is the PRIMARY guard: setting it here (the single source of truth
@@ -124,7 +188,160 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	// this empty value with intentional settings like --max-old-space-size.
 	env["NODE_OPTIONS"] = ""
 
+	// Clear CLAUDECODE to prevent nested session detection in Claude Code v2.x.
+	// When gt sling is invoked from within a Claude Code session, CLAUDECODE=1
+	// leaks through tmux's global environment into new polecat sessions, causing
+	// Claude Code to refuse to start with a "nested sessions" error.
+	// See: https://github.com/steveyegge/gastown/issues/1666
+	env["CLAUDECODE"] = ""
+
+	// Propagate Claude Code's own OTEL telemetry when GT telemetry is enabled.
+	// Reuses the same VictoriaMetrics endpoint as gastown's telemetry so all
+	// metrics (gt + claude) land in the same store.
+	// Opt-in: only active when GT_OTEL_METRICS_URL is explicitly set.
+	if metricsURL := os.Getenv("GT_OTEL_METRICS_URL"); metricsURL != "" {
+		env["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
+		env["OTEL_METRICS_EXPORTER"] = "otlp"
+		env["OTEL_METRIC_EXPORT_INTERVAL"] = "1000"
+		env["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] = metricsURL
+		// VictoriaMetrics rejects JSON encoding ("json encoding isn't supported
+		// for opentelemetry format"). The Node.js OTEL SDK defaults to JSON;
+		// force protobuf so the push succeeds.
+		env["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"] = "http/protobuf"
+		// Mirror into bd's own var names so any `bd` call inside the Claude
+		// session emits metrics/logs to the same VictoriaMetrics instance.
+		env["BD_OTEL_METRICS_URL"] = metricsURL
+		if logsURL := os.Getenv("GT_OTEL_LOGS_URL"); logsURL != "" {
+			env["BD_OTEL_LOGS_URL"] = logsURL
+			// Claude Code supports OTLP log export; route to the same VictoriaLogs
+			// instance. Uses protobuf (VictoriaLogs rejects JSON).
+			env["OTEL_LOGS_EXPORTER"] = "otlp"
+			env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] = logsURL
+			env["OTEL_EXPORTER_OTLP_LOGS_PROTOCOL"] = "http/protobuf"
+			// Log tool usage details (which tools ran, their status).
+			env["OTEL_LOG_TOOL_DETAILS"] = "true"
+			// Log tool output content (e.g. gt prime stdout as it reaches Claude).
+			env["OTEL_LOG_TOOL_CONTENT"] = "true"
+			// Log user-turn messages (initial beacon + any human prompts to Claude).
+			env["OTEL_LOG_USER_PROMPTS"] = "true"
+		}
+
+		// Attach GT context as OTEL resource attributes so Claude's metrics
+		// can be correlated with gastown's own telemetry in VictoriaMetrics.
+		// Claude Code's Node.js SDK picks up OTEL_RESOURCE_ATTRIBUTES automatically.
+		var attrs []string
+		if v := env["GT_ROLE"]; v != "" {
+			attrs = append(attrs, "gt.role="+v)
+		}
+		if cfg.Rig != "" {
+			attrs = append(attrs, "gt.rig="+cfg.Rig)
+		}
+		if v := env["BD_ACTOR"]; v != "" {
+			attrs = append(attrs, "gt.actor="+v)
+		}
+		if cfg.AgentName != "" {
+			attrs = append(attrs, "gt.agent="+cfg.AgentName)
+		}
+		if cfg.TownRoot != "" {
+			attrs = append(attrs, "gt.town="+filepath.Base(cfg.TownRoot))
+		}
+		if cfg.Prompt != "" {
+			attrs = append(attrs, "gt.prompt="+sanitizeOTELAttrValue(cfg.Prompt, 120))
+		}
+		if cfg.Issue != "" {
+			attrs = append(attrs, "gt.issue="+sanitizeOTELAttrValue(cfg.Issue, 40))
+		}
+		if cfg.Topic != "" {
+			attrs = append(attrs, "gt.topic="+sanitizeOTELAttrValue(cfg.Topic, 40))
+		}
+		if cfg.SessionName != "" {
+			attrs = append(attrs, "gt.session="+sanitizeOTELAttrValue(cfg.SessionName, 80))
+		}
+		if len(attrs) > 0 {
+			env["OTEL_RESOURCE_ATTRIBUTES"] = strings.Join(attrs, ",")
+		}
+	}
+
+	// Pass through cloud API credentials and provider configuration from the parent shell.
+	// Only variables explicitly listed here are forwarded; all others are blocked for isolation.
+	for _, key := range []string{
+		// Anthropic API (direct)
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_CUSTOM_HEADERS",
+
+		// Model selection
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"CLAUDE_CODE_SUBAGENT_MODEL",
+
+		// AWS Bedrock
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"AWS_SESSION_TOKEN",
+		"AWS_REGION",
+		"AWS_PROFILE",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+
+		// Microsoft Foundry
+		"CLAUDE_CODE_USE_FOUNDRY",
+		"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+		"ANTHROPIC_FOUNDRY_API_KEY",
+		"ANTHROPIC_FOUNDRY_BASE_URL",
+		"ANTHROPIC_FOUNDRY_RESOURCE",
+
+		// Google Vertex AI
+		"CLAUDE_CODE_USE_VERTEX",
+		"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+		"GOOGLE_APPLICATION_CREDENTIALS",
+		"GOOGLE_CLOUD_PROJECT",
+		"VERTEX_PROJECT",
+		"VERTEX_LOCATION",
+		"VERTEX_REGION_CLAUDE_3_5_HAIKU",
+		"VERTEX_REGION_CLAUDE_3_7_SONNET",
+		"VERTEX_REGION_CLAUDE_4_0_OPUS",
+		"VERTEX_REGION_CLAUDE_4_0_SONNET",
+		"VERTEX_REGION_CLAUDE_4_1_OPUS",
+
+		// Proxy / network
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"NO_PROXY",
+
+		// mTLS
+		"CLAUDE_CODE_CLIENT_CERT",
+		"CLAUDE_CODE_CLIENT_KEY",
+		"CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+	} {
+		if val := os.Getenv(key); val != "" {
+			env[key] = val
+		}
+	}
+
 	return env
+}
+
+// sanitizeOTELAttrValue prepares a string for use as a value in OTEL_RESOURCE_ATTRIBUTES.
+// It takes the first line only, replaces commas (which break key=value,key=value parsing),
+// and truncates to maxLen bytes.
+func sanitizeOTELAttrValue(s string, maxLen int) string {
+	// First line only — beacons are multi-line; the first line is the structured header.
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	// Commas separate key=value pairs in OTEL_RESOURCE_ATTRIBUTES — replace with |.
+	s = strings.ReplaceAll(s, ",", "|")
+	s = strings.TrimSpace(s)
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return s
 }
 
 // AgentEnvSimple is a convenience function for simple role-based env var lookup.

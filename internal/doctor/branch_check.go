@@ -6,11 +6,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
-// BranchCheck detects persistent roles (crew, witness, refinery) that are
-// not on the main branch. Long-lived roles should work directly on main
-// to avoid orphaned work and branch decay.
+// BranchCheck detects persistent infrastructure roles (witness, refinery)
+// that are not on the main branch. Crew members are excluded because they
+// legitimately use feature branches during PR workflows.
 type BranchCheck struct {
 	FixableCheck
 	offMainDirs []string // Cached during Run for use in Fix
@@ -22,7 +24,7 @@ func NewBranchCheck() *BranchCheck {
 		FixableCheck: FixableCheck{
 			BaseCheck: BaseCheck{
 				CheckName:        "persistent-role-branches",
-				CheckDescription: "Detect persistent roles not on main branch",
+				CheckDescription: "Detect infrastructure roles (witness/refinery) not on main branch",
 				CheckCategory:    CategoryCleanup,
 			},
 		},
@@ -44,7 +46,7 @@ func (c *BranchCheck) Run(ctx *CheckContext) *CheckResult {
 			continue
 		}
 
-		if branch == "main" || branch == "master" {
+		if c.isExpectedBranch(ctx.TownRoot, dir, branch) {
 			onMain++
 		} else {
 			offMain = append(offMain, fmt.Sprintf("%s (on %s)", c.relativePath(ctx.TownRoot, dir), branch))
@@ -58,7 +60,7 @@ func (c *BranchCheck) Run(ctx *CheckContext) *CheckResult {
 		if err != nil {
 			continue
 		}
-		if branch != "main" && branch != "master" {
+		if !c.isExpectedBranch(ctx.TownRoot, dir, branch) {
 			c.offMainDirs = append(c.offMainDirs, dir)
 		}
 	}
@@ -87,7 +89,8 @@ func (c *BranchCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// Fix switches all off-main directories to main branch.
+// Fix switches all off-main directories to their expected branch.
+// Uses the rig's default_branch if configured, otherwise "main".
 func (c *BranchCheck) Fix(ctx *CheckContext) error {
 	if len(c.offMainDirs) == 0 {
 		return nil
@@ -95,16 +98,15 @@ func (c *BranchCheck) Fix(ctx *CheckContext) error {
 
 	var lastErr error
 	for _, dir := range c.offMainDirs {
-		// git checkout main
-		cmd := exec.Command("git", "checkout", "main")
-		cmd.Dir = dir
-		if err := cmd.Run(); err != nil {
-			lastErr = fmt.Errorf("%s: %w", dir, err)
+		targetBranch := c.expectedBranch(ctx.TownRoot, dir)
+
+		if err := c.checkoutWithWorktreeRetry(dir, targetBranch); err != nil {
+			lastErr = err
 			continue
 		}
 
 		// git pull --rebase
-		cmd = exec.Command("git", "pull", "--rebase")
+		cmd := exec.Command("git", "pull", "--rebase")
 		cmd.Dir = dir
 		if err := cmd.Run(); err != nil {
 			// Pull failure is not fatal, just warn
@@ -115,10 +117,125 @@ func (c *BranchCheck) Fix(ctx *CheckContext) error {
 	return lastErr
 }
 
-// findPersistentRoleDirs finds all directories that should be on main:
-// - <rig>/crew/*
+// checkoutWithWorktreeRetry attempts git checkout, and if it fails because the
+// branch is already checked out in another worktree (typically .repo.git), it
+// detaches that worktree's HEAD to free the branch and retries.
+func (c *BranchCheck) checkoutWithWorktreeRetry(dir, branch string) error {
+	cmd := exec.Command("git", "checkout", branch) //nolint:gosec // G204: branch name from config
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+
+	// Check if failure is due to worktree branch conflict.
+	// Git error looks like: fatal: 'main' is already checked out at '/path/to/.repo.git'
+	conflictPath := parseWorktreeConflict(string(output))
+	if conflictPath == "" {
+		return fmt.Errorf("%s: git checkout %s failed: %s", dir, branch, strings.TrimSpace(string(output)))
+	}
+
+	// Only auto-resolve conflicts with bare repos (.repo.git).
+	// Detaching HEAD in a bare repo is safe since it has no working tree.
+	if !strings.HasSuffix(conflictPath, ".repo.git") {
+		return fmt.Errorf("%s: branch %q is already checked out at %s (not a bare repo, cannot auto-resolve)",
+			dir, branch, conflictPath)
+	}
+
+	// Detach the bare repo's HEAD to free the branch.
+	// We use checkout --detach which points HEAD at the current commit without a branch.
+	detachCmd := exec.Command("git", "-C", conflictPath, "checkout", "--detach") //nolint:gosec // G204: path from git output
+	if detachOutput, detachErr := detachCmd.CombinedOutput(); detachErr != nil {
+		return fmt.Errorf("%s: cannot detach HEAD in %s to free branch %q: %s",
+			dir, conflictPath, branch, strings.TrimSpace(string(detachOutput)))
+	}
+
+	// Retry the checkout now that the branch is freed.
+	retryCmd := exec.Command("git", "checkout", branch) //nolint:gosec // G204: branch name from config
+	retryCmd.Dir = dir
+	if retryOutput, retryErr := retryCmd.CombinedOutput(); retryErr != nil {
+		return fmt.Errorf("%s: git checkout %s failed after detaching %s: %s",
+			dir, branch, conflictPath, strings.TrimSpace(string(retryOutput)))
+	}
+
+	return nil
+}
+
+// parseWorktreeConflict extracts the conflicting path from a git checkout error.
+// Returns empty string if the error is not a worktree branch conflict.
+// Git versions use different formats:
+//   - Older: "fatal: 'branch' is already checked out at '/path/to/repo'"
+//   - Newer: "fatal: 'branch' is already used by worktree at '/path/to/repo'"
+func parseWorktreeConflict(output string) string {
+	markers := []string{
+		"is already checked out at '",
+		"is already used by worktree at '",
+	}
+	for _, marker := range markers {
+		idx := strings.Index(output, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := output[idx+len(marker):]
+		endIdx := strings.Index(rest, "'")
+		if endIdx < 0 {
+			continue
+		}
+		return rest[:endIdx]
+	}
+	return ""
+}
+
+// expectedBranch returns the branch a persistent role directory should be on.
+// Checks the rig's default_branch config, falling back to "main".
+func (c *BranchCheck) expectedBranch(townRoot, dir string) string {
+	rel, err := filepath.Rel(townRoot, dir)
+	if err != nil {
+		return "main"
+	}
+	parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+	if len(parts) < 1 {
+		return "main"
+	}
+	rigPath := filepath.Join(townRoot, parts[0])
+	cfg, err := rig.LoadRigConfig(rigPath)
+	if err != nil || cfg.DefaultBranch == "" {
+		return "main"
+	}
+	return cfg.DefaultBranch
+}
+
+// isExpectedBranch checks if a directory is on the expected branch.
+// For rigs with a custom default_branch, that branch is expected.
+// Otherwise, main or master are expected.
+func (c *BranchCheck) isExpectedBranch(townRoot, dir, branch string) bool {
+	if branch == "main" || branch == "master" {
+		return true
+	}
+	// Derive the rig path from the directory.
+	// Directories are like <town>/<rig>/refinery/rig or <town>/<rig>/crew/<name>.
+	rel, err := filepath.Rel(townRoot, dir)
+	if err != nil {
+		return false
+	}
+	parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+	if len(parts) < 1 {
+		return false
+	}
+	rigPath := filepath.Join(townRoot, parts[0])
+	cfg, err := rig.LoadRigConfig(rigPath)
+	if err != nil || cfg.DefaultBranch == "" {
+		return false
+	}
+	return branch == cfg.DefaultBranch
+}
+
+// findPersistentRoleDirs finds infrastructure directories that should be on main:
 // - <rig>/witness/rig (if exists)
 // - <rig>/refinery/rig (if exists)
+//
+// Crew members are excluded because they legitimately use feature branches
+// during PR workflows (fix/, feat/, chore/ branches).
 func (c *BranchCheck) findPersistentRoleDirs(townRoot string) []string {
 	var dirs []string
 
@@ -143,16 +260,6 @@ func (c *BranchCheck) findPersistentRoleDirs(townRoot string) []string {
 		// Check if this looks like a rig (has crew/, polecats/, witness/, or refinery/)
 		if !c.isRig(rigPath) {
 			continue
-		}
-
-		// Add crew members
-		crewPath := filepath.Join(rigPath, "crew")
-		if crewEntries, err := os.ReadDir(crewPath); err == nil {
-			for _, crew := range crewEntries {
-				if crew.IsDir() && !strings.HasPrefix(crew.Name(), ".") {
-					dirs = append(dirs, filepath.Join(crewPath, crew.Name()))
-				}
-			}
 		}
 
 		// Add witness/rig if exists
@@ -200,130 +307,6 @@ func (c *BranchCheck) relativePath(base, path string) string {
 		return path
 	}
 	return rel
-}
-
-// BeadsSyncOrphanCheck detects code changes on beads-sync branch that weren't
-// merged to main. This catches cases where merges lose code changes.
-type BeadsSyncOrphanCheck struct {
-	BaseCheck
-}
-
-// NewBeadsSyncOrphanCheck creates a new beads-sync orphan check.
-func NewBeadsSyncOrphanCheck() *BeadsSyncOrphanCheck {
-	return &BeadsSyncOrphanCheck{
-		BaseCheck: BaseCheck{
-			CheckName:        "beads-sync-orphans",
-			CheckDescription: "Detect orphaned code on beads-sync branch",
-			CheckCategory:    CategoryCleanup,
-		},
-	}
-}
-
-// Run checks for code differences between main and beads-sync.
-func (c *BeadsSyncOrphanCheck) Run(ctx *CheckContext) *CheckResult {
-	// Find the first rig with a crew member (that has beads-sync branch)
-	crewDirs := c.findCrewDirs(ctx.TownRoot)
-	if len(crewDirs) == 0 {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "No crew directories found",
-		}
-	}
-
-	// Use first crew dir to check beads-sync
-	crewDir := crewDirs[0]
-
-	// Check if beads-sync branch exists
-	cmd := exec.Command("git", "rev-parse", "--verify", "beads-sync")
-	cmd.Dir = crewDir
-	if err := cmd.Run(); err != nil {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "No beads-sync branch (single-clone setup)",
-		}
-	}
-
-	// Get diff between main and beads-sync, excluding .beads/
-	cmd = exec.Command("git", "diff", "--name-only", "main..beads-sync", "--", ".", ":(exclude).beads")
-	cmd.Dir = crewDir
-	out, err := cmd.Output()
-	if err != nil {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusWarning,
-			Message: "Could not diff main..beads-sync",
-			Details: []string{err.Error()},
-		}
-	}
-
-	files := strings.TrimSpace(string(out))
-	if files == "" {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "No orphaned code on beads-sync",
-		}
-	}
-
-	// Filter to code files only
-	var codeFiles []string
-	for _, f := range strings.Split(files, "\n") {
-		if f == "" {
-			continue
-		}
-		// Check if it's a code file
-		if strings.HasSuffix(f, ".go") || strings.HasSuffix(f, ".md") ||
-			strings.HasSuffix(f, ".toml") || strings.HasSuffix(f, ".json") ||
-			strings.HasSuffix(f, ".yaml") || strings.HasSuffix(f, ".yml") ||
-			strings.HasSuffix(f, ".tmpl") {
-			codeFiles = append(codeFiles, f)
-		}
-	}
-
-	if len(codeFiles) == 0 {
-		return &CheckResult{
-			Name:    c.Name(),
-			Status:  StatusOK,
-			Message: "No orphaned code on beads-sync (only non-code files differ)",
-		}
-	}
-
-	return &CheckResult{
-		Name:    c.Name(),
-		Status:  StatusWarning,
-		Message: fmt.Sprintf("%d file(s) on beads-sync not in main", len(codeFiles)),
-		Details: codeFiles,
-		FixHint: "Review with: git diff main..beads-sync -- <file>",
-	}
-}
-
-// findCrewDirs returns crew directories that might have beads-sync.
-func (c *BeadsSyncOrphanCheck) findCrewDirs(townRoot string) []string {
-	var dirs []string
-
-	entries, err := os.ReadDir(townRoot)
-	if err != nil {
-		return dirs
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || entry.Name() == "mayor" {
-			continue
-		}
-
-		crewPath := filepath.Join(townRoot, entry.Name(), "crew")
-		if crewEntries, err := os.ReadDir(crewPath); err == nil {
-			for _, crew := range crewEntries {
-				if crew.IsDir() && !strings.HasPrefix(crew.Name(), ".") {
-					dirs = append(dirs, filepath.Join(crewPath, crew.Name()))
-				}
-			}
-		}
-	}
-
-	return dirs
 }
 
 // CloneDivergenceCheck detects when git clones have drifted significantly apart.
