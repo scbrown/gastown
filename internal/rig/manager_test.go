@@ -1290,6 +1290,9 @@ esac
 }
 
 func TestAddRig_UpstreamURL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires running Dolt server")
+	}
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-based bd shim not reliable on Windows CI")
 	}
