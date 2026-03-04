@@ -66,7 +66,7 @@ jobs:
       - name: Test with Coverage
         run: |
           set -o pipefail
-          gotestsum --format testname --junitfile junit.xml -- -race -short -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
+          gotestsum --format testname --junitfile junit.xml -- -race -short -timeout=10m -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
 
       - name: Test Report
         if: always()

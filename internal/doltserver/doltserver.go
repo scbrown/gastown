@@ -128,6 +128,20 @@ const (
 	DefaultPort           = 3307
 	DefaultUser           = "root" // Default Dolt user (no password for local access)
 	DefaultMaxConnections = 1000   // Dolt default; no reason to limit below (Tim Sehn confirmed 1k is fine)
+
+	// DefaultReadTimeoutMs is the server-side timeout for reading a complete request from a client.
+	// Controls how long Dolt waits for a client to send a query on an idle connection.
+	// Prevents CLOSE_WAIT accumulation from abandoned connections: when a client times out
+	// and closes its end, Dolt will detect the dead connection within this window.
+	// 5 minutes matches the compactor GC timeout (compactorGCTimeout) so GC ops complete
+	// before the connection is considered stale.
+	DefaultReadTimeoutMs = 5 * 60 * 1000 // 5 minutes in milliseconds
+
+	// DefaultWriteTimeoutMs is the server-side timeout for writing a response back to a client.
+	// When a client closes its TCP connection while a query is running (e.g. compactor GC),
+	// Dolt detects the dead connection within this timeout rather than holding CLOSE_WAIT
+	// for Dolt's default 8 hours. Set to match compactor GC timeout.
+	DefaultWriteTimeoutMs = 5 * 60 * 1000 // 5 minutes in milliseconds
 )
 
 // metadataMu provides per-path mutexes for EnsureMetadata goroutine synchronization.
@@ -175,6 +189,21 @@ type Config struct {
 	// connection storms during mass polecat slings.
 	MaxConnections int
 
+	// ReadTimeoutMs is the server-side read timeout in milliseconds.
+	// Controls how long Dolt waits for a client to send a request on an idle connection.
+	// Prevents abandoned connections from staying in CLOSE_WAIT indefinitely.
+	// Set to 0 to use Dolt's default (28800000 = 8 hours — strongly discouraged).
+	ReadTimeoutMs int
+
+	// WriteTimeoutMs is the server-side write timeout in milliseconds.
+	// Controls how long Dolt waits to write response data back to a client.
+	// When a client closes its TCP connection while a query is running, Dolt
+	// detects the dead connection within WriteTimeoutMs instead of holding it
+	// open for up to 8 hours (Dolt default).
+	// Must be >= the longest expected query (e.g., compactor GC at 5 minutes).
+	// Set to 0 to use Dolt's default (28800000 = 8 hours — strongly discouraged).
+	WriteTimeoutMs int
+
 	// LogLevel is the Dolt server log level (trace, debug, info, warning, error, fatal).
 	// Default is "warning" to suppress connection open/close noise. Override with
 	// GT_DOLT_LOGLEVEL=info (or debug) for diagnostics.
@@ -198,6 +227,8 @@ func DefaultConfig(townRoot string) *Config {
 		LogFile:        filepath.Join(daemonDir, "dolt.log"),
 		PidFile:        filepath.Join(daemonDir, "dolt.pid"),
 		MaxConnections: DefaultMaxConnections,
+		ReadTimeoutMs:  DefaultReadTimeoutMs,
+		WriteTimeoutMs: DefaultWriteTimeoutMs,
 		LogLevel:       "warning",
 	}
 
@@ -280,6 +311,14 @@ func (c *Config) userDSN() string {
 		return c.User + ":" + c.Password
 	}
 	return c.User
+}
+
+// EffectiveHost returns the configured host, defaulting to "127.0.0.1" when empty.
+func (c *Config) EffectiveHost() string {
+	if c.Host == "" {
+		return "127.0.0.1"
+	}
+	return c.Host
 }
 
 // HostPort returns "host:port", defaulting host to "127.0.0.1" when empty.
@@ -923,6 +962,62 @@ func checkPortAvailable(port int) error {
 	return nil
 }
 
+// writeServerConfig writes a managed Dolt config.yaml from the Config struct.
+// This ensures all required settings (especially connection timeouts) are always
+// present when the server starts. The file is overwritten on each start to prevent
+// configuration drift.
+func writeServerConfig(config *Config, configPath string) error {
+	// Build the listener host entry. Omit it when empty to use Dolt's default
+	// (binds to all interfaces), which is the backward-compatible behavior.
+	hostLine := ""
+	if config.Host != "" {
+		hostLine = fmt.Sprintf("\n  host: %s", config.Host)
+	}
+
+	// Build timeout entries. Omit when 0 to use Dolt's defaults (not recommended).
+	readTimeoutLine := ""
+	if config.ReadTimeoutMs > 0 {
+		readTimeoutLine = fmt.Sprintf("\n  read_timeout_millis: %d", config.ReadTimeoutMs)
+	}
+	writeTimeoutLine := ""
+	if config.WriteTimeoutMs > 0 {
+		writeTimeoutLine = fmt.Sprintf("\n  write_timeout_millis: %d", config.WriteTimeoutMs)
+	}
+
+	maxConnLine := ""
+	if config.MaxConnections > 0 {
+		maxConnLine = fmt.Sprintf("\n  max_connections: %d", config.MaxConnections)
+	}
+
+	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by Gas Town (gt dolt start)
+# Do not edit manually; changes are overwritten on each server start.
+# To customize, set Gas Town environment variables:
+#   GT_DOLT_PORT, GT_DOLT_HOST, GT_DOLT_USER, GT_DOLT_PASSWORD, GT_DOLT_LOGLEVEL
+
+log_level: %s
+
+listener:
+  port: %d%s%s%s%s
+
+data_dir: "%s"
+
+behavior:
+  auto_gc_behavior:
+    enable: true
+    archive_level: 1
+`,
+		config.LogLevel,
+		config.Port,
+		hostLine,
+		maxConnLine,
+		readTimeoutLine,
+		writeTimeoutLine,
+		config.DataDir,
+	)
+
+	return os.WriteFile(configPath, []byte(content), 0600)
+}
+
 // Start starts the Dolt SQL server.
 func Start(townRoot string) error {
 	config := DefaultConfig(townRoot)
@@ -1083,19 +1178,17 @@ func Start(townRoot string) error {
 		return err
 	}
 
-	// Start dolt sql-server with --data-dir to serve all databases
-	// Note: --user flag is deprecated in newer Dolt; authentication is handled
-	// via privilege system. Default is root user with no password for localhost.
-	args := []string{"sql-server",
-		"--port", strconv.Itoa(config.Port),
-		"--data-dir", config.DataDir,
+	// Always write a managed config.yaml from the Config struct before starting.
+	// This ensures critical settings (especially read/write timeouts) are always
+	// present, preventing CLOSE_WAIT accumulation from abandoned connections.
+	// The config file uses --config so all settings come from this file; CLI flags
+	// are ignored by dolt when --config is used.
+	configPath := filepath.Join(config.DataDir, "config.yaml")
+	if err := writeServerConfig(config, configPath); err != nil {
+		logFile.Close()
+		return fmt.Errorf("writing Dolt config: %w", err)
 	}
-	if config.MaxConnections > 0 {
-		args = append(args, "--max-connections", strconv.Itoa(config.MaxConnections))
-	}
-	if config.LogLevel != "" {
-		args = append(args, "--loglevel", config.LogLevel)
-	}
+	args := []string{"sql-server", "--config", configPath}
 	cmd := exec.Command("dolt", args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -1104,7 +1197,7 @@ func Start(townRoot string) error {
 	// signals sent to the parent process group (e.g. SIGHUP when the caller
 	// calls syscall.Exec to become tmux) don't reach the dolt server.
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		if closeErr := logFile.Close(); closeErr != nil {
@@ -2047,6 +2140,88 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 	return referenced
 }
 
+// CollectDatabaseOwners returns a map from database name to a human-readable
+// owner description (e.g., "gastown rig beads", "town beads"). This is used by
+// gt dolt status to annotate each database with its rig owner, preventing
+// accidental drops of production databases. (GH#2252)
+func CollectDatabaseOwners(townRoot string) map[string]string {
+	owners := make(map[string]string)
+
+	// Check town-level beads (hq)
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if db := readExistingDoltDatabase(townBeadsDir); db != "" {
+		owners[db] = "town beads"
+	}
+
+	// Check all rigs from rigs.json
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	data, err := os.ReadFile(rigsPath)
+	if err == nil {
+		var config struct {
+			Rigs map[string]interface{} `json:"rigs"`
+		}
+		if err := json.Unmarshal(data, &config); err == nil {
+			for rigName := range config.Rigs {
+				beadsDir := FindRigBeadsDir(townRoot, rigName)
+				if beadsDir == "" {
+					continue
+				}
+				if db := readExistingDoltDatabase(beadsDir); db != "" {
+					owners[db] = rigName + " rig beads"
+				}
+			}
+		}
+	}
+
+	// Also check routes.jsonl
+	routesPath := filepath.Join(townRoot, ".beads", "routes.jsonl")
+	if routesData, readErr := os.ReadFile(routesPath); readErr == nil {
+		for _, line := range strings.Split(string(routesData), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var route struct {
+				Prefix string `json:"prefix"`
+				Path   string `json:"path"`
+			}
+			if json.Unmarshal([]byte(line), &route) != nil || route.Path == "" {
+				continue
+			}
+			beadsDir := filepath.Join(townRoot, route.Path, ".beads")
+			if db := readExistingDoltDatabase(beadsDir); db != "" {
+				if _, already := owners[db]; !already {
+					// Derive a name from the route path
+					parts := strings.Split(route.Path, "/")
+					owners[db] = parts[0] + " rig beads"
+				}
+			}
+		}
+	}
+
+	// Scan top-level directories for any .beads/metadata.json
+	if entries, readErr := os.ReadDir(townRoot); readErr == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() || entry.Name() == ".beads" || entry.Name() == "mayor" {
+				continue
+			}
+			dirName := entry.Name()
+			if db := readExistingDoltDatabase(filepath.Join(townRoot, dirName, ".beads")); db != "" {
+				if _, already := owners[db]; !already {
+					owners[db] = dirName + " rig beads"
+				}
+			}
+			if db := readExistingDoltDatabase(filepath.Join(townRoot, dirName, "mayor", "rig", ".beads")); db != "" {
+				if _, already := owners[db]; !already {
+					owners[db] = dirName + " rig beads"
+				}
+			}
+		}
+	}
+
+	return owners
+}
+
 // RemoveDatabase removes an orphaned database directory from .dolt-data/.
 // The caller should verify the database is actually orphaned before calling this.
 // If the Dolt server is running, it will DROP the database first.
@@ -2266,14 +2441,29 @@ func EnsureMetadata(townRoot, rigName string) error {
 		_ = json.Unmarshal(data, &existing) // best effort
 	}
 
-	// Patch dolt server fields. Only set fields that are gastown's responsibility
-	// (ensuring server mode). dolt_database is owned by bd init — only set it as
-	// a fallback when bd init hasn't run yet (no existing value).
-	existing["database"] = "dolt"
-	existing["backend"] = "dolt"
-	existing["dolt_mode"] = "server"
+	// Patch dolt server fields. Only write when values actually change so tracked
+	// metadata.json files in source repos stay clean.
+	changed := false
+	if existing["database"] != "dolt" {
+		existing["database"] = "dolt"
+		changed = true
+	}
+	if existing["backend"] != "dolt" {
+		existing["backend"] = "dolt"
+		changed = true
+	}
+	if existing["dolt_mode"] != "server" {
+		existing["dolt_mode"] = "server"
+		changed = true
+	}
 	if existing["dolt_database"] == nil || existing["dolt_database"] == "" {
 		existing["dolt_database"] = rigName
+		changed = true
+	}
+
+	// Fast path: avoid rewriting metadata.json when already correct.
+	if !changed {
+		return nil
 	}
 
 	data, err := json.MarshalIndent(existing, "", "  ")
@@ -2416,7 +2606,7 @@ func GetActiveConnectionCount(townRoot string) (int, error) {
 	// Note: --host, --port, --user, --no-tls are dolt GLOBAL args and must come
 	// BEFORE the "sql" subcommand.
 	fullArgs := []string{
-		"--host", "127.0.0.1",
+		"--host", config.EffectiveHost(),
 		"--port", strconv.Itoa(config.Port),
 		"--user", config.User,
 		"--no-tls",
