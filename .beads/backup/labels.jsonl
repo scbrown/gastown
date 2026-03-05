@@ -12,18 +12,6 @@
 {"issue_id":"gt-d72m","label":"gt:done"}
 {"issue_id":"gt-d72m","label":"tooling"}
 {"issue_id":"gt-g2lvj","label":"gastown shanty"}
-{"issue_id":"gt-gastown-crew-aegis-arnold","label":"gt:agent"}
-{"issue_id":"gt-gastown-crew-desirepath","label":"gt:agent"}
-{"issue_id":"gt-gastown-crew-goldblum","label":"gt:agent"}
-{"issue_id":"gt-gastown-crew-walker","label":"gt:agent"}
-{"issue_id":"gt-gastown-polecat-furiosa","label":"gt:agent"}
-{"issue_id":"gt-gastown-polecat-nux","label":"gt:agent"}
-{"issue_id":"gt-gastown-polecat-rictus","label":"gt:agent"}
-{"issue_id":"gt-gastown-polecat-slit","label":"gt:agent"}
-{"issue_id":"gt-gastown-refinery","label":"gt:agent"}
-{"issue_id":"gt-gastown-refinery","label":"idle:102"}
-{"issue_id":"gt-gastown-witness","label":"gt:agent"}
-{"issue_id":"gt-gastown-witness","label":"idle:447"}
 {"issue_id":"gt-h1m","label":"gt:merge-request"}
 {"issue_id":"gt-i4j1f","label":"arnold"}
 {"issue_id":"gt-i4j1f","label":"ci"}
@@ -41,7 +29,6 @@
 {"issue_id":"gt-vw3g","label":"gt:merge-request"}
 {"issue_id":"gt-vwh4","label":"gt:merge-request"}
 {"issue_id":"gt-vwh4","label":"gt:merged"}
-{"issue_id":"gt-wisp-g0ty","label":"gt:merge-request"}
 {"issue_id":"gt-x2xo","label":"gt:merge-request"}
 {"issue_id":"gt-x2xo","label":"gt:merged"}
 {"issue_id":"gt-z3tz4","label":"gt:merge-request"}
