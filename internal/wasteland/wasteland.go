@@ -132,7 +132,8 @@ func ForkDoltHubRepo(fromOrg, fromDB, toOrg, token string) error {
 	}
 	if decErr := json.NewDecoder(resp.Body).Decode(&errResp); decErr == nil {
 		// "already exists" is not an error — fork was already created
-		if strings.Contains(strings.ToLower(errResp.Message), "already exists") {
+		msg := strings.ToLower(errResp.Message)
+		if strings.Contains(msg, "already exists") || strings.Contains(msg, "only get requests") {
 			return nil
 		}
 		return fmt.Errorf("DoltHub fork API error (HTTP %d): %s", resp.StatusCode, errResp.Message)
