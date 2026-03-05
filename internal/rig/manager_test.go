@@ -1398,7 +1398,7 @@ func TestBareCloneDefaultBranch(t *testing.T) {
 	)
 	for _, args := range [][]string{
 		{"git", "init", "-b", "master", srcDir},
-		{"git", "-C", srcDir, "commit", "--allow-empty", "-m", "init"},
+		{"git", "-C", srcDir, "-c", "user.name=test", "-c", "user.email=test@test", "commit", "--allow-empty", "-m", "init"},
 	} {
 		c := exec.Command(args[0], args[1:]...)
 		c.Env = gitEnv
