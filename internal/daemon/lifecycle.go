@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -542,6 +543,9 @@ func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.Rol
 	if paneID, err := d.tmux.GetPaneID(sessionName); err == nil {
 		_ = d.tmux.SetEnvironment(sessionName, "GT_PANE_ID", paneID)
 	}
+
+	// Set current activity tier so agents can self-limit from session start.
+	_ = d.tmux.SetEnvironment(sessionName, "GT_ACTIVITY_TIER", strconv.Itoa(int(ReadActivityTier())))
 
 	// Set any custom env vars from role config
 	if roleConfig != nil {

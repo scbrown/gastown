@@ -679,6 +679,11 @@ func (d *Daemon) heartbeat(state *State) {
 	// daemon.log uses lumberjack for automatic rotation; this handles Dolt server logs.
 	d.rotateOversizedLogs()
 
+	// 16. Calculate activity tier (budget-aware resource throttling).
+	// Reads token budget metrics from Pushgateway, computes tier 1-4,
+	// writes to ~/.claude/activity-tier, and sets GT_ACTIVITY_TIER on all sessions.
+	d.calculateActivityTier()
+
 	// Update state
 	state.LastHeartbeat = time.Now()
 	state.HeartbeatCount++
@@ -2006,6 +2011,9 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
 	processNames := config.ResolveProcessNames(rc.ResolvedAgent, rc.Command)
 	_ = d.tmux.SetEnvironment(sessionName, "GT_PROCESS_NAMES", strings.Join(processNames, ","))
+
+	// Set current activity tier so polecats can self-limit from session start.
+	_ = d.tmux.SetEnvironment(sessionName, "GT_ACTIVITY_TIER", strconv.Itoa(int(ReadActivityTier())))
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	if paneID, err := d.tmux.GetPaneID(sessionName); err == nil {

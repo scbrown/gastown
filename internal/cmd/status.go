@@ -69,8 +69,9 @@ type TownStatus struct {
 	Dolt     *DoltInfo      `json:"dolt,omitempty"`     // Dolt server status
 	Tmux     *TmuxInfo      `json:"tmux,omitempty"`     // Tmux server status
 	Agents   []AgentRuntime `json:"agents"`             // Global agents (Mayor, Deacon)
-	Rigs     []RigStatus    `json:"rigs"`
-	Summary  StatusSum      `json:"summary"`
+	Rigs         []RigStatus    `json:"rigs"`
+	ActivityTier int            `json:"activity_tier,omitempty"` // Budget-aware resource tier (1-4)
+	Summary      StatusSum      `json:"summary"`
 }
 
 // ServiceInfo represents a background service status.
@@ -779,6 +780,9 @@ func gatherStatus() (TownStatus, error) {
 		status.Daemon = &ServiceInfo{Running: daemonRunning, PID: daemonPid}
 	}
 
+	// Activity tier (budget-aware resource throttling)
+	status.ActivityTier = int(daemon.ReadActivityTier())
+
 	// Dolt status
 	doltCfg := doltserver.DefaultConfig(townRoot)
 	if doltCfg.IsRemote() {
@@ -983,6 +987,10 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 			} else {
 				parts = append(parts, fmt.Sprintf("tmux %s", style.Dim.Render(fmt.Sprintf("(-L %s, no server)", status.Tmux.Socket))))
 			}
+		}
+		if status.ActivityTier > 0 {
+			tierNames := map[int]string{1: "full", 2: "crew+plan", 3: "crew-only", 4: "conservation"}
+			parts = append(parts, fmt.Sprintf("tier %s", style.Dim.Render(fmt.Sprintf("(%d: %s)", status.ActivityTier, tierNames[status.ActivityTier]))))
 		}
 		fmt.Fprintf(w, "%s\n", strings.Join(parts, "  "))
 		fmt.Fprintln(w)
