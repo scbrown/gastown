@@ -134,6 +134,12 @@ type Message struct {
 	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
 	// In-memory only — not serialized.
 	SuppressNotify bool `json:"-"`
+
+	// PreValidated signals that the recipient address was already validated
+	// by the Resolver, so the Router can skip its own validateRecipient call.
+	// This avoids redundant bd subprocess calls that add ~25s of latency.
+	// In-memory only — not serialized.
+	PreValidated bool `json:"-"`
 }
 
 // NewMessage creates a new message with a generated ID and thread ID.

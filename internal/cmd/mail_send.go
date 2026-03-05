@@ -166,6 +166,9 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	var recipientAddrs []string
 	var sendErrs []string
 
+	// Resolver already validated addresses — skip router re-validation
+	msg.PreValidated = true
+
 	for _, rec := range recipients {
 		switch rec.Type {
 		case mail.RecipientQueue:

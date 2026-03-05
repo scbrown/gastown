@@ -1072,9 +1072,11 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Expand crew/polecats shorthand (e.g., "crew/bob" → "pata/bob")
 	toIdentity = r.resolveCrewShorthand(toIdentity)
 
-	// Validate recipient exists
-	if err := r.validateRecipient(toIdentity); err != nil {
-		return fmt.Errorf("invalid recipient %q: %w", msg.To, err)
+	// Validate recipient exists (skip if the Resolver already validated)
+	if !msg.PreValidated {
+		if err := r.validateRecipient(toIdentity); err != nil {
+			return fmt.Errorf("invalid recipient %q: %w", msg.To, err)
+		}
 	}
 
 	// Build labels for type, from/thread/reply-to/cc
