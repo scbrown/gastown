@@ -1391,7 +1391,11 @@ func TestBareCloneDefaultBranch(t *testing.T) {
 	// Override GIT_CONFIG_GLOBAL so user config (e.g. init.defaultBranch)
 	// doesn't interfere.
 	srcDir := t.TempDir()
-	gitEnv := append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	gitEnv := append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test",
+	)
 	for _, args := range [][]string{
 		{"git", "init", "-b", "master", srcDir},
 		{"git", "-C", srcDir, "commit", "--allow-empty", "-m", "init"},

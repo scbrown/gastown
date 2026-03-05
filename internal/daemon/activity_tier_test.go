@@ -15,7 +15,7 @@ func TestComputeTier(t *testing.T) {
 		want         ActivityTier
 	}{
 		{"full budget, no reset info", 100, 0, TierFull},
-		{"high budget", 80, 5, TierFull},
+		{"high budget long reset", 80, 5, TierConservation}, // time >4h dominates
 		{"mid-high budget", 60, 5, TierConservation},     // time >4h overrides
 		{"mid budget", 40, 3.5, TierCrewOnly},             // both agree on tier 3
 		{"low budget", 20, 5, TierConservation},            // budget <25 and time >4h
