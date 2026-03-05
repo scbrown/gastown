@@ -54,6 +54,13 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, out)
 	}
 
+	// Register custom types needed by scheduler tests (convoy, etc.).
+	cfgCmd := exec.Command("bd", "config", "set", "types.custom", "convoy")
+	cfgCmd.Dir = dir
+	if cfgOut, cfgErr := cfgCmd.CombinedOutput(); cfgErr != nil {
+		t.Logf("bd config set types.custom convoy: %v\n%s", cfgErr, cfgOut)
+	}
+
 	// Create empty issues.jsonl to prevent bd auto-export from corrupting
 	// routes.jsonl (same as initBeadsDBWithPrefix does).
 	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
