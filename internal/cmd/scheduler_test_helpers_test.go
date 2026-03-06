@@ -224,11 +224,18 @@ func addBeadDependency(t *testing.T, blocked, blocker, dir string) {
 // be in a different DB if routes.jsonl is present in dir's .beads/.
 func addBeadDependencyOfType(t *testing.T, from, to, depType, dir string) {
 	t.Helper()
-	cmd := exec.Command("bd", "dep", "add", from, to, "--type="+depType)
+	cmd := exec.Command("bd", "dep", "add", from, to, "--type="+depType, "--verbose")
 	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	t.Logf("bd dep add %s %s --type=%s in %s: exit=%v\n%s", from, to, depType, dir, err, out)
+	if err != nil {
 		t.Fatalf("bd dep add %s %s --type=%s failed: %v\n%s", from, to, depType, err, out)
 	}
+	// Debug: verify dep was stored
+	listCmd := exec.Command("bd", "dep", "list", from, "--direction=down", "--type="+depType, "--json")
+	listCmd.Dir = dir
+	listOut, listErr := listCmd.CombinedOutput()
+	t.Logf("bd dep list %s --direction=down --type=%s: exit=%v\n%s", from, depType, listErr, listOut)
 }
 
 // createTestBeadOfType creates a bead with the given title and issue type (e.g.,
