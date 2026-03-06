@@ -426,10 +426,27 @@ func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy string
 	}
 
 	// Add tracking relation: convoy tracks the issue.
-	// Pass the raw beadID and let bd handle cross-rig resolution via routes.jsonl,
-	// matching what gt convoy create/add already do (convoy.go:368, convoy.go:464).
-	// Use WithAutoCommit for the same reason as above.
-	depArgs := []string{"dep", "add", convoyID, beadID, "--type=tracks"}
+	// The convoy lives in HQ DB (hq-cv- prefix) while the bead is typically in
+	// a rig DB. In Dolt server mode, bd resolves cross-DB IDs locally but stores
+	// them as raw refs that dep list can't find. Use explicit external ref format
+	// so the dep is stored correctly for cross-database resolution.
+	depTarget := beadID
+	beadPrefix := beads.ExtractPrefix(beadID)
+	if beadPrefix != "" && beadPrefix != beads.ExtractPrefix(convoyID) {
+		routes, err := beads.LoadRoutes(townBeads)
+		if err == nil {
+			for _, route := range routes {
+				if route.Prefix == beadPrefix && route.Path != "." {
+					project := strings.SplitN(route.Path, "/", 2)[0]
+					if project != "" {
+						depTarget = fmt.Sprintf("external:%s:%s", project, beadID)
+						break
+					}
+				}
+			}
+		}
+	}
+	depArgs := []string{"dep", "add", convoyID, depTarget, "--type=tracks"}
 	if out, err := BdCmd(depArgs...).Dir(townRoot).WithAutoCommit().CombinedOutput(); err != nil {
 		// Tracking failed — delete the orphan convoy to prevent accumulation
 		_ = BdCmd("close", convoyID, "-r", "tracking dep failed").Dir(townRoot).Run()
