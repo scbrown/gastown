@@ -7,11 +7,14 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/testutil"
@@ -224,18 +227,45 @@ func addBeadDependency(t *testing.T, blocked, blocker, dir string) {
 // be in a different DB if routes.jsonl is present in dir's .beads/.
 func addBeadDependencyOfType(t *testing.T, from, to, depType, dir string) {
 	t.Helper()
-	cmd := exec.Command("bd", "dep", "add", from, to, "--type="+depType, "--verbose")
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	t.Logf("bd dep add %s %s --type=%s in %s: exit=%v\n%s", from, to, depType, dir, err, out)
-	if err != nil {
-		t.Fatalf("bd dep add %s %s --type=%s failed: %v\n%s", from, to, depType, err, out)
+
+	// Detect cross-rig deps: if prefixes differ, convert "to" to external ref
+	// format so bd stores it correctly for cross-database resolution.
+	// Without this, Dolt server resolves the ID across databases during add,
+	// but dep list can't find it because it only joins the local issues table.
+	toArg := to
+	fromPrefix := extractBeadPrefix(from)
+	toPrefix := extractBeadPrefix(to)
+	if fromPrefix != "" && toPrefix != "" && fromPrefix != toPrefix {
+		// Look up route for the "to" prefix to get the project name
+		beadsDir := filepath.Join(dir, ".beads")
+		routes, err := beads.LoadRoutes(beadsDir)
+		if err == nil {
+			for _, route := range routes {
+				if route.Prefix == toPrefix+"-" {
+					project := strings.SplitN(route.Path, "/", 2)[0]
+					if project != "" && project != "." {
+						toArg = fmt.Sprintf("external:%s:%s", project, to)
+						break
+					}
+				}
+			}
+		}
 	}
-	// Debug: verify dep was stored
-	listCmd := exec.Command("bd", "dep", "list", from, "--direction=down", "--type="+depType, "--json")
-	listCmd.Dir = dir
-	listOut, listErr := listCmd.CombinedOutput()
-	t.Logf("bd dep list %s --direction=down --type=%s: exit=%v\n%s", from, depType, listErr, listOut)
+
+	cmd := exec.Command("bd", "dep", "add", from, toArg, "--type="+depType)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd dep add %s %s --type=%s failed: %v\n%s", from, toArg, depType, err, out)
+	}
+}
+
+// extractBeadPrefix returns the prefix part of a bead ID (e.g., "h22" from "h22-abc").
+func extractBeadPrefix(id string) string {
+	idx := strings.Index(id, "-")
+	if idx <= 0 {
+		return ""
+	}
+	return id[:idx]
 }
 
 // createTestBeadOfType creates a bead with the given title and issue type (e.g.,
