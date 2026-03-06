@@ -141,6 +141,7 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	}
 	routes := []beads.Route{
 		{Prefix: hqPrefix + "-", Path: "."},
+		{Prefix: "hq-cv-", Path: "."},
 		{Prefix: rigPrefix + "-", Path: "testrig/mayor/rig"},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
@@ -577,6 +578,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	}
 	routes := []beads.Route{
 		{Prefix: hqPrefix + "-", Path: "."},
+		{Prefix: "hq-cv-", Path: "."},
 		{Prefix: rig1Prefix + "-", Path: "rig1/mayor/rig"},
 		{Prefix: rig2Prefix + "-", Path: "rig2/mayor/rig"},
 	}
