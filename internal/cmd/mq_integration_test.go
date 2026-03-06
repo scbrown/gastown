@@ -34,7 +34,7 @@ func TestMakeTestMR_RealisticFields(t *testing.T) {
 func TestMockBeadsList_LabelFilter(t *testing.T) {
 	mock := newMockBeads()
 
-	// Add a realistic MR (Type: "task", Label: "gt:merge-request")
+	// Add a realistic MR (Type: "task", Labels: []string{"gt:merge-request"})
 	mr := makeTestMR("mr-1", "polecat/Nux/gt-001", "main", "Nux", "open")
 	mock.addIssue(mr)
 
@@ -110,7 +110,7 @@ func TestMockBeadsList_StatusFiltering(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			results, err := mock.List(beads.ListOptions{
-				Label:  "gt:merge-request",
+				Label: "gt:merge-request",
 				Status: tt.status,
 			})
 			if err != nil {
