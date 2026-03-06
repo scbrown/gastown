@@ -237,7 +237,7 @@ func TestManager_PostMerge_ClosesMRAndSourceIssue(t *testing.T) {
 	mrDesc := "branch: polecat/test/gt-xyz\nsource_issue: " + srcIssue.ID + "\nworker: test\ntarget: main"
 	mrIssue, err := b.Create(beads.CreateOptions{
 		Title:       "MR for feature X",
-		Labels: []string{"gt:merge-request"},
+		Labels:      []string{"gt:merge-request"},
 		Description: mrDesc,
 	})
 	if err != nil {
@@ -277,7 +277,7 @@ func TestManager_PostMerge_AlreadyClosedMR(t *testing.T) {
 	// Create and close an MR bead
 	mrIssue, err := b.Create(beads.CreateOptions{
 		Title:       "Already merged MR",
-		Labels: []string{"gt:merge-request"},
+		Labels:      []string{"gt:merge-request"},
 		Description: "branch: polecat/old/gt-old\ntarget: main",
 	})
 	if err != nil {

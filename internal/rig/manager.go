@@ -927,15 +927,6 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 			return fmt.Errorf("bd config set issue_prefix failed: %s", strings.TrimSpace(string(prefixOutput)))
 		}
 
-		// Default to Dolt-native sync mode for new Gas Town rig beads.
-		// Non-fatal: the shared helper below will persist sync.mode to config.yaml.
-		syncModeCmd := exec.Command("bd", "config", "set", "sync.mode", "dolt-native")
-		syncModeCmd.Dir = rigPath
-		syncModeCmd.Env = filteredEnv
-		if syncModeOutput, syncModeErr := syncModeCmd.CombinedOutput(); syncModeErr != nil {
-			fmt.Printf("   ⚠ Could not set sync.mode via bd: %s\n", strings.TrimSpace(string(syncModeOutput)))
-		}
-
 		// Drop the orphaned beads_<prefix> database created by bd init (gt-sv1h).
 		// bd init --prefix creates a database named beads_<prefix> on the Dolt server,
 		// but the rig uses <rigName> as its database (set by InitRig + EnsureMetadata).
