@@ -132,7 +132,7 @@ func ensureConfigYAML(beadsDir, prefix, syncMode string, onlyIfMissing bool) err
 			value := strings.TrimSpace(strings.TrimPrefix(trimmed, "sync.mode:"))
 			value = strings.Trim(value, `"'`)
 			// Respect explicit non-default modes, but migrate missing/legacy defaults.
-			if value == "" || value == "git-portable" || value == syncMode {
+			if value == "" || value == syncMode {
 				lines[i] = wantSyncMode
 			}
 		}
