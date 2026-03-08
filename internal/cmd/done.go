@@ -434,6 +434,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				}
 
 				if !skipClose {
+					// BUG FIX (gt-r8wpj): Close attached molecule/wisps BEFORE closing
+					// the base bead. Without this, the zero-commits path left orphaned
+					// wisps as open beads blocking the parent. Mirrors the cleanup in
+					// updateAgentStateOnDone for the normal close path.
+					if issue, err := bd.Show(issueID); err == nil {
+						attachment := beads.ParseAttachmentFields(issue)
+						if attachment != nil && attachment.AttachedMolecule != "" {
+							if n := closeDescendants(bd, attachment.AttachedMolecule); n > 0 {
+								fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachment.AttachedMolecule)
+							}
+							if closeErr := bd.ForceCloseWithReason("done (zero commits)", attachment.AttachedMolecule); closeErr != nil {
+								if !errors.Is(closeErr, beads.ErrNotFound) {
+									fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, closeErr)
+								}
+							}
+						}
+					}
+
 					closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
 					// G15 fix: Force-close bypasses molecule dependency checks.
 					// The polecat is about to be nuked — open wisps should not block closure.
