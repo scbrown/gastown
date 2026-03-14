@@ -630,6 +630,10 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 
 	// Notify address is stored in description (line 166-168) and read from there
 
+	// Run dep add from town root (parent of .beads) so bd routes correctly
+	// across rigs via routes.jsonl. Running from .beads breaks cross-rig routing.
+	townRoot := filepath.Dir(townBeads)
+
 	// Add 'tracks' relations for each tracked issue
 	trackedCount := 0
 	for _, issueID := range trackedIssues {
@@ -637,7 +641,7 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 		var depStderr bytes.Buffer
 		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
 			WithAutoCommit().
-			Dir(townBeads).
+			Dir(townRoot).
 			StripBeadsDir().
 			Stderr(&depStderr).
 			Run(); err != nil {
@@ -743,12 +747,16 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Reopened convoy %s\n", style.Bold.Render("↺"), convoyID)
 	}
 
+	// Run dep add from town root (parent of .beads) so bd routes correctly
+	// across rigs via routes.jsonl. Running from .beads breaks cross-rig routing.
+	townRoot := filepath.Dir(townBeads)
+
 	// Add 'tracks' relations for each issue
 	addedCount := 0
 	for _, issueID := range issuesToAdd {
 		var depStderr bytes.Buffer
 		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
-			Dir(townBeads).
+			Dir(townRoot).
 			WithAutoCommit().
 			StripBeadsDir().
 			Stderr(&depStderr).
