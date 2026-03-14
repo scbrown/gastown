@@ -245,7 +245,7 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// GH#gt-tt37: Supersede older open MRs for the same source issue.
+		// Supersede older open MRs for the same source issue.
 		// When a new polecat reattempts an issue, the old MR (different branch)
 		// is orphaned. Close it so the queue and GitHub PRs stay clean.
 		if issueID != "" {
@@ -257,8 +257,21 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 					reason := fmt.Sprintf("superseded by %s", mrIssue.ID)
 					if err := bd.CloseWithReason(reason, old.ID); err != nil {
 						style.PrintWarning("could not supersede old MR %s: %v", old.ID, err)
-					} else {
-						fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), old.ID)
+						continue
+					}
+					fmt.Printf("  %s Superseded old MR: %s\n", style.Dim.Render("○"), old.ID)
+
+					// Delete the old remote branch to auto-close the GitHub PR.
+					// Only polecat branches — non-polecat branches may belong to
+					// contributor forks; deleting them closes upstream PRs. (GH#2669)
+					oldFields := beads.ParseMRFields(old)
+					if oldFields != nil && strings.HasPrefix(oldFields.Branch, "polecat/") {
+						g := git.NewGit(cwd)
+						if err := g.DeleteRemoteBranch("origin", oldFields.Branch); err != nil {
+							style.PrintWarning("could not delete superseded branch %s: %v", oldFields.Branch, err)
+						} else {
+							fmt.Printf("  %s Deleted remote branch: %s\n", style.Dim.Render("○"), oldFields.Branch)
+						}
 					}
 				}
 			}
