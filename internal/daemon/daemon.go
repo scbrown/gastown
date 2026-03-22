@@ -99,6 +99,12 @@ type Daemon struct {
 	// lastMaintenanceRun tracks when scheduled maintenance last ran.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastMaintenanceRun time.Time
+
+	// mayorZombieCount tracks consecutive patrol cycles where the Mayor tmux
+	// session exists but the agent process is not detected. A count >= 3
+	// triggers a zombie restart, debouncing transient gaps during handoffs.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	mayorZombieCount int
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -500,6 +506,18 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Scheduled maintenance ticker started (check interval %v, window %s)", interval, window)
 	}
 
+	// Start main-branch test runner ticker if configured.
+	// Periodically runs quality gates on each rig's main branch to catch regressions.
+	var mainBranchTestTicker *time.Ticker
+	var mainBranchTestChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "main_branch_test") {
+		interval := mainBranchTestInterval(d.patrolConfig)
+		mainBranchTestTicker = time.NewTicker(interval)
+		mainBranchTestChan = mainBranchTestTicker.C
+		defer mainBranchTestTicker.Stop()
+		d.logger.Printf("Main branch test ticker started (interval %v)", interval)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -592,6 +610,13 @@ func (d *Daemon) Run() error {
 			// and runs `gt maintain --force` when commit counts exceed threshold.
 			if !d.isShutdownInProgress() {
 				d.runScheduledMaintenance()
+			}
+
+		case <-mainBranchTestChan:
+			// Main branch test runner — periodically runs quality gates on each
+			// rig's main branch to catch regressions from merges or direct pushes.
+			if !d.isShutdownInProgress() {
+				d.runMainBranchTests()
 			}
 
 		case <-timer.C:
@@ -1256,20 +1281,52 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 }
 
 // ensureMayorRunning ensures the Mayor is running.
-// Uses mayor.Manager for consistent startup behavior (zombie detection, GUPP, etc.).
+// Uses mayor.Manager for consistent startup behavior.
+// If the tmux session exists but the agent is dead (zombie), the daemon
+// stops the zombie session and starts a fresh one.
 func (d *Daemon) ensureMayorRunning() {
 	mgr := mayor.NewManager(d.config.TownRoot)
 
 	if err := mgr.Start(""); err != nil {
 		if err == mayor.ErrAlreadyRunning {
-			// Mayor is running - nothing to do
+			// Session exists — verify agent is actually alive.
+			// During handoffs the agent is briefly undetectable, so we
+			// only restart if the session has been a zombie for multiple
+			// consecutive patrol cycles (debounce).
+			if !d.isMayorAgentAlive(mgr) {
+				d.mayorZombieCount++
+				if d.mayorZombieCount >= 3 {
+					d.logger.Printf("Mayor zombie detected (%d cycles), restarting", d.mayorZombieCount)
+					if stopErr := mgr.Stop(); stopErr != nil && stopErr != mayor.ErrNotRunning {
+						d.logger.Printf("Error stopping zombie Mayor: %v", stopErr)
+						return
+					}
+					d.mayorZombieCount = 0
+					if startErr := mgr.Start(""); startErr != nil {
+						d.logger.Printf("Error restarting Mayor after zombie cleanup: %v", startErr)
+						return
+					}
+					d.logger.Println("Mayor restarted after zombie cleanup")
+				} else {
+					d.logger.Printf("Mayor agent not detected (cycle %d/3), waiting before restart", d.mayorZombieCount)
+				}
+			} else {
+				d.mayorZombieCount = 0
+			}
 			return
 		}
 		d.logger.Printf("Error starting Mayor: %v", err)
 		return
 	}
 
+	d.mayorZombieCount = 0
 	d.logger.Println("Mayor started successfully")
+}
+
+// isMayorAgentAlive checks if the Mayor's agent process is running in tmux.
+func (d *Daemon) isMayorAgentAlive(mgr *mayor.Manager) bool {
+	t := tmux.NewTmux()
+	return t.IsAgentAlive(mgr.SessionName())
 }
 
 // killDeaconSessions kills leftover deacon and boot tmux sessions.
@@ -1969,6 +2026,20 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 		return
 	}
 
+	// Terminal state guard: skip polecats in intentional shutdown states.
+	// agent_state='done' means normal completion; agent_state='nuked' means forced shutdown.
+	// Their sessions being dead is expected, not a crash. Without this check,
+	// the dead session + open hook_bead combination can fire false CRASHED_POLECAT
+	// alerts during the race window before the hook_bead is closed.
+	// This check is pure in-memory (info.State is already populated), so it runs before
+	// the more expensive isBeadClosed subprocess call.
+	agentState := beads.AgentState(info.State)
+	if agentState == beads.AgentStateDone || agentState == beads.AgentStateNuked {
+		d.logger.Printf("Skipping crash detection for %s/%s: agent_state=%s (intentional shutdown, not a crash)",
+			rigName, polecatName, info.State)
+		return
+	}
+
 	// Stale hook guard: skip polecats whose hook_bead is already closed.
 	// When a polecat completes work normally (gt done), the hook_bead gets closed
 	// but may not be cleared from the agent bead before the session stops.
@@ -2005,18 +2076,6 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 				rigName, polecatName)
 			return
 		}
-	}
-
-	// Terminal state guard: skip polecats that have completed or been nuked (GH#2795).
-	// A polecat in agent_state=done or agent_state=nuked has shut down intentionally.
-	// The session being dead is expected — the daemon should NOT fire CRASHED_POLECAT.
-	// Without this, every heartbeat cycle floods the witness with duplicate
-	// RECOVERY_NEEDED alerts for completed/nuked polecats.
-	agentState := beads.AgentState(info.State)
-	if agentState == beads.AgentStateDone || agentState == beads.AgentStateNuked {
-		d.logger.Printf("Skipping crash detection for %s/%s: agent_state=%s (session shutdown expected)",
-			rigName, polecatName, info.State)
-		return
 	}
 
 	// TOCTOU guard: re-verify session is still dead before restarting.

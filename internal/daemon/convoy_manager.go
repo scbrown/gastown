@@ -86,9 +86,9 @@ type ConvoyManager struct {
 	// duplicate convoy checks for the same stranded convoy.
 	scanMu sync.Mutex
 
-	// lastEventTimes tracks per-store high-water marks for event polling.
+	// lastEventIDs tracks per-store high-water marks for event polling.
 	// Key matches stores map keys ("hq", "gastown", etc.).
-	lastEventTimes sync.Map // map[string]time.Time
+	lastEventIDs sync.Map // map[string]time.Time
 
 	// seeded is true once the first poll cycle has run (warm-up).
 	// The first cycle advances high-water marks without processing events,
@@ -261,9 +261,9 @@ func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) bo
 // The seen set deduplicates issueIDs across stores within a poll cycle.
 // Returns an error if the poll failed (used by caller for backoff decisions).
 func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map[string]beadsdk.Storage, seen map[string]bool) error {
-	// Load per-store high-water mark (time-based since beads SDK v0.61.0)
+	// Load per-store high-water mark
 	var highWater time.Time
-	if v, ok := m.lastEventTimes.Load(name); ok {
+	if v, ok := m.lastEventIDs.Load(name); ok {
 		highWater = v.(time.Time)
 	}
 
@@ -282,7 +282,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			highWater = e.CreatedAt
 		}
 	}
-	m.lastEventTimes.Store(name, highWater)
+	m.lastEventIDs.Store(name, highWater)
 
 	// First poll cycle is warm-up only: advance marks, skip processing.
 	// This prevents replaying the entire event history on daemon restart.
@@ -397,9 +397,12 @@ func (m *ConvoyManager) scan() {
 			}
 			m.closeEmptyConvoy(c.ID)
 		} else {
-			// Tracked issues exist but none are ready. This requires agent
-			// judgment (the deacon decides what to do). Log for visibility.
-			m.logger("Convoy %s: %d tracked issues, 0 ready — needs agent review", c.ID, c.TrackedCount)
+			// Tracked issues exist but none are ready. This could mean:
+			// (a) all tracked issues are closed → convoy should auto-close
+			// (b) issues are blocked/in-progress → needs agent review
+			// Run convoy check to handle case (a); it's a no-op for (b).
+			m.logger("Convoy %s: %d tracked issues, 0 ready — checking completion", c.ID, c.TrackedCount)
+			m.checkConvoyCompletion(c.ID)
 		}
 	}
 }
@@ -475,6 +478,21 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 	}
 
 	m.logger("Convoy %s: no dispatchable issues (all %d skipped)", c.ID, len(c.ReadyIssues))
+}
+
+// checkConvoyCompletion runs gt convoy check to auto-close a convoy whose
+// tracked issues may all be closed. This handles the case where the event poll
+// missed the close events (e.g., daemon restart, Dolt latency).
+func (m *ConvoyManager) checkConvoyCompletion(convoyID string) {
+	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "check", convoyID)
+	cmd.Dir = m.townRoot
+	util.SetProcessGroup(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		m.logger("Convoy %s: completion check failed: %s", convoyID, util.FirstLine(stderr.String()))
+	}
 }
 
 // closeEmptyConvoy runs gt convoy check to auto-close an empty convoy.

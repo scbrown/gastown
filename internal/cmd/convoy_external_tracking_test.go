@@ -77,6 +77,9 @@ func TestGetTrackedIssues_FallsBackToShowTrackedDependencies(t *testing.T) {
 
 	scriptBody := fmt.Sprintf(`
 case "$*" in
+  "--allow-stale version")
+    exit 0
+    ;;
   "dep list hq-cv-ext --direction=down --type=tracks --allow-stale --json")
     echo '[]'
     ;;
