@@ -185,6 +185,7 @@ func TestFormatPeriod(t *testing.T) {
 		name  string
 		since time.Time
 		want  string
+		skip  bool
 	}{
 		{
 			name:  "today returns 'Today'",
@@ -192,9 +193,11 @@ func TestFormatPeriod(t *testing.T) {
 			want:  "Today",
 		},
 		{
-			name:  "week start returns 'Week of ...'",
+			name: "week start returns 'Week of ...'",
 			since: weekStart,
 			want:  fmt.Sprintf("Week of %s", weekStart.Format("Jan 02, 2006")),
+			// On Mondays weekStart == today, so formatPeriod returns "Today" first.
+			skip: weekStart.Equal(today),
 		},
 		{
 			name:  "arbitrary past date returns 'Since ...'",
@@ -205,6 +208,9 @@ func TestFormatPeriod(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.skip {
+				t.Skip("skipped: weekStart == today (Monday)")
+			}
 			got := formatPeriod(tt.since)
 			if got != tt.want {
 				t.Errorf("formatPeriod(%v) = %q, want %q", tt.since, got, tt.want)
