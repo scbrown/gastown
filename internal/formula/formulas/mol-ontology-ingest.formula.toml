@@ -60,11 +60,55 @@ gt hook
 bd show {{issue}}
 ```
 
-**2. Gather full context:**
-- Read the bead description, comments, and any linked design docs
-- If the source is a handoff mail, read the full mail body
-- If the source references files, read those files
-- Collect all factual claims about entities, relationships, and events
+**2. Gather full context (MANDATORY — do ALL of these):**
+
+```bash
+# Read bead with all comments
+bd show {{issue}}
+
+# Check bead dependencies and blockers
+bd deps {{issue}} 2>/dev/null || true
+
+# Check assignee for crew context
+bd show {{issue}} --json 2>/dev/null | python3 -c "import json,sys; b=json.load(sys.stdin); print('Assignee:', b.get('assignee','')); print('Owner:', b.get('owner','')); print('Labels:', b.get('labels',[]))" 2>/dev/null || true
+```
+
+**Extract and follow ALL references in the bead text:**
+
+- **Git commits**: For EVERY commit hash (7+ hex chars) found in the description or comments:
+  ```bash
+  git show <hash> --stat    # what files changed
+  git show <hash>           # full diff + commit message
+  ```
+- **File paths**: For every file path mentioned, read it:
+  ```bash
+  cat <filepath>            # or Read tool
+  ```
+- **Design docs**: If `docs/` paths are referenced, read them
+- **Bead references**: If other bead IDs (aegis-xxx) are mentioned:
+  ```bash
+  bd show <other-bead-id>   # get cross-referenced context
+  ```
+- **Handoff mails**: If handoff mail IDs (hq-xxx) are referenced:
+  ```bash
+  gt mail read <mail-id>
+  ```
+
+**3. Query existing ontology (if Graphiti MCP available):**
+```bash
+# Search for entities already in the graph that relate to this bead
+# Use search_nodes MCP tool with key entity names from the bead
+# This prevents duplicates and enables linking to existing nodes
+```
+
+If no MCP, do a manual check:
+```bash
+ssh root@192.168.7.243 'redis-cli GRAPH.QUERY aegis-ontology \
+  "MATCH (n:Entity) WHERE n.name CONTAINS \"<key-term>\" RETURN n.name, n.summary"' 2>/dev/null || true
+```
+
+**4. Collect all factual claims** about entities, relationships, events,
+commits, file changes, and temporal context (dates, who did what when)
 
 **3. Identify the source type** (determines group_id prefix):
 - `bead-closure` — a completed bead with deliverables
