@@ -141,17 +141,85 @@ ssh root@192.168.7.243 'redis-cli GRAPH.QUERY {{group_id}} \
 ```"""
 
 [[steps]]
-id = "close"
-title = "Record results and clean up"
+id = "feedback"
+title = "Inject ontology context back into bead and agent"
 needs = ["post-episode"]
 tier = "haiku"
 description = """
-**Add a bead comment** with the ingestion results:
+After a successful POST, feed the extracted context BACK into the bead and
+the assigned agent. This closes the knowledge loop — the agent working on
+the bead benefits from understanding what entities are involved.
+
+**1. Format the context summary:**
+
+Build a structured summary from what you extracted:
+```
+🧠 Ontology context (<mode>):
+Entities: <name> (<label>), <name> (<label>), ...
+Relationships:
+  - <source> <relationship> <target>
+  - ...
+Episode: <episode_name> (<N> nodes, <M> edges)
+```
+
+Where `<mode>` is "creation" for new beads or "closure" for closed beads.
+
+**2. Add rich comment to the bead:**
 ```bash
-bd comments add {{issue}} "Ontology ingestion: <N> nodes, <M> edges extracted.
-Episode: <episode_uuid>
-Entities: <comma-separated node names>
-Source: <source type and ID>"
+bd comments add {{issue}} "🧠 Ontology context (<mode>):
+Entities: <comma-separated name (label) pairs>
+Relationships:
+  - <source> <rel> <target>
+  - ...
+Episode: <name> (<N> nodes, <M> edges)"
+```
+
+**3. Mail the assigned agent (if any):**
+```bash
+# Check who is assigned
+ASSIGNEE=$(bd show {{issue}} --json 2>/dev/null | python3 -c "import json,sys; b=json.load(sys.stdin); print(b.get('assignee',''))" 2>/dev/null || true)
+
+# If assigned, mail them the context
+if [[ -n "$ASSIGNEE" ]]; then
+  gt mail send "$ASSIGNEE" --subject "Ontology context for {{issue}}" --body "$(cat <<MAILEOF
+Your bead {{issue}} has been analyzed by the ontology pipeline.
+
+<paste the same structured summary here>
+
+This context may help you understand the entities and relationships
+involved. When you close this bead, a closure extraction will capture
+what you discovered and link it to these entities.
+MAILEOF
+)"
+fi
+```
+
+**4. Add tracking label:**
+```bash
+# For new bead ingestion:
+bd label add {{issue}} ontology-context-injected 2>/dev/null || true
+
+# For closed bead ingestion:
+bd label add {{issue}} ontology-closed-context-injected 2>/dev/null || true
+```
+
+The label tells the cron trigger this bead has been fully processed
+(extraction + feedback)."""
+
+[[steps]]
+id = "close"
+title = "Record results and clean up"
+needs = ["feedback"]
+tier = "haiku"
+description = """
+**Verify the feedback was applied:**
+```bash
+bd show {{issue}} --json 2>/dev/null | python3 -c "
+import json, sys
+b = json.load(sys.stdin)
+labels = b.get('labels', [])
+print('Context injected:', 'ontology-context-injected' in labels or 'ontology-closed-context-injected' in labels)
+"
 ```
 
 **Then self-clean:**
