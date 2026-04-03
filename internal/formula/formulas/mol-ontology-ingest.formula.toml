@@ -94,18 +94,25 @@ bd show {{issue}} --json 2>/dev/null | python3 -c "import json,sys; b=json.load(
   gt mail read <mail-id>
   ```
 
-**3. Query existing ontology (if Graphiti MCP available):**
-```bash
-# Search for entities already in the graph that relate to this bead
-# Use search_nodes MCP tool with key entity names from the bead
-# This prevents duplicates and enables linking to existing nodes
+**3. Query existing ontology for dedup (MANDATORY):**
+
+Use the Graphiti MCP tools (search_nodes, search_memory_facts) to check
+what already exists in the graph. This prevents duplicate nodes:
+```
+# Via MCP tools (preferred — available in crew agent configs):
+search_nodes("koror")           → see if koror node exists already
+search_nodes("FalkorDB")        → see if FalkorDB node exists
+search_memory_facts("runs on")  → see existing relationship patterns
 ```
 
-If no MCP, do a manual check:
+If MCP is not available, query FalkorDB directly:
 ```bash
 ssh root@192.168.7.243 'redis-cli GRAPH.QUERY aegis-ontology \
   "MATCH (n:Entity) WHERE n.name CONTAINS \"<key-term>\" RETURN n.name, n.summary"' 2>/dev/null || true
 ```
+
+When an entity already exists in the graph, use the EXACT same name in
+your extraction to link to it rather than creating a duplicate.
 
 **4. Collect all factual claims** about entities, relationships, events,
 commits, file changes, and temporal context (dates, who did what when)
@@ -150,9 +157,25 @@ Extract structured knowledge from the source material.
 }
 ```
 
-**Quality gate**: if you extract fewer than 2 nodes or 1 edge, the source
-may not contain graph-worthy knowledge. Add a bead comment explaining why
-and skip the POST step."""
+**Quality gate — HARD REQUIREMENT:**
+You MUST extract at least 3 nodes and 2 edges from every bead. Every bead
+has entities worth capturing — if you can't find them, you haven't gathered
+enough context. Go back to load-source and:
+- `git show` every commit hash
+- Read every referenced file
+- `bd show` every cross-referenced bead
+- Check bead comments for implementation details
+
+If after exhaustive context gathering you still can't extract 3+ nodes,
+add a bead comment with:
+```
+ONTOLOGY EXTRACTION FAILED: <reason>
+Context gathered: <list what you read>
+Missing: <what would help>
+```
+Then EXIT WITH ERROR — do NOT proceed to post-episode. The cron will
+retry this bead on the next run. A failed extraction is better than a
+thin one that creates duplicate or useless nodes."""
 
 [[steps]]
 id = "post-episode"
