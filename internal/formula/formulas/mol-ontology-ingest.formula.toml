@@ -1,0 +1,160 @@
+description = """
+Ontology ingestion molecule — extract entities and relationships from source
+material and POST to the Graphiti knowledge graph API.
+
+This molecule is designed for Haiku-tier polecats. The polecat IS the LLM that
+performs knowledge extraction — Graphiti only stores and embeds, it never calls
+an external LLM.
+
+## Extraction Model
+
+The polecat reads source material (bead descriptions, HLA directives, service
+health events, handoff mails) and extracts:
+- **Entity nodes**: services, hosts, people, concepts with labels and summaries
+- **Entity edges**: typed relationships with natural-language facts
+
+The extracted graph is POSTed to Graphiti's /episodes/complete endpoint, which
+generates local embeddings (sentence-transformers) and writes to FalkorDB.
+
+## Context Loading
+
+At prime time, the polecat MUST load the extraction guide:
+```bash
+cat docs/ontology-extraction-guide.md
+```
+This file defines the complete label taxonomy, relationship vocabulary, and
+extraction rules. It is the polecat's schema reference.
+
+If Graphiti MCP is configured (mcpServers.graphiti), use search_entities to
+check for existing nodes before creating new ones (dedup).
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | hook_bead | The source bead/event to extract from |
+| graphiti_url | rig config | Graphiti API URL (default: http://graphiti.svc:8000) |
+| group_id | sling vars | Graph partition (default: aegis-ontology) |
+
+## Design Principles
+
+- **Haiku tier**: extraction is structured, template-driven work
+- **Idempotent**: episode name includes source bead ID, re-runs are safe
+- **No LLM in Graphiti**: the polecat does all intelligence, API just stores
+- **Fail fast**: if extraction produces nothing useful, close cleanly"""
+formula = "mol-ontology-ingest"
+version = 1
+
+[[steps]]
+id = "load-source"
+title = "Load source material"
+tier = "haiku"
+description = """
+Read the source material to extract knowledge from.
+
+**1. Prime, load extraction guide, check hook:**
+```bash
+gt prime
+cat docs/ontology-extraction-guide.md   # REQUIRED — your label/relationship schema
+gt hook
+bd show {{issue}}
+```
+
+**2. Gather full context:**
+- Read the bead description, comments, and any linked design docs
+- If the source is a handoff mail, read the full mail body
+- If the source references files, read those files
+- Collect all factual claims about entities, relationships, and events
+
+**3. Identify the source type** (determines group_id prefix):
+- `bead-closure` — a completed bead with deliverables
+- `hla-directive` — a Stiwi directive from HLA store
+- `service-event` — a service state change (deploy, incident, config)
+- `handoff` — a crew handoff with session context
+- `design` — a design doc with architectural decisions"""
+
+[[steps]]
+id = "extract"
+title = "Extract entities and relationships"
+needs = ["load-source"]
+tier = "haiku"
+description = """
+Extract structured knowledge from the source material.
+
+**Entity extraction rules:**
+- Name entities concretely: "FalkorDB" not "the database"
+- Use consistent labels: Service, Host, Person, Concept, Config, Rig, Container
+- Write summaries as factual one-liners, not descriptions
+- Deduplicate: if an entity was likely already ingested, use the same name
+
+**Edge extraction rules:**
+- Name relationships as verbs: runs_on, depends_on, owns, manages, connects_to
+- Write facts as complete sentences: "FalkorDB runs on koror as CT 243"
+- Include temporal context when relevant: "deployed on 2026-04-03"
+- Every edge must reference two nodes from your extraction
+
+**Output format** (prepare this mentally, write in next step):
+```json
+{
+  "name": "<source-type>-<bead-id>",
+  "group_id": "{{group_id}}",
+  "episode_body": "<summary of source material>",
+  "reference_time": "<ISO timestamp of event>",
+  "source_description": "<who extracted from what>",
+  "nodes": [{"name": "...", "labels": ["..."], "summary": "..."}],
+  "edges": [{"name": "...", "fact": "...", "source_node_name": "...", "target_node_name": "..."}]
+}
+```
+
+**Quality gate**: if you extract fewer than 2 nodes or 1 edge, the source
+may not contain graph-worthy knowledge. Add a bead comment explaining why
+and skip the POST step."""
+
+[[steps]]
+id = "post-episode"
+title = "POST extracted episode to Graphiti"
+needs = ["extract"]
+tier = "haiku"
+description = """
+Send the extracted knowledge to the Graphiti API.
+
+**POST the episode:**
+```bash
+curl -s -w '\nHTTP: %{http_code}\n' \
+  -X POST '{{graphiti_url}}/episodes/complete' \
+  -H 'Content-Type: application/json' \
+  -d '<your JSON from extract step>'
+```
+
+**Expected response**: HTTP 201 with episode_uuid, nodes[], edges[]
+
+**Error handling:**
+- 422: edge references unknown node name — fix the extraction
+- 500: check if Graphiti service is healthy (`curl {{graphiti_url}}/docs`)
+- Timeout: Graphiti may be loading the embedder model on first use (~10s)
+
+**Verify in FalkorDB** (optional, for confidence):
+```bash
+# On the goldblum controller:
+ssh root@192.168.7.243 'redis-cli GRAPH.QUERY {{group_id}} \
+  "MATCH (n:Entity) RETURN n.name, n.summary LIMIT 10"'
+```"""
+
+[[steps]]
+id = "close"
+title = "Record results and clean up"
+needs = ["post-episode"]
+tier = "haiku"
+description = """
+**Add a bead comment** with the ingestion results:
+```bash
+bd comments add {{issue}} "Ontology ingestion: <N> nodes, <M> edges extracted.
+Episode: <episode_uuid>
+Entities: <comma-separated node names>
+Source: <source type and ID>"
+```
+
+**Then self-clean:**
+```bash
+gt done
+```"""
