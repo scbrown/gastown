@@ -305,6 +305,9 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Sent handoff mail %s (auto-hooked)\n", style.Bold.Render("📬"), beadID)
 	}
 
+	// Create ontology extraction bead from handoff context (aegis-od2).
+	createExtractionBead(handoffSubject, handoffMessage)
+
 	// NOTE: reportAgentState("stopped") removed (gt-zecmc)
 	// Agent liveness is observable from tmux - no need to record it in bead.
 	// "Discover, don't track" principle: reality is truth, state is derived.
@@ -398,6 +401,9 @@ func runHandoffAuto() error {
 	} else {
 		fmt.Fprintf(os.Stderr, "auto-handoff: saved state to %s\n", beadID)
 	}
+
+	// Create ontology extraction bead from handoff context (aegis-od2).
+	createExtractionBead(subject, message)
 
 	// Write handoff marker so post-compact prime knows it's post-handoff
 	if cwd, err := os.Getwd(); err == nil {
@@ -506,6 +512,9 @@ func runHandoffCycle() error {
 	} else {
 		fmt.Fprintf(os.Stderr, "handoff --cycle: saved state to %s\n", beadID)
 	}
+
+	// Create ontology extraction bead from handoff context (aegis-od2).
+	createExtractionBead(subject, message)
 
 	// Write handoff marker so post-cycle prime knows it's post-handoff.
 	// Format: "session_id\nreason" — the reason enables isCompactResume()
@@ -1296,6 +1305,62 @@ func sendHandoffMail(subject, message string) (string, error) {
 	}
 
 	return beadID, nil
+}
+
+// createExtractionBead creates an ontology-extraction bead from the handoff
+// mail body. This is the first ingestion hook for the crew ontology system —
+// handoff context becomes a raw episode that crew can later extract knowledge
+// from. Non-fatal: extraction bead creation never blocks handoff.
+func createExtractionBead(subject, body string) {
+	if body == "" {
+		return
+	}
+
+	townRoot := detectTownRootFromCwd()
+	if townRoot == "" {
+		return
+	}
+
+	agentID, _, _, err := resolveSelfTarget()
+	if err != nil {
+		return
+	}
+	agentID = mail.AddressToIdentity(agentID)
+
+	title := "Extract knowledge: " + subject
+	// Truncate title to 200 chars (bd constraint)
+	if len(title) > 200 {
+		title = title[:197] + "..."
+	}
+
+	args := []string{
+		"create",
+		"-d", body,
+		"--labels", "ontology-extraction,from:" + agentID,
+		"--actor", agentID,
+		"--silent",
+		"--", title,
+	}
+
+	cmd := BdCmd(args...).
+		WithAutoCommit().
+		Dir(townRoot).
+		Build()
+	cmd.Env = append(cmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
+
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		// Non-fatal — extraction bead is nice-to-have
+		return
+	}
+
+	extractBeadID := strings.TrimSpace(stdout.String())
+	if extractBeadID != "" {
+		fmt.Printf("🧠 Created extraction bead %s\n", extractBeadID)
+	}
 }
 
 // warnHandoffGitStatus checks the current workspace for uncommitted or unpushed
