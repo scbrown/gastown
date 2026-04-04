@@ -79,7 +79,7 @@ func jsonlGitBackupInterval(config *DaemonPatrolConfig) time.Duration {
 // and commits/pushes to a git repository.
 // Non-fatal: errors are logged but don't stop the daemon.
 func (d *Daemon) syncJsonlGitBackup() {
-	if !IsPatrolEnabled(d.patrolConfig, "jsonl_git_backup") {
+	if !d.isPatrolActive("jsonl_git_backup") {
 		return
 	}
 

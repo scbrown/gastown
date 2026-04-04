@@ -1244,6 +1244,16 @@ type MergeQueueConfig struct {
 	// Nil defaults to false (no review required).
 	RequireReview *bool `json:"require_review,omitempty"`
 
+	// JudgmentEnabled controls whether the refinery performs quality review
+	// before merging. When true, the refinery patrol's quality-review step
+	// evaluates the diff for correctness, security, and code quality.
+	JudgmentEnabled *bool `json:"judgment_enabled,omitempty"`
+
+	// ReviewDepth controls the thoroughness of quality review when judgment
+	// is enabled. Valid values: "quick", "standard", "deep".
+	// Nil defaults to "standard".
+	ReviewDepth string `json:"review_depth,omitempty"`
+
 	// OnConflict specifies conflict resolution strategy: "assign_back" or "auto_rebase".
 	OnConflict string `json:"on_conflict"`
 

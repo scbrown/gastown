@@ -217,21 +217,10 @@ func NewTmuxWithSocket(socket string) *Tmux {
 	return &Tmux{socketName: socket}
 }
 
-// tmuxCommandTimeout is the maximum time to wait for any tmux subprocess.
-// All tmux commands (send-keys, list-sessions, show-environment, etc.) should
-// complete in well under 1 second. A 10-second timeout catches hung tmux servers
-// (e.g., under extreme load) that would otherwise block the entire gt process.
-// See: aegis-9rfyen (gt mail send hangs in sigsuspend).
-const tmuxCommandTimeout = 10 * time.Second
-
 // run executes a tmux command and returns stdout.
 // All commands include -u flag for UTF-8 support regardless of locale settings.
-// Commands are killed after tmuxCommandTimeout to prevent indefinite hangs.
 // See: https://github.com/steveyegge/gastown/issues/1219
 func (t *Tmux) run(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), tmuxCommandTimeout)
-	defer cancel()
-
 	// Prepend global flags: -u (UTF-8 mode, PATCH-004) and optionally -L (socket).
 	// The -L flag must come before the subcommand, so it goes in the prefix.
 	allArgs := []string{"-u"}
@@ -247,9 +236,6 @@ func (t *Tmux) run(args ...string) (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("tmux command timed out after %s: %v", tmuxCommandTimeout, args)
-		}
 		return "", t.wrapError(err, stderr.String(), args)
 	}
 
@@ -2345,6 +2331,56 @@ func (t *Tmux) SelectWindow(session string, index int) error {
 	return err
 }
 
+// ResolveCurrentSession returns the session name for the tmux pane that is an
+// ancestor of the calling process. Works even when $TMUX and $TMUX_PANE are
+// not in the process environment (e.g., Claude Code hook subprocesses).
+//
+// Walks up the process parent chain and matches against tmux pane PIDs on
+// the configured socket.
+func (t *Tmux) ResolveCurrentSession() (string, error) {
+	out, err := t.run("list-panes", "-a", "-F", "#{pane_pid} #{session_name}")
+	if err != nil {
+		return "", fmt.Errorf("listing panes: %w", err)
+	}
+
+	paneSessions := make(map[int]string)
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		paneSessions[pid] = parts[1]
+	}
+
+	// Walk up from our PID to PID 1, checking each against pane PIDs
+	pid := os.Getpid()
+	for pid > 1 {
+		if name, ok := paneSessions[pid]; ok {
+			return name, nil
+		}
+		ppid, err := parentPID(pid)
+		if err != nil || ppid == pid {
+			break
+		}
+		pid = ppid
+	}
+
+	return "", fmt.Errorf("no tmux pane ancestor found for pid %d", os.Getpid())
+}
+
+// parentPID returns the parent PID of the given process.
+func parentPID(pid int) (int, error) {
+	data, err := exec.Command("ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
 // SetEnvironment sets an environment variable in the session.
 func (t *Tmux) SetEnvironment(session, key, value string) error {
 	_, err := t.run("set-environment", "-t", session, key, value)
@@ -3476,11 +3512,13 @@ func (t *Tmux) SetCycleBindings(session string) error {
 // See: https://github.com/steveyegge/gastown/issues/13
 // See: https://github.com/steveyegge/gastown/issues/1548
 func (t *Tmux) SetFeedBinding(session string) error {
-	// Skip if already configured — preserves user's original fallback from first call
-	if t.isGTBinding("prefix", "a") {
+	pattern := sessionPrefixPattern()
+	// Skip if already configured with the current rig prefix pattern.
+	// Must re-bind if the pattern is stale (e.g., after gt rig add adds a new prefix).
+	if t.isGTBinding("prefix", "a") && t.isGTBindingCurrent("prefix", "a", pattern) {
 		return nil
 	}
-	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
+	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", pattern)
 	fallback := t.getKeyBinding("prefix", "a")
 	if fallback == "" {
 		// No prior binding — do nothing in non-GT sessions
@@ -3502,11 +3540,13 @@ func (t *Tmux) SetFeedBinding(session string) error {
 // press is silently ignored.
 // See: https://github.com/steveyegge/gastown/issues/1548
 func (t *Tmux) SetAgentsBinding(session string) error {
-	// Skip if already configured — preserves user's original fallback from first call
-	if t.isGTBinding("prefix", "g") {
+	pattern := sessionPrefixPattern()
+	// Skip if already configured with the current rig prefix pattern.
+	// Must re-bind if the pattern is stale (e.g., after gt rig add adds a new prefix).
+	if t.isGTBinding("prefix", "g") && t.isGTBindingCurrent("prefix", "g", pattern) {
 		return nil
 	}
-	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", sessionPrefixPattern())
+	ifShell := fmt.Sprintf("echo '#{session_name}' | grep -Eq '%s'", pattern)
 	fallback := t.getKeyBinding("prefix", "g")
 	if fallback == "" {
 		// No prior binding — do nothing in non-GT sessions

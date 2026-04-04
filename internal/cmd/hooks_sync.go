@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -16,18 +17,23 @@ var hooksSyncDryRun bool
 
 var hooksSyncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Regenerate all .claude/settings.json files",
-	Long: `Regenerate all .claude/settings.json files from the base config and overrides.
+	Short: "Regenerate all agent hook/settings files",
+	Long: `Regenerate hook and settings files for all agents across the workspace.
 
-For each target (mayor, deacon, rig/crew, rig/witness, etc.):
+For Claude agents (settings.json merge):
 1. Load base config
 2. Apply role override (if exists)
 3. Apply rig+role override (if exists)
 4. Merge hooks section into existing settings.json (preserving all fields)
 5. Write updated settings.json
 
+For template-based agents (OpenCode, Gemini, Copilot, etc.):
+1. Resolve the agent configured for each role
+2. Compare deployed hook file against current template
+3. Overwrite if content differs
+
 Examples:
-  gt hooks sync             # Regenerate all settings.json files
+  gt hooks sync             # Regenerate all hook/settings files
   gt hooks sync --dry-run   # Show what would change without writing`,
 	RunE: runHooksSync,
 }

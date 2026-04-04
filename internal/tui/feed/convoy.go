@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -33,10 +35,20 @@ type Convoy struct {
 	ClosedAt  time.Time `json:"closed_at,omitempty"`
 }
 
+// MQEntry represents a single merge request in the merge queue
+type MQEntry struct {
+	ID      string // Bead ID (e.g., "gt-mr-abc")
+	Branch  string // Source branch name
+	Status  string // queued, merging, merged, failed
+	Polecat string // Polecat that submitted (e.g., "nux")
+	Rig     string // Which rig this MR belongs to
+}
+
 // ConvoyState holds all convoy data for the panel
 type ConvoyState struct {
 	InProgress []Convoy
 	Landed     []Convoy
+	MQEntries  []MQEntry
 	LastUpdate time.Time
 }
 
@@ -82,6 +94,9 @@ func FetchConvoys(townRoot string) (*ConvoyState, error) {
 	sort.Slice(state.Landed, func(i, j int) bool {
 		return state.Landed[i].ClosedAt.After(state.Landed[j].ClosedAt)
 	})
+
+	// Fetch merge queue entries from all rigs
+	state.MQEntries = fetchMQEntries(townRoot)
 
 	return state, nil
 }
@@ -224,6 +239,17 @@ func (m *Model) renderConvoys() string {
 	} else {
 		for _, c := range m.convoyState.Landed {
 			lines = append(lines, renderConvoyLine(c, true))
+		}
+	}
+
+	// Merge Queue section
+	lines = append(lines, "")
+	lines = append(lines, MQTitleStyle.Render("⚙ Merge Queue"))
+	if len(m.convoyState.MQEntries) == 0 {
+		lines = append(lines, "  "+AgentIdleStyle.Render("No pending merges"))
+	} else {
+		for _, entry := range m.convoyState.MQEntries {
+			lines = append(lines, renderMQLine(entry))
 		}
 	}
 

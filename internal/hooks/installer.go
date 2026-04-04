@@ -21,11 +21,20 @@ import (
 var templateFS embed.FS
 
 // InstallForRole provisions hook/settings files for an agent based on its preset config.
-// settingsDir is the gastown-managed parent (used by agents with --settings flag).
-// workDir is the agent's working directory.
-// role is the Gas Town role (e.g., "polecat", "crew", "witness").
-// hooksDir and hooksFile come from the preset's HooksDir and HooksSettingsFile.
-// provider is the preset's HooksProvider (e.g., "claude", "gemini").
+// It creates the file if it does not exist, or overwrites if the existing file contains
+// known stale patterns (e.g., legacy "export PATH=" format). Otherwise it does not
+// overwrite — this is the safe path for session startup, where Claude's settings.json
+// may have been customized by syncTarget (base + role overrides merge) and must not
+// be clobbered.
+//
+// For explicit sync operations that should update stale files, use SyncForRole.
+//
+// Parameters:
+//   - provider: the preset's HooksProvider (e.g., "claude", "gemini").
+//   - settingsDir: the gastown-managed parent (used by agents with --settings flag).
+//   - workDir: the agent's working directory.
+//   - role: the Gas Town role (e.g., "polecat", "crew", "witness").
+//   - hooksDir/hooksFile: from the preset's HooksDir and HooksSettingsFile.
 //
 // Template resolution:
 //   - Role-aware agents (have both autonomous and interactive templates):
@@ -129,11 +138,10 @@ func installTargetPath(settingsDir, workDir, hooksDir, hooksFile string, useSett
 	if useSettingsDir {
 		installDir = settingsDir
 	}
-
 	return filepath.Join(installDir, hooksDir, hooksFile)
 }
 
-// resolveAndSubstitute resolves a template and substitutes placeholders.
+// resolveAndSubstitute resolves the template and performs {{GT_BIN}} substitution.
 func resolveAndSubstitute(provider, hooksFile, role string) ([]byte, error) {
 	content, err := resolveTemplate(provider, hooksFile, role)
 	if err != nil {
@@ -167,7 +175,6 @@ func writeTemplate(provider, role, hooksFile, targetPath string) error {
 		return fmt.Errorf("creating hooks directory: %w", err)
 	}
 
-	// Use restrictive permissions for settings that may contain role instructions
 	perm := os.FileMode(0644)
 	if isSettingsFile(hooksFile) {
 		perm = 0600
@@ -250,17 +257,7 @@ func resolveGTBinary() string {
 // This is used by the doctor hooks-sync check to compare installed files against
 // current templates.
 func ComputeExpectedTemplate(provider, hooksFile, role string) ([]byte, error) {
-	content, err := resolveTemplate(provider, hooksFile, role)
-	if err != nil {
-		return nil, err
-	}
-
-	if bytes.Contains(content, []byte("{{GT_BIN}}")) {
-		gtBin := resolveGTBinary()
-		content = bytes.ReplaceAll(content, []byte("{{GT_BIN}}"), []byte(gtBin))
-	}
-
-	return content, nil
+	return resolveAndSubstitute(provider, hooksFile, role)
 }
 
 // TemplateContentEqual compares two JSON byte slices for structural equality

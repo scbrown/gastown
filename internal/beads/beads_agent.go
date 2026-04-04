@@ -435,6 +435,7 @@ func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 // This allows multiple fields to be updated in a single read-modify-write
 // cycle, avoiding races where concurrent callers overwrite each other's changes.
 type AgentFieldUpdates struct {
+	AgentState        *string
 	CleanupStatus     *string
 	ActiveMR          *string
 	NotificationLevel *string

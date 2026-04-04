@@ -38,7 +38,9 @@ var SystemDefaults = map[string]interface{}{
 	"priority_adjustment":     0,
 	"dnd":                     false,
 	"polecat_branch_template": "", // Empty = use default behavior (polecat/{name}/...)
-	"default_formula":         "mol-polecat-work",
+	// default_formula intentionally omitted from SystemDefaults so that
+	// the rig settings/config.json fallback in resolveFormula() is reached.
+	// System default "mol-polecat-work" is the final fallback in resolveFormula().
 }
 
 // StackingKeys defines which keys use stacking semantics (values add up).

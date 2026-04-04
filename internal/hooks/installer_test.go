@@ -93,7 +93,6 @@ func TestInstallForRole_SkipsExisting(t *testing.T) {
 	}
 }
 
-
 func TestInstallForRole_UpgradesStaleExportPath(t *testing.T) {
 	dir := t.TempDir()
 	hooksPath := filepath.Join(dir, ".opencode/plugins", "gastown.js")
