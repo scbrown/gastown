@@ -78,7 +78,90 @@ func (c *HooksSyncCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	if len(c.outOfSync) == 0 {
+	// Loop 2: Non-Claude template-based agents — use DiscoverRoleLocations + SyncForRole comparison.
+	locations, locErr := hooks.DiscoverRoleLocations(ctx.TownRoot)
+	if locErr != nil {
+		details = append(details, fmt.Sprintf("discovering role locations: %v", locErr))
+	} else {
+		for _, loc := range locations {
+			rigPath := ""
+			if loc.Rig != "" {
+				rigPath = filepath.Join(ctx.TownRoot, loc.Rig)
+			}
+			// Use ResolveRoleAgentName (not ResolveRoleAgentConfig) so that checks are
+			// based on the *configured* agent, not the *resolved* one.
+			// ResolveRoleAgentConfig falls back to claude when the agent binary is not
+			// found in PATH (e.g., in CI), which would silently skip non-Claude targets.
+			agentName, _ := config.ResolveRoleAgentName(loc.Role, ctx.TownRoot, rigPath)
+			if agentName == "" {
+				continue
+			}
+			preset := config.GetAgentPresetByName(agentName)
+			if preset == nil || preset.HooksDir == "" || preset.HooksSettingsFile == "" {
+				continue
+			}
+			hooksProvider := preset.HooksProvider
+			if hooksProvider == "" {
+				hooksProvider = agentName
+			}
+			// Claude targets are handled by Loop 1.
+			if hooksProvider == "claude" {
+				continue
+			}
+
+			useSettingsDir := preset.HooksUseSettingsDir
+
+			var checkDirs []string
+			if loc.Rig == "" || useSettingsDir {
+				checkDirs = []string{loc.Dir}
+			} else {
+				checkDirs = hooks.DiscoverWorktrees(loc.Dir)
+			}
+
+			for _, dir := range checkDirs {
+				totalTargets++
+				targetPath := filepath.Join(dir, preset.HooksDir, preset.HooksSettingsFile)
+
+				expected, err := hooks.ComputeExpectedTemplate(hooksProvider, preset.HooksSettingsFile, loc.Role)
+				if err != nil {
+					details = append(details, fmt.Sprintf("%s (%s): error computing template: %v", targetPath, hooksProvider, err))
+					continue
+				}
+
+				actual, readErr := os.ReadFile(targetPath)
+				if readErr != nil {
+					// File missing
+					c.templateOutOfSync = append(c.templateOutOfSync, templateTarget{
+						path: targetPath, dir: dir, provider: hooksProvider,
+						role: loc.Role, hooksDir: preset.HooksDir,
+						settingsFile: preset.HooksSettingsFile, useSettingsDir: useSettingsDir,
+					})
+					details = append(details, fmt.Sprintf("%s (%s): missing", targetPath, hooksProvider))
+					continue
+				}
+
+				// Compare: structural for JSON, byte-exact for other files.
+				inSync := false
+				if filepath.Ext(preset.HooksSettingsFile) == ".json" {
+					inSync = hooks.TemplateContentEqual(expected, actual)
+				} else {
+					inSync = bytes.Equal(expected, actual)
+				}
+
+				if !inSync {
+					c.templateOutOfSync = append(c.templateOutOfSync, templateTarget{
+						path: targetPath, dir: dir, provider: hooksProvider,
+						role: loc.Role, hooksDir: preset.HooksDir,
+						settingsFile: preset.HooksSettingsFile, useSettingsDir: useSettingsDir,
+					})
+					details = append(details, fmt.Sprintf("%s (%s): out of sync", targetPath, hooksProvider))
+				}
+			}
+		}
+	}
+
+	outOfSyncCount := len(c.outOfSync) + len(c.templateOutOfSync)
+	if outOfSyncCount == 0 {
 		return &CheckResult{
 			Name:     c.Name(),
 			Status:   StatusOK,
