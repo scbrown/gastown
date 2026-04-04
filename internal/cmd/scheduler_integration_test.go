@@ -295,8 +295,7 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	}
 
 	// Verify: convoy is resolvable via bd show from hq
-	showArgs := beads.MaybePrependAllowStale([]string{"show", fields.Convoy, "--json"})
-	cmd := exec.Command("bd", showArgs...)
+	cmd := exec.Command("bd", "show", fields.Convoy, "--json", "--allow-stale")
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -318,9 +317,6 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
 	// This is the core cross-rig link: convoy lives in HQ DB, bead in rig DB.
-	// The dep IS persisted correctly, but bd dep list < v0.63 silently drops
-	// cross-rig deps (beads GH#2624, PR#2774). Once the fix is released,
-	// change t.Logf → t.Errorf to enforce the assertion.
 	depArgs := beads.MaybePrependAllowStale([]string{"dep", "list", fields.Convoy, "--direction=down", "--type=tracks", "--json"})
 	depCmd := exec.Command("bd", depArgs...)
 	depCmd.Dir = hqPath
@@ -342,7 +338,7 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		}
 	}
 	if !foundTracked {
-		t.Logf("cross-rig dep not visible (requires bd >= v0.63 with GH#2624 fix), convoy %s → %s, got deps: %s", fields.Convoy, beadID, depOut)
+		t.Errorf("convoy %s should track bead %s via tracks dep, got deps: %s", fields.Convoy, beadID, depOut)
 	}
 }
 

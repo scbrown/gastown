@@ -66,14 +66,14 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 		cfg = PatrolConfig{
 			RoleName:      "witness",
 			PatrolMolName: constants.MolWitnessPatrol,
-			BeadsDir:      roleInfo.TownRoot,
+			BeadsDir:      roleInfo.WorkDir,
 			Assignee:      roleInfo.Rig + "/witness",
 		}
 	case RoleRefinery:
 		cfg = PatrolConfig{
 			RoleName:      "refinery",
 			PatrolMolName: constants.MolRefineryPatrol,
-			BeadsDir:      roleInfo.TownRoot,
+			BeadsDir:      roleInfo.WorkDir,
 			Assignee:      roleInfo.Rig + "/refinery",
 			ExtraVars:     buildRefineryPatrolVars(roleInfo),
 		}

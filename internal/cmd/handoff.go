@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
-
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
@@ -76,7 +74,6 @@ var (
 	handoffCycle      bool
 	handoffReason     string
 	handoffNoGitCheck bool
-	handoffYes        bool
 )
 
 func init() {
@@ -90,7 +87,6 @@ func init() {
 	handoffCmd.Flags().BoolVar(&handoffCycle, "cycle", false, "Auto-cycle session (for PreCompact hooks that want full session replacement)")
 	handoffCmd.Flags().StringVar(&handoffReason, "reason", "", "Reason for handoff (e.g., 'compaction', 'idle')")
 	handoffCmd.Flags().BoolVar(&handoffNoGitCheck, "no-git-check", false, "Skip git workspace cleanliness check")
-	handoffCmd.Flags().BoolVarP(&handoffYes, "yes", "y", false, "Skip confirmation prompt (for automation and scripting)")
 	rootCmd.AddCommand(handoffCmd)
 }
 
@@ -157,16 +153,6 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		doneCmd.Stdout = os.Stdout
 		doneCmd.Stderr = os.Stderr
 		return doneCmd.Run()
-	}
-
-	// Prompt for confirmation unless --yes/-y was passed or stdin is not a TTY.
-	// Only interactive (human) sessions get prompted; agent automation proceeds
-	// without blocking on stdin (gas-6z0).
-	if !handoffYes && !handoffDryRun && term.IsTerminal(int(os.Stdin.Fd())) {
-		if !promptYesNo("Ready to hand off? This will restart the session.") {
-			fmt.Println("Handoff canceled.")
-			return nil
-		}
 	}
 
 	// Enforce minimum handoff cooldown to prevent tight restart loops (gt-058d).
@@ -305,9 +291,6 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Sent handoff mail %s (auto-hooked)\n", style.Bold.Render("📬"), beadID)
 	}
 
-	// Create ontology extraction bead from handoff context (aegis-od2).
-	createExtractionBead(handoffSubject, handoffMessage)
-
 	// NOTE: reportAgentState("stopped") removed (gt-zecmc)
 	// Agent liveness is observable from tmux - no need to record it in bead.
 	// "Discover, don't track" principle: reality is truth, state is derived.
@@ -401,9 +384,6 @@ func runHandoffAuto() error {
 	} else {
 		fmt.Fprintf(os.Stderr, "auto-handoff: saved state to %s\n", beadID)
 	}
-
-	// Create ontology extraction bead from handoff context (aegis-od2).
-	createExtractionBead(subject, message)
 
 	// Write handoff marker so post-compact prime knows it's post-handoff
 	if cwd, err := os.Getwd(); err == nil {
@@ -512,9 +492,6 @@ func runHandoffCycle() error {
 	} else {
 		fmt.Fprintf(os.Stderr, "handoff --cycle: saved state to %s\n", beadID)
 	}
-
-	// Create ontology extraction bead from handoff context (aegis-od2).
-	createExtractionBead(subject, message)
 
 	// Write handoff marker so post-cycle prime knows it's post-handoff.
 	// Format: "session_id\nreason" — the reason enables isCompactResume()
@@ -1305,62 +1282,6 @@ func sendHandoffMail(subject, message string) (string, error) {
 	}
 
 	return beadID, nil
-}
-
-// createExtractionBead creates an ontology-extraction bead from the handoff
-// mail body. This is the first ingestion hook for the crew ontology system —
-// handoff context becomes a raw episode that crew can later extract knowledge
-// from. Non-fatal: extraction bead creation never blocks handoff.
-func createExtractionBead(subject, body string) {
-	if body == "" {
-		return
-	}
-
-	townRoot := detectTownRootFromCwd()
-	if townRoot == "" {
-		return
-	}
-
-	agentID, _, _, err := resolveSelfTarget()
-	if err != nil {
-		return
-	}
-	agentID = mail.AddressToIdentity(agentID)
-
-	title := "Extract knowledge: " + subject
-	// Truncate title to 200 chars (bd constraint)
-	if len(title) > 200 {
-		title = title[:197] + "..."
-	}
-
-	args := []string{
-		"create",
-		"-d", body,
-		"--labels", "ontology-extraction,from:" + agentID,
-		"--actor", agentID,
-		"--silent",
-		"--", title,
-	}
-
-	cmd := BdCmd(args...).
-		WithAutoCommit().
-		Dir(townRoot).
-		Build()
-	cmd.Env = append(cmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
-
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		// Non-fatal — extraction bead is nice-to-have
-		return
-	}
-
-	extractBeadID := strings.TrimSpace(stdout.String())
-	if extractBeadID != "" {
-		fmt.Printf("🧠 Created extraction bead %s\n", extractBeadID)
-	}
 }
 
 // warnHandoffGitStatus checks the current workspace for uncommitted or unpushed

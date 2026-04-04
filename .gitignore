@@ -27,7 +27,6 @@ Thumbs.db
 # Test
 coverage.out
 *.test
-internal/events/*/
 
 # Local config
 config.toml

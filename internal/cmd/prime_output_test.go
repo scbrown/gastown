@@ -1,16 +1,17 @@
 package cmd
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// Not parallel: subtests use captureStdout which replaces os.Stdout.
 func TestOutputRoleDirectives(t *testing.T) {
+	t.Parallel()
+
 	t.Run("no directives emits nothing visible", func(t *testing.T) {
+		t.Parallel()
 		townRoot := t.TempDir()
 		ctx := RoleContext{
 			Role:     RolePolecat,
@@ -18,9 +19,9 @@ func TestOutputRoleDirectives(t *testing.T) {
 			Rig:      "myrig",
 		}
 
-		var buf bytes.Buffer
-		outputRoleDirectives(ctx, &buf, false)
-		out := buf.String()
+		out := captureStdout(t, func() {
+			outputRoleDirectives(ctx)
+		})
 
 		if strings.Contains(out, "Directives") {
 			t.Errorf("expected no header when no directives, got: %s", out)
@@ -28,6 +29,7 @@ func TestOutputRoleDirectives(t *testing.T) {
 	})
 
 	t.Run("town-level directive emits town header", func(t *testing.T) {
+		t.Parallel()
 		townRoot := t.TempDir()
 		dir := filepath.Join(townRoot, "directives")
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -43,9 +45,9 @@ func TestOutputRoleDirectives(t *testing.T) {
 			Rig:      "myrig",
 		}
 
-		var buf bytes.Buffer
-		outputRoleDirectives(ctx, &buf, false)
-		out := buf.String()
+		out := captureStdout(t, func() {
+			outputRoleDirectives(ctx)
+		})
 
 		if !strings.Contains(out, "## Town Directives") {
 			t.Errorf("expected Town Directives header, got: %s", out)
@@ -56,6 +58,7 @@ func TestOutputRoleDirectives(t *testing.T) {
 	})
 
 	t.Run("rig-level directive emits rig header", func(t *testing.T) {
+		t.Parallel()
 		townRoot := t.TempDir()
 		dir := filepath.Join(townRoot, "myrig", "directives")
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -71,9 +74,9 @@ func TestOutputRoleDirectives(t *testing.T) {
 			Rig:      "myrig",
 		}
 
-		var buf bytes.Buffer
-		outputRoleDirectives(ctx, &buf, false)
-		out := buf.String()
+		out := captureStdout(t, func() {
+			outputRoleDirectives(ctx)
+		})
 
 		if !strings.Contains(out, "## Rig Directives") {
 			t.Errorf("expected Rig Directives header, got: %s", out)
@@ -84,6 +87,7 @@ func TestOutputRoleDirectives(t *testing.T) {
 	})
 
 	t.Run("both levels emits combined header", func(t *testing.T) {
+		t.Parallel()
 		townRoot := t.TempDir()
 
 		townDir := filepath.Join(townRoot, "directives")
@@ -108,9 +112,9 @@ func TestOutputRoleDirectives(t *testing.T) {
 			Rig:      "myrig",
 		}
 
-		var buf bytes.Buffer
-		outputRoleDirectives(ctx, &buf, false)
-		out := buf.String()
+		out := captureStdout(t, func() {
+			outputRoleDirectives(ctx)
+		})
 
 		if !strings.Contains(out, "## Town & Rig Directives") {
 			t.Errorf("expected combined header, got: %s", out)
@@ -124,7 +128,12 @@ func TestOutputRoleDirectives(t *testing.T) {
 	})
 
 	t.Run("explain mode shows file paths", func(t *testing.T) {
+		t.Parallel()
 		townRoot := t.TempDir()
+
+		oldExplain := primeExplain
+		primeExplain = true
+		defer func() { primeExplain = oldExplain }()
 
 		ctx := RoleContext{
 			Role:     RolePolecat,
@@ -132,19 +141,20 @@ func TestOutputRoleDirectives(t *testing.T) {
 			Rig:      "myrig",
 		}
 
-		var buf bytes.Buffer
-		outputRoleDirectives(ctx, &buf, true)
-		out := buf.String()
+		out := captureStdout(t, func() {
+			outputRoleDirectives(ctx)
+		})
 
 		if !strings.Contains(out, "[EXPLAIN]") {
 			t.Errorf("expected EXPLAIN output, got: %s", out)
 		}
-		if !strings.Contains(out, filepath.Join("directives", "polecat.md")) {
+		if !strings.Contains(out, "directives/polecat.md") {
 			t.Errorf("expected file path in explain output, got: %s", out)
 		}
 	})
 
 	t.Run("empty rig name skips rig path", func(t *testing.T) {
+		t.Parallel()
 		townRoot := t.TempDir()
 
 		townDir := filepath.Join(townRoot, "directives")
@@ -161,9 +171,9 @@ func TestOutputRoleDirectives(t *testing.T) {
 			Rig:      "",
 		}
 
-		var buf bytes.Buffer
-		outputRoleDirectives(ctx, &buf, false)
-		out := buf.String()
+		out := captureStdout(t, func() {
+			outputRoleDirectives(ctx)
+		})
 
 		if !strings.Contains(out, "## Town Directives") {
 			t.Errorf("expected Town Directives header, got: %s", out)

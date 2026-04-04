@@ -333,16 +333,20 @@ func hookSessionBeaconLines(sessionID, source string) []string {
 // signalAgentReady sets GT_AGENT_READY=1 in the current tmux session environment.
 // Called from the agent's SessionStart hook to signal that the agent has started.
 // WaitForCommand polls for this variable as a ZFC-compliant alternative to
-// probing the process tree via IsAgentAlive.
-// Uses ResolveCurrentSession to find our session on the town socket — raw
-// exec.Command("tmux", ...) would use the default socket and miss the gastown server.
+// probing the process tree via IsAgentAlive. No-op when not in a tmux session.
 func signalAgentReady() {
-	t := tmux.NewTmux()
-	name, err := t.ResolveCurrentSession()
-	if err != nil || name == "" {
+	if os.Getenv("TMUX") == "" {
 		return
 	}
-	_ = t.SetEnvironment(name, tmux.EnvAgentReady, "1")
+	out, err := exec.Command("tmux", "display-message", "-p", "#{session_name}").Output()
+	if err != nil {
+		return
+	}
+	session := strings.TrimSpace(string(out))
+	if session == "" {
+		return
+	}
+	_ = exec.Command("tmux", "set-environment", "-t", session, tmux.EnvAgentReady, "1").Run()
 }
 
 // isCompactResume returns true if the current prime is running after compaction or resume.
@@ -404,7 +408,7 @@ func outputRoleContext(ctx RoleContext) (string, error) {
 		return "", err
 	}
 
-	outputRoleDirectives(ctx, os.Stdout, primeExplain)
+	outputRoleDirectives(ctx)
 	outputContextFile(ctx)
 	outputHandoffContent(ctx)
 	outputAttachmentStatus(ctx)

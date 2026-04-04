@@ -143,7 +143,7 @@ func shouldRunMaintenance(now time.Time, lastRun time.Time, interval string) boo
 // runScheduledMaintenance checks if we're in the maintenance window and
 // if any database exceeds the commit threshold, runs `gt maintain --force`.
 func (d *Daemon) runScheduledMaintenance() {
-	if !d.isPatrolActive("scheduled_maintenance") {
+	if !IsPatrolEnabled(d.patrolConfig, "scheduled_maintenance") {
 		return
 	}
 

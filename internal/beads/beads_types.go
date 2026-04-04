@@ -224,10 +224,9 @@ func EnsureCustomStatuses(beadsDir string) error {
 	getCmd.Env = getEnv
 	existingOutput, _ := getCmd.Output()
 
-	// Build merged set: existing + required.
-	// bd config get returns "(not set)" when no value exists — treat that as empty.
+	// Build merged set: existing + required
 	statusSet := make(map[string]bool)
-	if existing := strings.TrimSpace(string(existingOutput)); existing != "" && existing != "(not set)" {
+	if existing := strings.TrimSpace(string(existingOutput)); existing != "" {
 		for _, s := range strings.Split(existing, ",") {
 			s = strings.TrimSpace(s)
 			if s != "" {

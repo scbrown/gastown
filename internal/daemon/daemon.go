@@ -56,11 +56,6 @@ type Daemon struct {
 	doltServer *DoltServerManager
 	krcPruner  *KRCPruner
 
-	// disabledPatrols is loaded from town settings (disabled_patrols field).
-	// Provides a simple way to disable individual patrol dogs without editing
-	// mayor/daemon.json. Checked by isPatrolActive alongside patrolConfig.
-	disabledPatrols map[string]bool
-
 	// Mass death detection: track recent session deaths
 	deathsMu     sync.Mutex
 	recentDeaths []sessionDeath
@@ -180,17 +175,6 @@ func New(config *Config) (*Daemon, error) {
 		}
 	}
 
-	// Load disabled_patrols from town settings (settings/config.json).
-	// This provides a simpler way to disable patrols than editing daemon.json.
-	disabledPatrols := loadDisabledPatrolsFromTownSettings(config.TownRoot)
-	if len(disabledPatrols) > 0 {
-		names := make([]string, 0, len(disabledPatrols))
-		for k := range disabledPatrols {
-			names = append(names, k)
-		}
-		logger.Printf("Patrols disabled via town settings: %v", names)
-	}
-
 	// Initialize Dolt server manager if configured
 	var doltServer *DoltServerManager
 	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoltServer != nil {
@@ -283,19 +267,18 @@ func New(config *Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		config:          config,
-		patrolConfig:    patrolConfig,
-		disabledPatrols: disabledPatrols,
-		tmux:            tmux.NewTmux(),
-		logger:          logger,
-		ctx:             ctx,
-		cancel:          cancel,
-		doltServer:      doltServer,
-		gtPath:          gtPath,
-		bdPath:          bdPath,
-		restartTracker:  restartTracker,
-		otelProvider:    otelProvider,
-		metrics:         dm,
+		config:         config,
+		patrolConfig:   patrolConfig,
+		tmux:           tmux.NewTmux(),
+		logger:         logger,
+		ctx:            ctx,
+		cancel:         cancel,
+		doltServer:     doltServer,
+		gtPath:         gtPath,
+		bdPath:         bdPath,
+		restartTracker: restartTracker,
+		otelProvider:   otelProvider,
+		metrics:        dm,
 	}, nil
 }
 
@@ -429,7 +412,7 @@ func (d *Daemon) Run() error {
 	// to periodically push databases to their git remotes.
 	var doltRemotesTicker *time.Ticker
 	var doltRemotesChan <-chan time.Time
-	if d.isPatrolActive("dolt_remotes") {
+	if IsPatrolEnabled(d.patrolConfig, "dolt_remotes") {
 		interval := doltRemotesInterval(d.patrolConfig)
 		doltRemotesTicker = time.NewTicker(interval)
 		doltRemotesChan = doltRemotesTicker.C
@@ -441,7 +424,7 @@ func (d *Daemon) Run() error {
 	// Runs filesystem backup sync (dolt backup sync) for production databases.
 	var doltBackupTicker *time.Ticker
 	var doltBackupChan <-chan time.Time
-	if d.isPatrolActive("dolt_backup") {
+	if IsPatrolEnabled(d.patrolConfig, "dolt_backup") {
 		interval := doltBackupInterval(d.patrolConfig)
 		doltBackupTicker = time.NewTicker(interval)
 		doltBackupChan = doltBackupTicker.C
@@ -453,7 +436,7 @@ func (d *Daemon) Run() error {
 	// Exports issues to JSONL, scrubs ephemeral data, pushes to git repo.
 	var jsonlGitBackupTicker *time.Ticker
 	var jsonlGitBackupChan <-chan time.Time
-	if d.isPatrolActive("jsonl_git_backup") {
+	if IsPatrolEnabled(d.patrolConfig, "jsonl_git_backup") {
 		interval := jsonlGitBackupInterval(d.patrolConfig)
 		jsonlGitBackupTicker = time.NewTicker(interval)
 		jsonlGitBackupChan = jsonlGitBackupTicker.C
@@ -465,7 +448,7 @@ func (d *Daemon) Run() error {
 	// Closes stale wisps (abandoned molecule steps, old patrol data) across all databases.
 	var wispReaperTicker *time.Ticker
 	var wispReaperChan <-chan time.Time
-	if d.isPatrolActive("wisp_reaper") {
+	if IsPatrolEnabled(d.patrolConfig, "wisp_reaper") {
 		interval := wispReaperInterval(d.patrolConfig)
 		wispReaperTicker = time.NewTicker(interval)
 		wispReaperChan = wispReaperTicker.C
@@ -477,7 +460,7 @@ func (d *Daemon) Run() error {
 	// Health monitor: TCP check, latency, DB count, gc, zombie detection, backup/disk checks.
 	var doctorDogTicker *time.Ticker
 	var doctorDogChan <-chan time.Time
-	if d.isPatrolActive("doctor_dog") {
+	if IsPatrolEnabled(d.patrolConfig, "doctor_dog") {
 		interval := doctorDogInterval(d.patrolConfig)
 		doctorDogTicker = time.NewTicker(interval)
 		doctorDogChan = doctorDogTicker.C
@@ -489,7 +472,7 @@ func (d *Daemon) Run() error {
 	// Flattens Dolt commit history to reclaim graph storage (daily).
 	var compactorDogTicker *time.Ticker
 	var compactorDogChan <-chan time.Time
-	if d.isPatrolActive("compactor_dog") {
+	if IsPatrolEnabled(d.patrolConfig, "compactor_dog") {
 		interval := compactorDogInterval(d.patrolConfig)
 		compactorDogTicker = time.NewTicker(interval)
 		compactorDogChan = compactorDogTicker.C
@@ -501,7 +484,7 @@ func (d *Daemon) Run() error {
 	// Auto-commits WIP changes in active polecat worktrees to prevent data loss.
 	var checkpointDogTicker *time.Ticker
 	var checkpointDogChan <-chan time.Time
-	if d.isPatrolActive("checkpoint_dog") {
+	if IsPatrolEnabled(d.patrolConfig, "checkpoint_dog") {
 		interval := checkpointDogInterval(d.patrolConfig)
 		checkpointDogTicker = time.NewTicker(interval)
 		checkpointDogChan = checkpointDogTicker.C
@@ -514,7 +497,7 @@ func (d *Daemon) Run() error {
 	// runs `gt maintain --force` when commit counts exceed threshold.
 	var scheduledMaintenanceTicker *time.Ticker
 	var scheduledMaintenanceChan <-chan time.Time
-	if d.isPatrolActive("scheduled_maintenance") {
+	if IsPatrolEnabled(d.patrolConfig, "scheduled_maintenance") {
 		interval := maintenanceCheckInterval(d.patrolConfig)
 		scheduledMaintenanceTicker = time.NewTicker(interval)
 		scheduledMaintenanceChan = scheduledMaintenanceTicker.C
@@ -527,7 +510,7 @@ func (d *Daemon) Run() error {
 	// Periodically runs quality gates on each rig's main branch to catch regressions.
 	var mainBranchTestTicker *time.Ticker
 	var mainBranchTestChan <-chan time.Time
-	if d.isPatrolActive("main_branch_test") {
+	if IsPatrolEnabled(d.patrolConfig, "main_branch_test") {
 		interval := mainBranchTestInterval(d.patrolConfig)
 		mainBranchTestTicker = time.NewTicker(interval)
 		mainBranchTestChan = mainBranchTestTicker.C
@@ -688,7 +671,7 @@ func (d *Daemon) heartbeat(state *State) {
 
 	// 1. Ensure Deacon is running (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
-	if d.isPatrolActive("deacon") {
+	if IsPatrolEnabled(d.patrolConfig, "deacon") {
 		d.ensureDeaconRunning()
 	} else {
 		d.logger.Printf("Deacon patrol disabled in config, skipping")
@@ -701,20 +684,20 @@ func (d *Daemon) heartbeat(state *State) {
 	// 2. Poke Boot for intelligent triage (stuck/nudge/interrupt)
 	// Boot handles nuanced "is Deacon responsive" decisions
 	// Only run if Deacon patrol is enabled
-	if d.isPatrolActive("deacon") {
+	if IsPatrolEnabled(d.patrolConfig, "deacon") {
 		d.ensureBootRunning()
 	}
 
 	// 3. Direct Deacon heartbeat check (belt-and-suspenders)
 	// Boot may not detect all stuck states; this provides a fallback
 	// Only run if Deacon patrol is enabled
-	if d.isPatrolActive("deacon") {
+	if IsPatrolEnabled(d.patrolConfig, "deacon") {
 		d.checkDeaconHeartbeat()
 	}
 
 	// 4. Ensure Witnesses are running for all rigs (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
-	if d.isPatrolActive("witness") {
+	if IsPatrolEnabled(d.patrolConfig, "witness") {
 		d.ensureWitnessesRunning()
 	} else {
 		d.logger.Printf("Witness patrol disabled in config, skipping")
@@ -725,7 +708,7 @@ func (d *Daemon) heartbeat(state *State) {
 	// 5. Ensure Refineries are running for all rigs (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
 	// Pressure-gated: refineries consume API credits, defer when system is loaded.
-	if d.isPatrolActive("refinery") {
+	if IsPatrolEnabled(d.patrolConfig, "refinery") {
 		if p := d.checkPressure("refinery"); !p.OK {
 			d.logger.Printf("Deferring refinery spawn: %s", p.Reason)
 		} else {
@@ -742,7 +725,7 @@ func (d *Daemon) heartbeat(state *State) {
 
 	// 6.5. Handle Dog lifecycle: cleanup stuck dogs and dispatch plugins
 	// Pressure-gated: dog dispatch spawns new agent sessions.
-	if d.isPatrolActive("handler") {
+	if IsPatrolEnabled(d.patrolConfig, "handler") {
 		if p := d.checkPressure("dog"); !p.OK {
 			d.logger.Printf("Deferring dog dispatch: %s", p.Reason)
 			// Still run cleanup phases (stuck/stale/idle) — only skip dispatch

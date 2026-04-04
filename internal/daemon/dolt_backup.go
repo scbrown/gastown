@@ -38,7 +38,7 @@ func (d *Daemon) syncDoltBackups() {
 	if runtime.GOOS != "darwin" {
 		return
 	}
-	if !d.isPatrolActive("dolt_backup") {
+	if !IsPatrolEnabled(d.patrolConfig, "dolt_backup") {
 		return
 	}
 

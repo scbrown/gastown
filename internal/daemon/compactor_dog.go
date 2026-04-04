@@ -117,7 +117,7 @@ func compactorDogKeepRecent(config *DaemonPatrolConfig) int {
 // (4) concurrent write retry with error classification, (5) row count integrity
 // verification. See mol-dog-compactor.formula.toml for full rationale.
 func (d *Daemon) runCompactorDog() {
-	if !d.isPatrolActive("compactor_dog") {
+	if !IsPatrolEnabled(d.patrolConfig, "compactor_dog") {
 		return
 	}
 
