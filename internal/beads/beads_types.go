@@ -119,9 +119,13 @@ func EnsureCustomTypes(beadsDir string) error {
 	// The sentinel stores the types that were configured. If types have changed
 	// (e.g., "queue" and "event" added), the sentinel won't match and we'll
 	// re-configure. Legacy "v1\n" sentinels also won't match.
+	//
+	// Also check if the bd binary has been upgraded since the sentinel was written.
+	// bd upgrades can reset custom type configuration, making the sentinel a stale
+	// cache that masks the missing config (aegis-715k).
 	sentinelPath := filepath.Join(beadsDir, typesSentinel)
 	if data, err := os.ReadFile(sentinelPath); err == nil {
-		if strings.TrimSpace(string(data)) == typesList {
+		if strings.TrimSpace(string(data)) == typesList && !bdBinaryNewerThan(sentinelPath) {
 			ensuredDirs[beadsDir] = true
 			return nil
 		}
@@ -178,6 +182,25 @@ func EnsureCustomTypes(beadsDir string) error {
 	return nil
 }
 
+// bdBinaryNewerThan returns true if the bd binary has been modified more
+// recently than the given file path. This detects bd upgrades that may have
+// reset custom type configuration, invalidating the sentinel cache.
+func bdBinaryNewerThan(path string) bool {
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		return true // Can't stat sentinel, assume stale
+	}
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		return false // No bd binary, can't be newer
+	}
+	bdInfo, err := os.Stat(bdPath)
+	if err != nil {
+		return false
+	}
+	return bdInfo.ModTime().After(pathInfo.ModTime())
+}
+
 // EnsureCustomStatuses ensures the target beads directory has custom statuses configured.
 // Uses the same two-level caching strategy as EnsureCustomTypes:
 //   - In-memory cache for multiple operations in the same CLI invocation
@@ -201,10 +224,11 @@ func EnsureCustomStatuses(beadsDir string) error {
 		return nil
 	}
 
-	// Fast path: sentinel file matches current statuses list
+	// Fast path: sentinel file matches current statuses list.
+	// Also invalidate if bd binary is newer than sentinel (aegis-715k).
 	sentinelPath := filepath.Join(beadsDir, statusesSentinel)
 	if data, err := os.ReadFile(sentinelPath); err == nil {
-		if strings.TrimSpace(string(data)) == statusesList {
+		if strings.TrimSpace(string(data)) == statusesList && !bdBinaryNewerThan(sentinelPath) {
 			ensuredDirs[cacheKey] = true
 			return nil
 		}
