@@ -1,0 +1,295 @@
+description = """
+Ontology ingestion molecule — extract entities and relationships from source
+material and POST to the Graphiti knowledge graph API.
+
+This molecule is designed for Haiku-tier polecats. The polecat IS the LLM that
+performs knowledge extraction — Graphiti only stores and embeds, it never calls
+an external LLM.
+
+## Extraction Model
+
+The polecat reads source material (bead descriptions, HLA directives, service
+health events, handoff mails) and extracts:
+- **Entity nodes**: services, hosts, people, concepts with labels and summaries
+- **Entity edges**: typed relationships with natural-language facts
+
+The extracted graph is POSTed to Graphiti's /episodes/complete endpoint, which
+generates local embeddings (sentence-transformers) and writes to FalkorDB.
+
+## Context Loading
+
+At prime time, the polecat MUST load the extraction guide:
+```bash
+cat docs/ontology-extraction-guide.md
+```
+This file defines the complete label taxonomy, relationship vocabulary, and
+extraction rules. It is the polecat's schema reference.
+
+If Graphiti MCP is configured (mcpServers.graphiti), use search_entities to
+check for existing nodes before creating new ones (dedup).
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | hook_bead | The source bead/event to extract from |
+| graphiti_url | rig config | Graphiti API URL (default: http://graphiti.svc:8000) |
+| group_id | sling vars | Graph partition (default: aegis-ontology) |
+
+## Design Principles
+
+- **Haiku tier**: extraction is structured, template-driven work
+- **Idempotent**: episode name includes source bead ID, re-runs are safe
+- **No LLM in Graphiti**: the polecat does all intelligence, API just stores
+- **Fail fast**: if extraction produces nothing useful, close cleanly"""
+formula = "mol-ontology-ingest"
+version = 1
+
+[[steps]]
+id = "load-source"
+title = "Load source material"
+tier = "haiku"
+description = """
+Read the source material to extract knowledge from.
+
+**1. Prime, load extraction guide, check hook:**
+```bash
+gt prime
+cat docs/ontology-extraction-guide.md   # REQUIRED — your label/relationship schema
+gt hook
+bd show {{issue}}
+```
+
+**2. Gather full context (MANDATORY — do ALL of these):**
+
+```bash
+# Read bead with all comments
+bd show {{issue}}
+
+# Check bead dependencies and blockers
+bd deps {{issue}} 2>/dev/null || true
+
+# Check assignee for crew context
+bd show {{issue}} --json 2>/dev/null | python3 -c "import json,sys; b=json.load(sys.stdin); print('Assignee:', b.get('assignee','')); print('Owner:', b.get('owner','')); print('Labels:', b.get('labels',[]))" 2>/dev/null || true
+```
+
+**Extract and follow ALL references in the bead text:**
+
+- **Git commits**: For EVERY commit hash (7+ hex chars) found in the description or comments:
+  ```bash
+  git show <hash> --stat    # what files changed
+  git show <hash>           # full diff + commit message
+  ```
+- **File paths**: For every file path mentioned, read it:
+  ```bash
+  cat <filepath>            # or Read tool
+  ```
+- **Design docs**: If `docs/` paths are referenced, read them
+- **Bead references**: If other bead IDs (aegis-xxx) are mentioned:
+  ```bash
+  bd show <other-bead-id>   # get cross-referenced context
+  ```
+- **Handoff mails**: If handoff mail IDs (hq-xxx) are referenced:
+  ```bash
+  gt mail read <mail-id>
+  ```
+
+**3. Query existing ontology for dedup (MANDATORY):**
+
+Use the Graphiti MCP tools (search_nodes, search_memory_facts) to check
+what already exists in the graph. This prevents duplicate nodes:
+```
+# Via MCP tools (preferred — available in crew agent configs):
+search_nodes("koror")           → see if koror node exists already
+search_nodes("FalkorDB")        → see if FalkorDB node exists
+search_memory_facts("runs on")  → see existing relationship patterns
+```
+
+If MCP is not available, query FalkorDB directly:
+```bash
+ssh root@192.168.7.243 'redis-cli GRAPH.QUERY aegis-ontology \
+  "MATCH (n:Entity) WHERE n.name CONTAINS \"<key-term>\" RETURN n.name, n.summary"' 2>/dev/null || true
+```
+
+When an entity already exists in the graph, use the EXACT same name in
+your extraction to link to it rather than creating a duplicate.
+
+**4. Collect all factual claims** about entities, relationships, events,
+commits, file changes, and temporal context (dates, who did what when)
+
+**3. Identify the source type** (determines group_id prefix):
+- `bead-closure` — a completed bead with deliverables
+- `hla-directive` — a Stiwi directive from HLA store
+- `service-event` — a service state change (deploy, incident, config)
+- `handoff` — a crew handoff with session context
+- `design` — a design doc with architectural decisions"""
+
+[[steps]]
+id = "extract"
+title = "Extract entities and relationships"
+needs = ["load-source"]
+tier = "haiku"
+description = """
+Extract structured knowledge from the source material.
+
+**Entity extraction rules:**
+- Name entities concretely: "FalkorDB" not "the database"
+- Use consistent labels: Service, Host, Person, Concept, Config, Rig, Container
+- Write summaries as factual one-liners, not descriptions
+- Deduplicate: if an entity was likely already ingested, use the same name
+
+**Edge extraction rules:**
+- Name relationships as verbs: runs_on, depends_on, owns, manages, connects_to
+- Write facts as complete sentences: "FalkorDB runs on koror as CT 243"
+- Include temporal context when relevant: "deployed on 2026-04-03"
+- Every edge must reference two nodes from your extraction
+
+**Output format** (prepare this mentally, write in next step):
+```json
+{
+  "name": "<source-type>-<bead-id>",
+  "group_id": "{{group_id}}",
+  "episode_body": "<summary of source material>",
+  "reference_time": "<ISO timestamp of event>",
+  "source_description": "<who extracted from what>",
+  "nodes": [{"name": "...", "labels": ["..."], "summary": "..."}],
+  "edges": [{"name": "...", "fact": "...", "source_node_name": "...", "target_node_name": "..."}]
+}
+```
+
+**Quality gate — HARD REQUIREMENT:**
+You MUST extract at least 3 nodes and 2 edges from every bead. Every bead
+has entities worth capturing — if you can't find them, you haven't gathered
+enough context. Go back to load-source and:
+- `git show` every commit hash
+- Read every referenced file
+- `bd show` every cross-referenced bead
+- Check bead comments for implementation details
+
+If after exhaustive context gathering you still can't extract 3+ nodes,
+add a bead comment with:
+```
+ONTOLOGY EXTRACTION FAILED: <reason>
+Context gathered: <list what you read>
+Missing: <what would help>
+```
+Then EXIT WITH ERROR — do NOT proceed to post-episode. The cron will
+retry this bead on the next run. A failed extraction is better than a
+thin one that creates duplicate or useless nodes."""
+
+[[steps]]
+id = "post-episode"
+title = "POST extracted episode to Graphiti"
+needs = ["extract"]
+tier = "haiku"
+description = """
+Send the extracted knowledge to the Graphiti API.
+
+**POST the episode:**
+```bash
+curl -s -w '\nHTTP: %{http_code}\n' \
+  -X POST '{{graphiti_url}}/episodes/complete' \
+  -H 'Content-Type: application/json' \
+  -d '<your JSON from extract step>'
+```
+
+**Expected response**: HTTP 201 with episode_uuid, nodes[], edges[]
+
+**Error handling:**
+- 422: edge references unknown node name — fix the extraction
+- 500: check if Graphiti service is healthy (`curl {{graphiti_url}}/docs`)
+- Timeout: Graphiti may be loading the embedder model on first use (~10s)
+
+**Verify in FalkorDB** (optional, for confidence):
+```bash
+# On the goldblum controller:
+ssh root@192.168.7.243 'redis-cli GRAPH.QUERY {{group_id}} \
+  "MATCH (n:Entity) RETURN n.name, n.summary LIMIT 10"'
+```"""
+
+[[steps]]
+id = "feedback"
+title = "Inject ontology context back into bead and agent"
+needs = ["post-episode"]
+tier = "haiku"
+description = """
+After a successful POST, feed the extracted context BACK into the bead and
+the assigned agent. This closes the knowledge loop — the agent working on
+the bead benefits from understanding what entities are involved.
+
+**1. Format the context summary:**
+
+Build a structured summary from what you extracted:
+```
+🧠 Ontology context (<mode>):
+Entities: <name> (<label>), <name> (<label>), ...
+Relationships:
+  - <source> <relationship> <target>
+  - ...
+Episode: <episode_name> (<N> nodes, <M> edges)
+```
+
+Where `<mode>` is "creation" for new beads or "closure" for closed beads.
+
+**2. Add rich comment to the bead:**
+```bash
+bd comments add {{issue}} "🧠 Ontology context (<mode>):
+Entities: <comma-separated name (label) pairs>
+Relationships:
+  - <source> <rel> <target>
+  - ...
+Episode: <name> (<N> nodes, <M> edges)"
+```
+
+**3. Mail the assigned agent (if any):**
+```bash
+# Check who is assigned
+ASSIGNEE=$(bd show {{issue}} --json 2>/dev/null | python3 -c "import json,sys; b=json.load(sys.stdin); print(b.get('assignee',''))" 2>/dev/null || true)
+
+# If assigned, mail them the context
+if [[ -n "$ASSIGNEE" ]]; then
+  gt mail send "$ASSIGNEE" --subject "Ontology context for {{issue}}" --body "$(cat <<MAILEOF
+Your bead {{issue}} has been analyzed by the ontology pipeline.
+
+<paste the same structured summary here>
+
+This context may help you understand the entities and relationships
+involved. When you close this bead, a closure extraction will capture
+what you discovered and link it to these entities.
+MAILEOF
+)"
+fi
+```
+
+**4. Add tracking label:**
+```bash
+# For new bead ingestion:
+bd label add {{issue}} ontology-context-injected 2>/dev/null || true
+
+# For closed bead ingestion:
+bd label add {{issue}} ontology-closed-context-injected 2>/dev/null || true
+```
+
+The label tells the cron trigger this bead has been fully processed
+(extraction + feedback)."""
+
+[[steps]]
+id = "close"
+title = "Record results and clean up"
+needs = ["feedback"]
+tier = "haiku"
+description = """
+**Verify the feedback was applied:**
+```bash
+bd show {{issue}} --json 2>/dev/null | python3 -c "
+import json, sys
+b = json.load(sys.stdin)
+labels = b.get('labels', [])
+print('Context injected:', 'ontology-context-injected' in labels or 'ontology-closed-context-injected' in labels)
+"
+```
+
+**Then self-clean:**
+```bash
+gt done
+```"""

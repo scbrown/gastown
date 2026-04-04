@@ -228,7 +228,7 @@ func (t *Tmux) run(args ...string) (string, error) {
 		allArgs = append(allArgs, "-L", t.socketName)
 	}
 	allArgs = append(allArgs, args...)
-	cmd := exec.Command("tmux", allArgs...)
+	cmd := exec.CommandContext(ctx, "tmux", allArgs...)
 	hideConsoleWindow(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
