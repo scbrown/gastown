@@ -1,0 +1,759 @@
+description = """
+Reflective polecat work lifecycle with docs-update, knowledge capture, and introspection.
+
+Extends the standard mol-polecat-work workflow (v10) with three additional steps
+between build-check and pre-verify:
+
+1. **docs-update** — Update CLAUDE.md/CONTRIBUTING.md/README.md if implementation
+   changed user/developer-facing behavior
+2. **knowledge-capture** — Create ontology episodes and bobbin bundles for knowledge
+   learned during implementation
+3. **introspection** — Reflect on friction encountered and file improvement beads
+   for formulas, tooling (bobbin, quipu, gastown, beads), and context gaps
+
+The load-context step is also enhanced to leverage bobbin search, bundles, and
+ontology queries for richer initial context.
+
+## Polecat Contract (Self-Cleaning Model)
+
+You are a self-cleaning worker. You:
+1. Receive work via your hook (formula checklist + issue)
+2. Work through formula steps in order (shown inline at prime time)
+3. Complete and self-clean via `gt done` (submit + nuke yourself)
+4. You are GONE - Refinery merges from MQ
+
+**Self-cleaning:** When you run `gt done`, you push your work, submit to MQ,
+nuke your sandbox, and exit. There is no idle state. Done means gone.
+
+**Important:** This formula defines the workflow template. Steps are shown inline
+when you run `gt prime` — there are no separate step beads to close. Work through
+the checklist, then run `gt done`.
+
+**Speed principle:** You run the full gate suite AFTER rebasing onto the target
+branch (pre-verify step). This enables the refinery to fast-path merge your MR
+in ~5 seconds instead of re-running gates. If pre-verification is skipped or
+stale, the refinery falls through to normal gate execution.
+
+**You do NOT:**
+- Push directly to main (Refinery merges from MQ)
+- Close your own issue (Refinery closes after merge)
+- Wait for merge (you're gone after `gt done`)
+- Fix pre-existing failures on main (Refinery owns main health)
+
+## Variables
+
+| Variable | Source | Description |
+|----------|--------|-------------|
+| issue | hook_bead | The issue ID you're assigned to work on |
+| base_branch | sling vars | The base branch to rebase on (default: main) |
+| setup_command | rig config | Setup/install command (e.g., `pnpm install`). Empty = skip. |
+| typecheck_command | rig config | Type check command (e.g., `tsc --noEmit`). Empty = skip. |
+| test_command | rig config | Test command. Empty = skip. Rig must configure for its language. |
+| lint_command | rig config | Lint command (e.g., `eslint .`). Empty = skip. |
+| build_command | rig config | Build command (e.g., `go build ./...`). Empty = skip. |
+
+## Failure Modes
+
+| Situation | Action |
+|-----------|--------|
+| Build fails | Fix it. Do not proceed if it won't compile. |
+| Blocked on external | Mail Witness for help, mark yourself stuck |
+| Context filling | Use gt handoff to cycle to fresh session |
+| Unsure what to do | Mail Witness, don't guess |
+| Bobbin/ontology unavailable | Skip those queries, proceed with base context |"""
+formula = "mol-polecat-work-reflective"
+version = 1
+
+[[steps]]
+id = "load-context"
+title = "Load context and verify assignment (with bobbin + ontology)"
+description = """
+Initialize your session, understand your assignment, and gather rich context
+from bobbin and the ontology.
+
+**1. Prime your environment:**
+```bash
+gt prime                    # Load role context
+bd prime                    # Load beads context
+```
+
+**2. Check your hook:**
+```bash
+gt hook               # Shows your pinned molecule and hook_bead
+```
+
+The hook_bead is your assigned issue. Read it carefully:
+```bash
+bd show {{issue}}           # Full issue details
+```
+
+**3. Check inbox for additional context:**
+```bash
+gt mail inbox
+# Read any HANDOFF or assignment messages
+```
+
+**4. Check for prior merge failure context:**
+
+If the bead notes contain "MERGE REJECTION", a previous polecat's work was
+rejected by the refinery. Read the failure details carefully:
+- **Failure-Type**: what broke (tests, build, lint, typecheck)
+- **Error**: the actual error output
+- **Branch**: the previous branch may still exist with the original work
+
+If a prior branch exists, check it out instead of creating a new one:
+```bash
+git fetch origin
+git branch -a | grep <branch-from-notes>
+# If it exists: git checkout <branch> && git rebase origin/{{base_branch}}
+```
+
+**5. Search bobbin for relevant context:**
+
+Use bobbin to find related code, prior work, and existing knowledge:
+```bash
+# Semantic search for the problem space
+bobbin search "<bead title or key terms>"
+
+# Get task-aware context assembly
+bobbin context "<bead description summary>"
+
+# Check for related files and coupling patterns
+bobbin related <primary-file-if-known>
+bobbin impact <primary-file-if-known>
+```
+
+**6. Check for existing bundles:**
+
+Bundles are curated knowledge anchors that give you instant deep context:
+```bash
+bobbin bundle list                        # L0: see all available bundles
+bobbin bundle show <relevant-bundle>      # L1: outline with signatures
+bobbin bundle show <bundle> --deep        # L2: full context (use sparingly)
+```
+
+If the bead references a bundle (look for `b:<slug>` in labels or description),
+load it with `bobbin bundle show`. If no bundle exists but you can identify the
+subsystem, note it — you may create one in the knowledge-capture step later.
+
+**7. Query the ontology for operational context:**
+
+The ontology knows service dependencies, infrastructure topology, and prior
+operational decisions:
+```bash
+# Via Graphiti REST (current):
+curl -s http://graphiti.svc/search/nodes -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"query": "<service or component being modified>", "group_ids": ["aegis-ontology"]}'
+
+# Via Quipu MCP tools (when available via bobbin serve):
+# quipu_query, quipu_cord
+```
+
+This surfaces dependencies, constraints, and prior decisions that may affect
+your implementation. Skip if graphiti.svc is unreachable.
+
+**8. Understand the requirements:**
+- What exactly needs to be done?
+- What files are likely involved? (bobbin search + bundles should have helped)
+- Are there dependencies or blockers? (ontology should have helped)
+- What does "done" look like?
+- If this is a rework: what specifically failed and why?
+
+**9. Verify you can proceed:**
+- No unresolved blockers on the issue
+- You understand what to do
+- Required resources are available
+
+If blocked or unclear, mail Witness immediately:
+```bash
+gt mail send <rig>/witness -s "HELP: Unclear requirements" -m "Issue: {{issue}}
+Question: <what you need clarified>"
+```
+
+**Exit criteria:** You understand the work, have gathered context from bobbin and
+ontology, and can begin implementation."""
+
+[[steps]]
+id = "branch-setup"
+title = "Set up working branch"
+needs = ["load-context"]
+description = """
+Ensure you're on a clean feature branch ready for work.
+
+**1. Check current branch state:**
+```bash
+git status
+git branch --show-current
+```
+
+**2. Check for a prior branch from a rejected MR:**
+
+If the bead notes contain "MERGE REJECTION" with a branch name, check if that
+branch still exists on the remote. Reusing it preserves all previous work:
+```bash
+git fetch origin
+# Check for prior branch
+git branch -r | grep <prior-branch>
+# If found, check it out:
+git checkout -b <prior-branch> origin/<prior-branch>
+git rebase origin/{{base_branch}}
+```
+
+**If no prior branch, create a fresh one:**
+```bash
+git fetch origin
+git checkout -b polecat/<name> origin/{{base_branch}}
+```
+
+**3. Ensure clean working state:**
+```bash
+git status                  # Should show "working tree clean"
+git stash list              # Should be empty
+```
+
+If dirty state from previous work:
+```bash
+# If changes are relevant to this issue:
+git add -A && git commit -m "WIP: <description>"
+
+# If changes are unrelated cruft:
+git stash push -m "unrelated changes before {{issue}}"
+# Or discard if truly garbage:
+git checkout -- .
+```
+
+**4. Sync with {{base_branch}}:**
+```bash
+git fetch origin
+git rebase origin/{{base_branch}}      # Get latest, rebase your branch
+```
+
+If rebase conflicts:
+- Resolve them carefully
+- If stuck, mail Witness
+
+**5. Run project setup (if configured):**
+
+If setup_command is set, run it to install dependencies:
+```bash
+{{setup_command}}
+```
+
+This ensures dependencies are installed before you start work.
+Empty setup_command means "not configured" — skip this step.
+
+**Exit criteria:** You're on a clean feature branch, rebased on latest {{base_branch}}, dependencies installed."""
+
+[[steps]]
+id = "implement"
+title = "Implement the solution"
+needs = ["branch-setup"]
+description = """
+Do the actual implementation work.
+
+**Working principles:**
+- Follow existing codebase conventions
+- Make atomic, focused commits
+- Keep changes scoped to the assigned issue
+- Don't gold-plate or scope-creep
+
+**Persist findings as you go (CRITICAL for session survival):**
+Your session can die at any time (context limit, crash, SIGKILL). Code changes
+survive in git, but analysis, findings, and decisions exist only in your context
+window. Persist them to the bead so they survive session death:
+```bash
+# After completing significant analysis or reaching conclusions:
+bd update {{issue}} --notes "Findings so far: <what you discovered>"
+# For detailed reports, use --design:
+bd update {{issue}} --design "<structured findings>"
+```
+Do this BEFORE closing molecule steps, not after. If your session dies between
+persisting and closing, the findings survive. If you close first, they're lost.
+
+**For report-only tasks** (audits, reviews, research): your findings ARE the
+deliverable. There are no code changes to commit. You MUST persist all findings
+to the bead via --notes or --design. Without this, your entire work product is
+lost when the session ends.
+
+**Commit frequently (for code tasks):**
+```bash
+# After each logical unit of work:
+git add <files>
+git commit -m "<type>: <description> ({{issue}})"
+```
+
+Commit types: feat, fix, refactor, test, docs, chore
+
+**Discovered work:**
+If you find bugs or improvements outside your scope:
+```bash
+bd create --title "Found: <description>" --type bug --priority 2
+# Note the ID, continue with your work
+```
+
+Do NOT fix unrelated issues in this branch.
+
+**If stuck:**
+Don't spin for more than 15 minutes. Mail Witness:
+```bash
+gt mail send <rig>/witness -s "HELP: Stuck on implementation" -m "Issue: {{issue}}
+Trying to: <what you're attempting>
+Problem: <what's blocking you>
+Tried: <what you've attempted>"
+```
+
+**Exit criteria (HARD GATE):** Implementation complete AND code committed to git.
+- Code tasks: `git status` shows clean working tree, `git log origin/{{base_branch}}..HEAD` shows at least 1 commit
+- Report tasks: all findings persisted to bead via --notes or --design
+Do NOT proceed to the next step with uncommitted changes."""
+
+[[steps]]
+id = "commit-changes"
+title = "Commit all implementation changes"
+needs = ["implement"]
+description = """
+Ensure ALL implementation work is committed IMMEDIATELY after implementation.
+This step exists to prevent the #1 polecat failure mode: context exhaustion
+before code is committed. Commit NOW, review and build AFTER.
+
+**CRITICAL: You MUST commit all changes from implementation.**
+NEVER use `git checkout -- .` or `git restore .` to discard implementation work.
+ALWAYS commit ALL uncommitted changes from your implementation.
+
+**1. Check for uncommitted changes:**
+```bash
+git status
+```
+
+**2. If there are ANY uncommitted changes, commit them now:**
+```bash
+git add -A && git commit -m "<type>: <descriptive message> ({{issue}})"
+```
+
+**3. If working tree is already clean, that's fine — but you MUST still have commits (step 4).**
+
+**4. VERIFY commits exist (HARD GATE — do NOT close this step without passing):**
+```bash
+git log origin/{{base_branch}}..HEAD --oneline
+```
+
+This MUST show at least 1 commit. If it shows NOTHING:
+- You have NOT completed your implementation. Do NOT close this step.
+- Go back to the implement step and do the work.
+- If the task genuinely requires no code changes (already fixed upstream, etc.),
+  run `gt done --status DEFERRED` and skip remaining steps.
+- Do NOT proceed to review or build with zero commits.
+
+**5. VERIFY clean working tree:**
+```bash
+git status
+```
+Must show "nothing to commit, working tree clean".
+
+**Report-only tasks (audits, reviews, research — no code changes):**
+If your task produced no code changes, verify your findings are persisted to the bead:
+```bash
+bd show {{issue}}    # Check notes/design fields have your findings
+```
+If findings are persisted, proceed to review. Report-only tasks with findings
+persisted can skip commit verification.
+
+**Exit criteria:** Working tree clean AND either (a) at least 1 commit ahead of origin/{{base_branch}}, or (b) report-only task with findings persisted to bead."""
+
+[[steps]]
+id = "self-review"
+title = "Self-review changes"
+needs = ["commit-changes"]
+description = """
+Review your own changes before the build check. Use `/review --branch` for
+structured grading, or do a manual review.
+
+**Option A: Use /review (recommended)**
+```bash
+/review --branch
+```
+This gives you a structured grade (A-F) with CRITICAL/MAJOR/MINOR findings
+and specific fix suggestions. Fix any CRITICAL or MAJOR issues before proceeding.
+
+**Option B: Manual review**
+
+**1. Review the diff:**
+```bash
+git diff origin/{{base_branch}}...HEAD     # All changes vs {{base_branch}}
+git log --oneline origin/{{base_branch}}..HEAD  # All commits
+```
+
+**2. Check for common issues:**
+
+| Category | Look For |
+|----------|----------|
+| Bugs | Off-by-one, null handling, edge cases |
+| Security | Injection, auth bypass, exposed secrets |
+| Style | Naming, formatting, code organization |
+| Completeness | Missing error handling, incomplete paths |
+| Cruft | Debug prints, commented code, TODOs |
+
+**3. Fix issues found:**
+Don't just note them - fix them now. Amend or add commits as needed.
+
+**4. Verify no unintended changes:**
+```bash
+git diff --stat origin/{{base_branch}}...HEAD
+# Only files relevant to {{issue}} should appear
+```
+
+If you accidentally modified unrelated files, remove those changes.
+
+**Exit criteria:** Changes are clean, reviewed (Grade B or better if using /review),
+and ready for build check."""
+
+[[steps]]
+id = "build-check"
+title = "Build and sanity check"
+needs = ["self-review"]
+description = """
+Verify your changes compile and pass basic sanity checks. The Refinery's
+bisecting merge queue runs the full test suite — your job is to catch
+obvious problems fast so you don't waste the MQ's time.
+
+**1. Build (REQUIRED — must pass):**
+
+If build_command is set:
+```bash
+{{build_command}}
+```
+
+If setup_command is set (ensure new deps are installed):
+```bash
+{{setup_command}}
+```
+
+If typecheck_command is set:
+```bash
+{{typecheck_command}}
+```
+
+Empty commands mean "not configured" — skip silently.
+
+**2. If build fails:**
+- Fix it. Return to implement step if needed.
+- Do NOT submit broken code to the merge queue.
+
+**3. Targeted tests (OPTIONAL — run if fast and relevant):**
+
+If you modified or added test files, run those specific tests to catch
+obvious regressions. Do NOT run the full test suite — that's the
+Refinery's job.
+
+```bash
+# Example: run only tests in packages you changed
+go test ./internal/pkg/you/changed/...
+# Or for JS: npx jest --testPathPattern="changed-file"
+```
+
+If you're unsure which tests are relevant, skip this — the MQ will catch it.
+
+**4. Lint (OPTIONAL — run if configured and fast):**
+
+If lint_command is set:
+```bash
+{{lint_command}}
+```
+
+**Exit criteria:** Code compiles. Obvious regressions caught. Ready for reflection steps."""
+
+[[steps]]
+id = "docs-update"
+title = "Update project documentation"
+needs = ["build-check"]
+description = """
+Check if your implementation changed anything user/developer-facing that
+requires documentation updates. Time-boxed: ~2 minutes max.
+
+**1. Scan what you changed:**
+```bash
+git diff --name-only origin/{{base_branch}}...HEAD
+```
+
+**2. Evaluate impact on docs:**
+
+| Change Type | Doc Target |
+|---|---|
+| Public APIs, CLI commands, config formats | README.md |
+| Build/test/lint procedures, dev workflow | CONTRIBUTING.md |
+| Architecture, conventions, key patterns | CLAUDE.md |
+
+**3. If docs updates needed:**
+- Make targeted edits (don't rewrite entire files)
+- Commit: `git commit -m "docs: update project docs ({{issue}})"`
+
+**4. If no docs updates needed:** Note why and proceed. Don't force unnecessary
+changes. Purely internal refactors, bugfixes, or test-only changes typically
+need no doc updates.
+
+**Constraints:**
+- Don't add boilerplate or filler
+- Only update docs where implementation genuinely changed something visible
+- If purely internal changes, skip immediately
+
+**Exit criteria:** Docs are current with implementation, or explicitly determined
+to need no updates."""
+
+[[steps]]
+id = "knowledge-capture"
+title = "Capture knowledge: ontology episodes + bobbin bundles"
+needs = ["docs-update"]
+description = """
+Capture what you learned during implementation into shared knowledge systems.
+Time-boxed: ~2 minutes max.
+
+**1. Evaluate whether an ontology episode is warranted:**
+
+Create an episode if you discovered or changed:
+- Service dependencies (A depends on B, A routes to C)
+- Infrastructure facts (container configs, networking, DNS, Traefik routes)
+- Operational constraints (must-not-do rules, ordering requirements)
+- Component relationships (runs_on, managed_by, monitors, deployed_on)
+
+```bash
+# Via Graphiti REST:
+curl -s http://graphiti.svc/episodes/complete -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "{{issue}}: <what was learned>",
+    "episode_body": "<structured knowledge — entities, relationships, facts>",
+    "group_id": "aegis-ontology",
+    "source_description": "polecat work on {{issue}}"
+  }'
+
+# Via write_episode MCP tool (preferred when available):
+# write_episode(name, episode_body, group_id="aegis-ontology")
+```
+
+**2. Evaluate whether a bobbin bundle should be created or updated:**
+
+Create a bundle if:
+- You worked on a well-defined subsystem that lacks a bundle
+- Future polecats would benefit from curated context for this area
+- You identified key files, symbols, and coupling patterns
+
+```bash
+# Create new bundle:
+bobbin bundle create "<area/name>" \
+  -d "<what this bundle covers>" \
+  -k "<comma-separated keywords>" \
+  -f "<key-file-1>,<key-file-2>" \
+  -r "<file::Symbol1>,<file::Symbol2>"
+
+# Update existing bundle with new refs:
+bobbin bundle update "<area/name>" \
+  --add-files "<new-files>" \
+  --add-refs "<new-symbols>"
+```
+
+**3. Skip if nothing knowledge-worthy was learned.** Not every task produces
+ontology or bundle material. Pure bugfixes on well-documented, well-bundled
+code can skip this step entirely.
+
+**Constraints:**
+- Create 0-1 episodes and 0-1 bundles max per task
+- Only capture knowledge not already in the ontology or bundles
+- Prefer structured, factual content over narrative
+- If graphiti.svc or bobbin is unreachable, persist notes to the bead instead:
+  `bd update {{issue}} --notes "KNOWLEDGE: <facts for later ingestion>"`
+
+**Exit criteria:** Ontology episodes created if warranted. Bundles created/updated
+if warranted. Or explicitly determined that no knowledge capture is needed."""
+
+[[steps]]
+id = "introspection"
+title = "Reflect and file improvement beads"
+needs = ["knowledge-capture"]
+description = """
+Reflect on your work and surface actionable improvements for the system.
+Time-boxed: ~1-2 minutes. Don't philosophize — be concrete.
+
+**1. Reflect on the assignment:**
+- What was unexpectedly difficult?
+- What information was missing from the bead description?
+- What tooling/formula friction did you encounter?
+- What would have made this 2x faster?
+
+**2. Persist reflection to bead:**
+```bash
+bd update {{issue}} --notes "INTROSPECTION:
+- Difficulty: <what was hard and why>
+- Missing context: <what you wish you'd known>
+- Tooling friction: <what tools/commands didn't work well>
+- Speedup: <what would have made this faster>"
+```
+
+**3. If actionable improvements found, create improvement beads:**
+```bash
+bd create "Improve: <specific improvement>" \
+  -t task -p 3 -l polecat-feedback,<tool-label>
+```
+
+**4. Categories and labels for improvement beads:**
+
+| Category | Label(s) | Examples |
+|---|---|---|
+| Formula gaps | polecat-feedback | Missing steps, unclear instructions, wrong ordering |
+| Bobbin issues | polecat-feedback,bobbin | Search returning irrelevant results, missing bundles, stale bundles |
+| Quipu/ontology | polecat-feedback,quipu | Ontology gaps, missing relationships, query failures |
+| Gastown/GT CLI | polecat-feedback,gastown | gt/bd command issues, dispatch problems, hook bugs |
+| Beads issues | polecat-feedback,beads | bd CLI awkwardness, missing fields, status problems |
+| Context gaps | polecat-feedback | CLAUDE.md missing info, bead descriptions too vague |
+| Rig config | polecat-feedback | Missing build/test/lint commands, wrong defaults |
+
+**Constraints:**
+- File **0-3 improvement beads** max
+- Each bead must be specific and actionable (not "bobbin could be better")
+- If nothing was notably friction-ful, say "No significant friction" and move on
+
+**Exit criteria:** Reflection persisted to bead. Improvement beads filed if actionable."""
+
+[[steps]]
+id = "pre-verify"
+title = "Pre-merge rebase verification"
+needs = ["introspection"]
+description = """
+Rebase onto the target branch and run the full gate suite. This enables the
+refinery to fast-path merge your MR without re-running gates (~5s merge
+instead of minutes).
+
+**1. Fetch and rebase onto target:**
+```bash
+git fetch origin {{base_branch}}
+git rebase origin/{{base_branch}}
+```
+
+If rebase conflicts:
+- Resolve them carefully
+- Re-run the build to ensure the resolution is correct
+- If stuck, mail Witness
+
+**2. Run the full gate suite on the rebased result:**
+
+Run ALL configured gates (not just targeted tests — this is the full verification):
+
+If build_command is set:
+```bash
+{{build_command}}
+```
+
+If typecheck_command is set:
+```bash
+{{typecheck_command}}
+```
+
+If lint_command is set:
+```bash
+{{lint_command}}
+```
+
+If test_command is set:
+```bash
+{{test_command}}
+```
+
+Empty commands mean "not configured" — skip silently.
+
+**3. If any gate fails after rebase:**
+- Fix the issue, commit, and re-run from step 1
+- Do NOT proceed with --pre-verified if gates failed
+
+**4. If all gates pass:**
+You will use `gt done --pre-verified` in the next step. This tells the refinery
+that you ran the full gate suite on a rebased branch, enabling fast-path merge.
+
+**Note:** If this step takes too long or the gates are not configured for this
+project, you may skip this step and use `gt done` without --pre-verified.
+The refinery will run gates normally (slower but still correct).
+
+**Exit criteria:** Branch rebased onto latest origin/{{base_branch}}, all configured gates pass."""
+
+[[steps]]
+id = "submit-and-exit"
+title = "Submit work and self-clean"
+needs = ["pre-verify"]
+description = """
+Submit your work and clean up. You cease to exist after this step.
+
+**Self-Cleaning Model:**
+Once you run `gt done`, you're gone. The command:
+1. Pushes your branch to origin
+2. Creates an MR bead in the merge queue
+3. Nukes your sandbox (worktree removal)
+4. Exits your session immediately
+
+**Pre-flight: Verify you have actual work to submit (HARD GATE):**
+```bash
+git log origin/{{base_branch}}..HEAD --oneline
+```
+This MUST show at least 1 commit. If it shows nothing, do NOT run `gt done`.
+`gt done` will reject zero-commit branches for polecats.
+
+**Run gt done:**
+```bash
+# For code tasks with pre-verification (recommended — enables fast-path merge):
+gt done --pre-verified --target {{base_branch}}
+
+# For code tasks without pre-verification (gates skipped or failed):
+gt done --target {{base_branch}}
+
+# For report-only tasks (no commits — audits, reviews, research):
+gt done --status DEFERRED
+```
+
+You should see output like:
+```
+✓ Work submitted to merge queue
+  MR ID: gt-xxxxx
+  Source: polecat/<name>
+  Target: {{base_branch}}
+  Issue: {{issue}}
+✓ Sandbox nuked
+✓ Session exiting
+```
+
+**What happens next (not your concern):**
+- Refinery batches MRs and runs gates on the merged stack
+- If green: all MRs in the batch merge to {{base_branch}} at once
+- If red: Refinery bisects to isolate the culprit, merges the good ones
+- Refinery fixes failures itself (inline or via helper polecats)
+- Refinery closes your issue after successful merge
+
+You are NOT involved in any of that. You're gone. Done means gone.
+
+**Exit criteria:** Work submitted, sandbox nuked, session exited."""
+
+[vars]
+[vars.issue]
+description = "The issue ID assigned to this polecat"
+required = true
+
+[vars.base_branch]
+description = "The base branch to rebase on and compare against (e.g., main, integration/epic-id)"
+default = "main"
+
+[vars.setup_command]
+description = "Setup/install command (e.g., pnpm install). Empty = skip."
+default = ""
+
+[vars.typecheck_command]
+description = "Type check command (e.g., tsc --noEmit). Empty = skip."
+default = ""
+
+[vars.test_command]
+description = "Command to run tests (auto-detected from rig settings)"
+default = ""
+
+[vars.lint_command]
+description = "Command to run linting. Empty = skip."
+default = ""
+
+[vars.build_command]
+description = "Command to run build. Empty = skip."
+default = ""
