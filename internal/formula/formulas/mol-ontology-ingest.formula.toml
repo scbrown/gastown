@@ -1,10 +1,10 @@
 description = """
 Ontology ingestion molecule — extract entities and relationships from source
-material and POST to the Graphiti knowledge graph API.
+material and POST to the Quipu knowledge graph API.
 
 This molecule is designed for Haiku-tier polecats. The polecat IS the LLM that
-performs knowledge extraction — Graphiti only stores and embeds, it never calls
-an external LLM.
+performs knowledge extraction — Quipu handles storage, embedding, and optional
+LLM extraction internally.
 
 ## Extraction Model
 
@@ -13,8 +13,8 @@ health events, handoff mails) and extracts:
 - **Entity nodes**: services, hosts, people, concepts with labels and summaries
 - **Entity edges**: typed relationships with natural-language facts
 
-The extracted graph is POSTed to Graphiti's /episodes/complete endpoint, which
-generates local embeddings (sentence-transformers) and writes to FalkorDB.
+The extracted graph is POSTed to Quipu's /episode endpoint, which handles
+embedding and storage internally.
 
 ## Context Loading
 
@@ -25,7 +25,7 @@ cat docs/ontology-extraction-guide.md
 This file defines the complete label taxonomy, relationship vocabulary, and
 extraction rules. It is the polecat's schema reference.
 
-If Graphiti MCP is configured (mcpServers.graphiti), use search_entities to
+If Quipu MCP is configured (mcpServers.quipu), use search_entities to
 check for existing nodes before creating new ones (dedup).
 
 ## Variables
@@ -33,14 +33,14 @@ check for existing nodes before creating new ones (dedup).
 | Variable | Source | Description |
 |----------|--------|-------------|
 | issue | hook_bead | The source bead/event to extract from |
-| graphiti_url | rig config | Graphiti API URL (default: http://graphiti.svc:8000) |
+| quipu_url | rig config | Quipu API URL (default: http://quipu.svc) |
 | group_id | sling vars | Graph partition (default: aegis-ontology) |
 
 ## Design Principles
 
 - **Haiku tier**: extraction is structured, template-driven work
 - **Idempotent**: episode name includes source bead ID, re-runs are safe
-- **No LLM in Graphiti**: the polecat does all intelligence, API just stores
+- **No LLM in Quipu simple mode**: the polecat does all intelligence, API just stores
 - **Fail fast**: if extraction produces nothing useful, close cleanly"""
 formula = "mol-ontology-ingest"
 version = 1
@@ -96,19 +96,13 @@ bd show {{issue}} --json 2>/dev/null | python3 -c "import json,sys; b=json.load(
 
 **3. Query existing ontology for dedup (MANDATORY):**
 
-Use the Graphiti MCP tools (search_nodes, search_memory_facts) to check
+Use the Quipu MCP tools (search_nodes, search_memory_facts) to check
 what already exists in the graph. This prevents duplicate nodes:
 ```
 # Via MCP tools (preferred — available in crew agent configs):
 search_nodes("koror")           → see if koror node exists already
-search_nodes("FalkorDB")        → see if FalkorDB node exists
+search_nodes("Quipu")           → see if Quipu node exists
 search_memory_facts("runs on")  → see existing relationship patterns
-```
-
-If MCP is not available, query FalkorDB directly:
-```bash
-ssh root@192.168.7.243 'redis-cli GRAPH.QUERY aegis-ontology \
-  "MATCH (n:Entity) WHERE n.name CONTAINS \"<key-term>\" RETURN n.name, n.summary"' 2>/dev/null || true
 ```
 
 When an entity already exists in the graph, use the EXACT same name in
@@ -133,14 +127,14 @@ description = """
 Extract structured knowledge from the source material.
 
 **Entity extraction rules:**
-- Name entities concretely: "FalkorDB" not "the database"
+- Name entities concretely: "Quipu" not "the database"
 - Use consistent labels: Service, Host, Person, Concept, Config, Rig, Container
 - Write summaries as factual one-liners, not descriptions
 - Deduplicate: if an entity was likely already ingested, use the same name
 
 **Edge extraction rules:**
 - Name relationships as verbs: runs_on, depends_on, owns, manages, connects_to
-- Write facts as complete sentences: "FalkorDB runs on koror as CT 243"
+- Write facts as complete sentences: "Quipu runs on koror as a service"
 - Include temporal context when relevant: "deployed on 2026-04-03"
 - Every edge must reference two nodes from your extraction
 
@@ -148,14 +142,14 @@ Extract structured knowledge from the source material.
 ```json
 {
   "name": "<source-type>-<bead-id>",
-  "group_id": "{{group_id}}",
   "episode_body": "<summary of source material>",
-  "reference_time": "<ISO timestamp of event>",
-  "source_description": "<who extracted from what>",
-  "nodes": [{"name": "...", "labels": ["..."], "summary": "..."}],
-  "edges": [{"name": "...", "fact": "...", "source_node_name": "...", "target_node_name": "..."}]
+  "group_id": "{{group_id}}",
+  "source_description": "<who extracted from what>"
 }
 ```
+
+Quipu's /episode endpoint handles LLM extraction internally (simple mode),
+or accepts pre-extracted nodes[]/edges[] arrays for explicit extraction.
 
 **Quality gate — HARD REQUIREMENT:**
 You MUST extract at least 3 nodes and 2 edges from every bead. Every bead
@@ -179,33 +173,26 @@ thin one that creates duplicate or useless nodes."""
 
 [[steps]]
 id = "post-episode"
-title = "POST extracted episode to Graphiti"
+title = "POST extracted episode to Quipu"
 needs = ["extract"]
 tier = "haiku"
 description = """
-Send the extracted knowledge to the Graphiti API.
+Send the extracted knowledge to the Quipu API.
 
 **POST the episode:**
 ```bash
 curl -s -w '\nHTTP: %{http_code}\n' \
-  -X POST '{{graphiti_url}}/episodes/complete' \
+  -X POST '{{quipu_url}}/episode' \
   -H 'Content-Type: application/json' \
   -d '<your JSON from extract step>'
 ```
 
-**Expected response**: HTTP 201 with episode_uuid, nodes[], edges[]
+**Expected response**: HTTP 200 with {count, episode, tx_id}
 
 **Error handling:**
-- 422: edge references unknown node name — fix the extraction
-- 500: check if Graphiti service is healthy (`curl {{graphiti_url}}/docs`)
-- Timeout: Graphiti may be loading the embedder model on first use (~10s)
-
-**Verify in FalkorDB** (optional, for confidence):
-```bash
-# On the goldblum controller:
-ssh root@192.168.7.243 'redis-cli GRAPH.QUERY {{group_id}} \
-  "MATCH (n:Entity) RETURN n.name, n.summary LIMIT 10"'
-```"""
+- 422: malformed request body — check JSON schema
+- 500: check if Quipu service is healthy (`curl {{quipu_url}}/health`)
+- Timeout: Quipu may be loading models on first use (~10s)"""
 
 [[steps]]
 id = "feedback"
