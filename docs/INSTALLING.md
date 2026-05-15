@@ -8,7 +8,7 @@ Complete setup guide for Gas Town multi-agent orchestrator.
 
 | Tool | Version | Check | Install |
 |------|---------|-------|---------|
-| **Go** | 1.24+ | `go version` | See [golang.org](https://go.dev/doc/install) |
+| **Go** | 1.25.8+ | `go version` | See [golang.org](https://go.dev/doc/install) |
 | **Git** | 2.20+ | `git --version` | See below |
 | **Dolt** | >= 1.82.4 | `dolt version` | macOS: `brew install dolt`; other platforms: see [dolthub/dolt](https://github.com/dolthub/dolt?tab=readme-ov-file#installation) |
 | **Beads** | >= 0.55.4 | `bd version` | Installed by `brew install gastown`, or from source with `go install github.com/steveyegge/beads/cmd/bd@latest` |
@@ -46,8 +46,8 @@ sudo apt update
 sudo apt install -y git
 
 # Install Go (apt version may be outdated, use official installer)
-wget https://go.dev/dl/go1.24.12.linux-amd64.tar.gz
-sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.24.12.linux-amd64.tar.gz
+wget https://go.dev/dl/go1.25.8.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.25.8.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> ~/.bashrc
 source ~/.bashrc
 
@@ -72,7 +72,7 @@ sudo dnf install -y tmux
 
 ```bash
 # Check all prerequisites
-go version        # Should show go1.24 or higher
+go version        # Should show go1.25.8 or higher
 git --version     # Should show 2.20 or higher
 dolt version      # Should show 1.82.4 or higher
 tmux -V           # (Optional) Should show 3.0 or higher
@@ -308,6 +308,8 @@ recommended Homebrew install:
 ```bash
 brew update
 brew upgrade gastown
+command -v gt              # Should be Homebrew's gt, e.g. /opt/homebrew/bin/gt
+gt version
 gt doctor --fix            # Fix any post-update issues
 ```
 
@@ -317,6 +319,8 @@ than installing `gt` with `go install` on macOS:
 ```bash
 git pull --ff-only
 make install
+command -v gt              # Should be ~/.local/bin/gt
+gt version
 gt doctor --fix
 ```
 
@@ -326,12 +330,11 @@ If you maintain Beads separately from Homebrew, update `bd` from its own source:
 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
-After updating, verify that your shell is running the binary you intended:
+Run the `command -v gt` and `gt version` checks before `gt doctor --fix` so a
+stale shadow binary does not run the repair step first.
 
-```bash
-command -v gt
-gt version
-```
+If `command -v gt` points at a different install channel than the one you just
+updated, fix your PATH before continuing.
 
 ## Uninstalling
 
