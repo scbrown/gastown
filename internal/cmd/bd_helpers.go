@@ -1,12 +1,18 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // bdCmd is a builder for constructing bd exec.Command calls.
@@ -174,6 +180,35 @@ func (b *bdCmd) Build() *exec.Cmd {
 	return cmd
 }
 
+func resolveBdCmdTimeout() time.Duration {
+	if v := os.Getenv("GT_BD_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return constants.BdCommandTimeout
+}
+
+func (b *bdCmd) buildContextCommand(ctx context.Context) *exec.Cmd {
+	args := b.resolvedArgs()
+	cmd := exec.CommandContext(ctx, "bd", args...)
+	util.SetProcessGroup(cmd)
+	cmd.Dir = b.dir
+	cmd.Env = b.buildEnv()
+	cmd.Stderr = b.stderr
+	return cmd
+}
+
+func wrapBdCmdTimeout(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		return fmt.Errorf("bd command timed out after %v: %w", resolveBdCmdTimeout(), err)
+	}
+	return err
+}
+
 // resolvedArgs returns the final args, stripping --allow-stale if bd doesn't support it.
 func (b *bdCmd) resolvedArgs() []string {
 	if beads.BdSupportsAllowStale() {
@@ -191,7 +226,9 @@ func (b *bdCmd) resolvedArgs() []string {
 // Run builds and runs the command, returning any error.
 // This is a convenience method equivalent to Build().Run().
 func (b *bdCmd) Run() error {
-	return b.Build().Run()
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdCmdTimeout())
+	defer cancel()
+	return wrapBdCmdTimeout(ctx, b.buildContextCommand(ctx).Run())
 }
 
 // Output builds and runs the command, returning stdout and any error.
@@ -199,16 +236,18 @@ func (b *bdCmd) Run() error {
 // Note: Output() captures stdout but Stderr must still be configured
 // separately if you want to capture stderr instead of it going to os.Stderr.
 func (b *bdCmd) Output() ([]byte, error) {
-	return b.Build().Output()
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdCmdTimeout())
+	defer cancel()
+	out, err := b.buildContextCommand(ctx).Output()
+	return out, wrapBdCmdTimeout(ctx, err)
 }
 
 // CombinedOutput builds and runs the command, returning combined stdout+stderr.
 // This overrides the configured Stderr writer to capture both streams.
 // Useful for including command output in error messages.
 func (b *bdCmd) CombinedOutput() ([]byte, error) {
-	args := b.resolvedArgs()
-	cmd := exec.Command("bd", args...)
-	cmd.Dir = b.dir
-	cmd.Env = b.buildEnv()
-	return cmd.CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdCmdTimeout())
+	defer cancel()
+	out, err := b.buildContextCommand(ctx).CombinedOutput()
+	return out, wrapBdCmdTimeout(ctx, err)
 }

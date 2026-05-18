@@ -810,6 +810,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	// (see sling_helpers.go), so HookBead is typically empty. Kept for backward
 	// compatibility with agent beads that still have hook_bead set.
 	agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
+	var staleHookErr error
 	if agentBeadID != "" {
 		agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
 		ab := beads.New(agentBeadDir)
@@ -827,7 +828,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 			// fast — never pontificate, the witness will clear the hook on
 			// its next sweep and the dispatcher will (or won't) re-issue.
 			if hookBead == nil || isBeadNotFound(showErr) {
-				return nil, fmt.Errorf("%w: agent=%s hook_bead=%s cwd=%s: %v",
+				staleHookErr = fmt.Errorf("%w: agent=%s hook_bead=%s cwd=%s: %v",
 					ErrHookUnresolvable, agentID, agentBead.HookBead, ctx.WorkDir, showErr)
 			}
 		}
@@ -880,6 +881,9 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	}
 
 	if len(hookedBeads) == 0 {
+		if staleHookErr != nil {
+			return nil, staleHookErr
+		}
 		return nil, nil
 	}
 	return hookedBeads[0], nil

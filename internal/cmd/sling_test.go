@@ -2313,6 +2313,41 @@ exit /b 0
 	}
 }
 
+func TestHookBeadWithRetryForcesAutoCommit(t *testing.T) {
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+
+	bdScript := `#!/usr/bin/env sh
+printf 'ENV:BD_DOLT_AUTO_COMMIT=%s|%s\n' "$BD_DOLT_AUTO_COMMIT" "$*" >> "$BD_LOG"
+exit 0
+`
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo ENV:BD_DOLT_AUTO_COMMIT=%BD_DOLT_AUTO_COMMIT%^|%*>>"%BD_LOG%"
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_DOLT_AUTO_COMMIT", "off")
+	t.Setenv("GT_TEST_SKIP_HOOK_VERIFY", "1")
+
+	if err := hookBeadWithRetry("gt-test123", "gastown/polecats/toast", townRoot); err != nil {
+		t.Fatalf("hookBeadWithRetry: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	logText := string(logBytes)
+	if !strings.Contains(logText, "ENV:BD_DOLT_AUTO_COMMIT=on|") {
+		t.Fatalf("hook update did not force auto-commit; log:\n%s", logText)
+	}
+}
+
 func TestBuildSlingFieldUpdatesIncludesConvoyFields(t *testing.T) {
 	got := buildSlingFieldUpdates(
 		"mayor",

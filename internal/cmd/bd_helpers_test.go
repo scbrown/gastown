@@ -168,6 +168,30 @@ func TestBdCmd_Run(t *testing.T) {
 	}
 }
 
+func TestBdCmd_RunTimesOut(t *testing.T) {
+	binDir := t.TempDir()
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+sleep 5
+`, `@echo off
+timeout /t 5 /nobreak >NUL
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_BD_TIMEOUT_SEC", "1")
+
+	start := time.Now()
+	err := BdCmd("list").Run()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %v, want timeout", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("timeout took %v, want under 4s", elapsed)
+	}
+}
+
 func TestBdCmd_Chaining(t *testing.T) {
 	// Test that all builder methods return the receiver for chaining
 	bdc := BdCmd("test")

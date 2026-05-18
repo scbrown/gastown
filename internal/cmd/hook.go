@@ -523,6 +523,17 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("listing hooked beads: %w", err)
 	}
+	if len(hookedBeads) == 0 {
+		inProgressBeads, err := b.List(beads.ListOptions{
+			Status:   "in_progress",
+			Assignee: target,
+			Priority: -1,
+		})
+		if err != nil {
+			return fmt.Errorf("listing in-progress beads: %w", err)
+		}
+		hookedBeads = inProgressBeads
+	}
 
 	// If nothing found in local beads, also check town beads for hooked convoys.
 	// Convoys (hq-cv-*) are stored in town beads (~/gt/.beads) and any agent
@@ -541,6 +552,15 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 				})
 				if err == nil && len(townHooked) > 0 {
 					hookedBeads = townHooked
+				} else if err == nil {
+					townInProgress, err := townBeads.List(beads.ListOptions{
+						Status:   "in_progress",
+						Assignee: target,
+						Priority: -1,
+					})
+					if err == nil && len(townInProgress) > 0 {
+						hookedBeads = townInProgress
+					}
 				}
 			}
 
