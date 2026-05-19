@@ -108,29 +108,14 @@ func filterEnvKey(env []string, key string) []string {
 }
 
 func filterBdTargetEnv(env []string) []string {
-	for _, key := range []string{
-		"BEADS_DIR",
-		"BEADS_DB",
-		"BEADS_DOLT_SERVER_DATABASE",
-		"BEADS_DOLT_SERVER_HOST",
-		"BEADS_DOLT_SERVER_PORT",
-		"BEADS_DOLT_PORT",
-	} {
-		env = filterEnvKey(env, key)
-	}
-	return env
+	return beads.StripBDTargetEnv(env)
 }
 
 func pinBeadsDirEnv(env []string, beadsDir string) []string {
-	env = filterBdTargetEnv(env)
 	if beadsDir == "" {
-		return env
+		return beads.StripBDTargetEnv(env)
 	}
-	env = append(env, "BEADS_DIR="+beadsDir)
-	if dbEnv := beads.DatabaseEnv(beadsDir); dbEnv != "" {
-		env = append(env, dbEnv)
-	}
-	return env
+	return beads.BuildPinnedBDEnv(env, beadsDir)
 }
 
 // buildEnv constructs the final environment slice based on configured options.
@@ -164,6 +149,8 @@ func (b *bdCmd) buildEnv() []string {
 		env = pinBeadsDirEnv(env, b.beadsDir)
 	} else if b.dir != "" {
 		env = pinBeadsDirEnv(env, beads.ResolveBeadsDir(b.dir))
+	} else {
+		env = beads.SuppressBDSideEffects(beads.StripBDTargetEnv(env))
 	}
 
 	return env

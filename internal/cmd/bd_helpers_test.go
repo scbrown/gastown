@@ -542,6 +542,8 @@ func TestBdCmd_WithBeadsDir_OverridesInheritedDoltTarget(t *testing.T) {
 		"BEADS_DOLT_SERVER_HOST=100.107.173.83",
 		"BEADS_DOLT_SERVER_PORT=3307",
 		"BEADS_DOLT_PORT=3307",
+		"BEADS_DOLT_DATA_DIR=/wrong/data",
+		"BD_DB=/wrong.db",
 	}
 
 	bdc := &bdCmd{
@@ -558,7 +560,16 @@ func TestBdCmd_WithBeadsDir_OverridesInheritedDoltTarget(t *testing.T) {
 	if envMap["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
 		t.Errorf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb", envMap["BEADS_DOLT_SERVER_DATABASE"])
 	}
-	for _, key := range []string{"BEADS_DB", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+	if envMap["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" {
+		t.Errorf("BEADS_DOLT_SERVER_HOST = %q, want 127.0.0.1", envMap["BEADS_DOLT_SERVER_HOST"])
+	}
+	if envMap["BEADS_DOLT_SERVER_PORT"] != "3307" {
+		t.Errorf("BEADS_DOLT_SERVER_PORT = %q, want 3307", envMap["BEADS_DOLT_SERVER_PORT"])
+	}
+	if envMap["BEADS_DOLT_PORT"] != "3307" {
+		t.Errorf("BEADS_DOLT_PORT = %q, want 3307", envMap["BEADS_DOLT_PORT"])
+	}
+	for _, key := range []string{"BEADS_DB", "BD_DB", "BEADS_DOLT_DATA_DIR"} {
 		if value, ok := envMap[key]; ok {
 			t.Errorf("%s should be stripped when BEADS_DIR is pinned, got %q", key, value)
 		}
@@ -576,6 +587,30 @@ func TestBdCmd_EmptyBeadsDir_Skipped(t *testing.T) {
 		if strings.HasPrefix(e, "BEADS_DIR=") {
 			t.Errorf("BEADS_DIR should not be added when empty, found: %s", e)
 		}
+	}
+}
+
+func TestBdCmd_DefaultStripsTargetEnvAndSuppressesSideEffects(t *testing.T) {
+	bdc := &bdCmd{
+		args: []string{"version"},
+		env: []string{
+			"PATH=/usr/bin",
+			"BEADS_DIR=/wrong",
+			"BEADS_DOLT_SERVER_DATABASE=hq",
+			"BEADS_DOLT_SERVER_HOST=wrong-host",
+			"BD_EXPORT_AUTO=true",
+		},
+		stderr: os.Stderr,
+	}
+	cmd := bdc.Build()
+	envMap := parseEnv(cmd.Env)
+	for _, key := range []string{"BEADS_DIR", "BEADS_DOLT_SERVER_DATABASE", "BEADS_DOLT_SERVER_HOST"} {
+		if value, ok := envMap[key]; ok {
+			t.Fatalf("%s should be stripped for unpinned BdCmd, got %q in %v", key, value, cmd.Env)
+		}
+	}
+	if envMap["BD_EXPORT_AUTO"] != "false" {
+		t.Fatalf("BD_EXPORT_AUTO = %q, want false in %v", envMap["BD_EXPORT_AUTO"], cmd.Env)
 	}
 }
 

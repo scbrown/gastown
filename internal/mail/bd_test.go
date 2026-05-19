@@ -263,7 +263,7 @@ func TestBdSubprocessEnv_FiltersStaleBdTargetEnv(t *testing.T) {
 	if !envContains(got, "BEADS_DOLT_SERVER_DATABASE=rigdb") {
 		t.Fatalf("expected metadata database env in env, got %v", got)
 	}
-	for _, want := range []string{"BD_READONLY=true", "BD_EXPORT_AUTO=false", "BD_BACKUP_ENABLED=false"} {
+	for _, want := range []string{"BD_READONLY=true", "BD_EXPORT_AUTO=false", "BD_BACKUP_ENABLED=false", "BD_DOLT_AUTO_PUSH=false", "BD_NO_PUSH=true", "BD_EXPORT_GIT_ADD=false", "BD_NO_GIT_OPS=true"} {
 		if !envContains(got, want) {
 			t.Fatalf("expected %s in env, got %v", want, got)
 		}
@@ -275,7 +275,7 @@ func TestBdSubprocessEnv_WriteCommandsAreNotReadonly(t *testing.T) {
 	if value, ok := envLastValue(got, "BD_READONLY"); ok {
 		t.Fatalf("write command env should not inherit or set BD_READONLY, got %q in %v", value, got)
 	}
-	for _, want := range []string{"BD_EXPORT_AUTO=false", "BD_BACKUP_ENABLED=false"} {
+	for _, want := range []string{"BD_EXPORT_AUTO=false", "BD_BACKUP_ENABLED=false", "BD_DOLT_AUTO_PUSH=false", "BD_NO_PUSH=true", "BD_EXPORT_GIT_ADD=false", "BD_NO_GIT_OPS=true"} {
 		if !envContains(got, want) {
 			t.Fatalf("expected %s in env, got %v", want, got)
 		}
@@ -317,6 +317,8 @@ func TestIsMailBdReadCommand(t *testing.T) {
 func TestBdSubprocessEnv_AllowsRoutingWhenBeadsDirEmpty(t *testing.T) {
 	got := bdSubprocessEnv([]string{
 		"PATH=/usr/bin",
+		"GT_DOLT_HOST=127.0.0.2",
+		"GT_DOLT_PORT=5507",
 		"BEADS_DIR=/wrong",
 		"BEADS_DB=/wrong.db",
 		"BEADS_DOLT_SERVER_DATABASE=wrong",
@@ -325,13 +327,16 @@ func TestBdSubprocessEnv_AllowsRoutingWhenBeadsDirEmpty(t *testing.T) {
 		"BEADS_DOLT_PORT=9999",
 	}, "", true, nil)
 
-	for _, key := range []string{"BEADS_DIR", "BEADS_DB", "BEADS_DOLT_SERVER_DATABASE", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+	for _, key := range []string{"BEADS_DIR", "BEADS_DB", "BEADS_DOLT_SERVER_DATABASE"} {
 		if value, ok := envLastValue(got, key); ok {
 			t.Fatalf("expected %s to be absent for routed command, got %q in %v", key, value, got)
 		}
 	}
 	if !envContains(got, "BEADS_NO_AUTO_IMPORT=1") {
 		t.Fatalf("expected BEADS_NO_AUTO_IMPORT=1 in env, got %v", got)
+	}
+	if !envContains(got, "BEADS_DOLT_SERVER_HOST=127.0.0.2") || !envContains(got, "BEADS_DOLT_SERVER_PORT=5507") || !envContains(got, "BEADS_DOLT_PORT=5507") {
+		t.Fatalf("expected GT_DOLT host/port fallback for routed command, got %v", got)
 	}
 }
 

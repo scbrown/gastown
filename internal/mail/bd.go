@@ -120,17 +120,16 @@ func firstArg(args []string) string {
 }
 
 func bdSubprocessEnv(baseEnv []string, beadsDir string, readOnly bool, extraEnv []string) []string {
-	env := filterBdTargetEnv(baseEnv)
+	var env []string
+	if beadsDir == "" {
+		env = beads.BuildRoutingBDEnv(baseEnv, "")
+	} else {
+		env = beads.BuildPinnedBDEnv(baseEnv, beadsDir)
+	}
 	env = filterEnvKey(env, "BD_READONLY")
 	extraEnv = filterEnvKey(extraEnv, "BD_READONLY")
-	if beadsDir != "" {
-		env = append(env, "BEADS_DIR="+beadsDir)
-		if dbEnv := beads.DatabaseEnv(beadsDir); dbEnv != "" {
-			env = append(env, dbEnv)
-		}
-	}
 	env = append(env, "BEADS_NO_AUTO_IMPORT=1")
-	env = append(env, "BD_EXPORT_AUTO=false", "BD_BACKUP_ENABLED=false")
+	env = beads.SuppressBDSideEffects(env)
 	env = append(env, extraEnv...)
 	if readOnly {
 		env = filterEnvKey(env, "BD_READONLY")
@@ -179,19 +178,7 @@ func isMailBdReadCommand(args []string) bool {
 }
 
 func filterBdTargetEnv(env []string) []string {
-	filtered := make([]string, 0, len(env))
-	for _, entry := range env {
-		if strings.HasPrefix(entry, "BEADS_DIR=") ||
-			strings.HasPrefix(entry, "BEADS_DB=") ||
-			strings.HasPrefix(entry, "BEADS_DOLT_SERVER_DATABASE=") ||
-			strings.HasPrefix(entry, "BEADS_DOLT_SERVER_HOST=") ||
-			strings.HasPrefix(entry, "BEADS_DOLT_SERVER_PORT=") ||
-			strings.HasPrefix(entry, "BEADS_DOLT_PORT=") {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	return filtered
+	return beads.StripBDTargetEnv(env)
 }
 
 // bdReadCtx returns a context with the standard bd read timeout.
