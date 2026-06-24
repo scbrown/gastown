@@ -980,8 +980,11 @@ func TestLoadOrCreateMessagingConfig(t *testing.T) {
 
 func TestMessagingConfigPath(t *testing.T) {
 	t.Parallel()
-	path := MessagingConfigPath("/home/user/gt")
-	expected := "/home/user/gt/config/messaging.json"
+	// The argument is a town root (workspace root), NOT ~/gt — the messaging
+	// config lives at <town-root>/config/messaging.json. Use a town-root-looking
+	// path so the fixture can't be misread as a fixed ~/gt home path.
+	path := MessagingConfigPath("/home/user/mytown")
+	expected := "/home/user/mytown/config/messaging.json"
 	if filepath.ToSlash(path) != expected {
 		t.Errorf("MessagingConfigPath = %q, want %q", path, expected)
 	}

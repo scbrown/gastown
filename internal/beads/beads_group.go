@@ -313,7 +313,7 @@ func (b *Beads) RemoveGroupMember(name string, member string) (*Issue, error) {
 // DeleteGroupBead permanently deletes a group bead.
 func (b *Beads) DeleteGroupBead(name string) error {
 	id := GroupBeadID(name)
-	_, err := b.run("delete", id, "--hard", "--force")
+	_, err := b.run("delete", id, "--force")
 	return err
 }
 

@@ -322,7 +322,7 @@ func (b *Beads) UpdateChannelStatus(name, status string) error {
 // DeleteChannelBead permanently deletes a channel bead.
 func (b *Beads) DeleteChannelBead(name string) error {
 	id := ChannelBeadID(name)
-	_, err := b.run("delete", id, "--hard", "--force")
+	_, err := b.run("delete", id, "--force")
 	return err
 }
 
