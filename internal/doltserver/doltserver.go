@@ -343,6 +343,20 @@ func DefaultConfig(townRoot string) *Config {
 
 	if h := os.Getenv("GT_DOLT_HOST"); h != "" {
 		config.Host = h
+	} else {
+		// Fallback to the town daemon env so processes whose own env lacks the
+		// host still target the remote server instead of defaulting to
+		// 127.0.0.1. This matters for the deacon: it respawns agents and runs
+		// connection-capacity checks (HasConnectionCapacity -> EffectiveHost)
+		// but its env carries only GT_DOLT_PORT, not GT_DOLT_HOST — so sling
+		// admission control silently dialed 127.0.0.1 and failed (aegis-c6o).
+		// Mirrors the port's config-file fallback below.
+		daemonEnvPath := filepath.Join(daemonDir, "daemon.env")
+		if h := readDaemonEnvVar(daemonEnvPath, "GT_DOLT_HOST"); h != "" {
+			config.Host = h
+		} else if h := readDaemonEnvVar(daemonEnvPath, "BEADS_DOLT_SERVER_HOST"); h != "" {
+			config.Host = h
+		}
 	}
 
 	// Port precedence: config.yaml > env var > daemon.json > default
