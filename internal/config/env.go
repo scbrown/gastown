@@ -333,13 +333,28 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["BEADS_DOLT_AUTO_START"] = "0"
 	}
 
-	// Propagate Dolt server host so bd doesn't fall back to 127.0.0.1 when
-	// the server runs on a remote machine (e.g., mini2 over Tailscale).
-	if _, ok := env["BEADS_DOLT_SERVER_HOST"]; !ok {
-		if v := os.Getenv("BEADS_DOLT_SERVER_HOST"); v != "" {
-			env["BEADS_DOLT_SERVER_HOST"] = v
-		} else if v := os.Getenv("GT_DOLT_HOST"); v != "" {
-			env["BEADS_DOLT_SERVER_HOST"] = v
+	// Propagate Dolt server host so neither bd nor gt's own dolt client falls
+	// back to 127.0.0.1 when the server runs on a remote machine (e.g.,
+	// dolt.lan, or mini2 over Tailscale). This mirrors the port block above in
+	// two ways:
+	//
+	//  1. Resolution falls back to town config (daemon/daemon.env) when the
+	//     spawning process env lacks the host. This is essential because crew
+	//     are often respawned by the deacon, whose env carries GT_DOLT_PORT
+	//     (resolved from .dolt-data/config.yaml) but NOT GT_DOLT_HOST — without
+	//     a config fallback the host silently drops while the port survives,
+	//     leaving the agent pointed at a non-existent local server (aegis-c6o).
+	//
+	//  2. Both env vars are set: BEADS_DOLT_SERVER_HOST is the canonical host
+	//     for bd, while gt's own dolt client + sling admission control read
+	//     GT_DOLT_HOST (doltserver.go EffectiveHost). Setting only the former
+	//     left `gt sling` defaulting to 127.0.0.1 from inside crew shells.
+	if host := resolveDoltHost(cfg.TownRoot); host != "" {
+		if _, ok := env["BEADS_DOLT_SERVER_HOST"]; !ok {
+			env["BEADS_DOLT_SERVER_HOST"] = host
+		}
+		if _, ok := env["GT_DOLT_HOST"]; !ok {
+			env["GT_DOLT_HOST"] = host
 		}
 	}
 
@@ -471,6 +486,57 @@ func resolveDoltPort(townRoot string) int {
 	}
 
 	return 0
+}
+
+// resolveDoltHost resolves the Dolt server host, mirroring resolveDoltPort's
+// "process env first, then town config" strategy. Order:
+//
+//  1. Explicit process env: BEADS_DOLT_SERVER_HOST, then GT_DOLT_HOST.
+//  2. The town's daemon/daemon.env (GT_DOLT_HOST, then BEADS_DOLT_SERVER_HOST).
+//
+// Returns "" when no host is configured, in which case callers leave bd's and
+// gt's own defaults in place (effectively 127.0.0.1). The daemon.env fallback
+// matters because crew/dog respawns are frequently performed by a process (the
+// deacon) whose env lacks the host even though the port survives via config.
+func resolveDoltHost(townRoot string) string {
+	if v := os.Getenv("BEADS_DOLT_SERVER_HOST"); v != "" {
+		return v
+	}
+	if v := os.Getenv("GT_DOLT_HOST"); v != "" {
+		return v
+	}
+	if townRoot != "" {
+		envPath := filepath.Join(townRoot, "daemon", "daemon.env")
+		if v := readDaemonEnvValue(envPath, "GT_DOLT_HOST"); v != "" {
+			return v
+		}
+		if v := readDaemonEnvValue(envPath, "BEADS_DOLT_SERVER_HOST"); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// readDaemonEnvValue returns the value of key from a KEY=value env file
+// (daemon/daemon.env), ignoring blank lines and # comments. Returns "" when the
+// file is unreadable or the key is absent. Kept local to avoid an import edge
+// onto internal/doltserver, which has an equivalent unexported reader.
+func readDaemonEnvValue(path, key string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	prefix := key + "="
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
 }
 
 // parsePortFromConfigYAML extracts the listener port from a Dolt config.yaml

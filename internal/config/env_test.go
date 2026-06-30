@@ -1335,3 +1335,74 @@ func TestAgentEnv_EffortLevel(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveDoltHost_DaemonEnvFallback reproduces aegis-c6o: a crew/dog
+// respawn performed by a process whose env lacks GT_DOLT_HOST/
+// BEADS_DOLT_SERVER_HOST (e.g. the deacon) must still resolve the remote host
+// from town config (daemon/daemon.env), so the host doesn't silently drop while
+// the port survives. Both bd's canonical var and gt's own GT_DOLT_HOST must be
+// populated. Not parallel: mutates process env to simulate the bare spawner.
+func TestResolveDoltHost_DaemonEnvFallback(t *testing.T) {
+	// Simulate the deacon's environment: port present, host absent.
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("GT_DOLT_HOST", "")
+	os.Unsetenv("BEADS_DOLT_SERVER_HOST")
+	os.Unsetenv("GT_DOLT_HOST")
+
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "daemon"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemonEnv := "# town daemon env\nGT_DOLT_HOST=dolt.lan\nBEADS_DOLT_SERVER_HOST=dolt.lan\nGT_DOLT_PORT=3306\n"
+	if err := os.WriteFile(filepath.Join(town, "daemon", "daemon.env"), []byte(daemonEnv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveDoltHost(town); got != "dolt.lan" {
+		t.Fatalf("resolveDoltHost = %q, want dolt.lan", got)
+	}
+
+	env := AgentEnv(AgentEnvConfig{
+		Role:      "crew",
+		Rig:       "beads_aegis",
+		AgentName: "ray",
+		TownRoot:  town,
+	})
+	// Both must be set so bd (BEADS_DOLT_SERVER_HOST) and gt's dolt client +
+	// sling admission control (GT_DOLT_HOST) reach the remote server.
+	assertEnv(t, env, "BEADS_DOLT_SERVER_HOST", "dolt.lan")
+	assertEnv(t, env, "GT_DOLT_HOST", "dolt.lan")
+}
+
+// TestResolveDoltHost_ProcessEnvWins confirms explicit process env still takes
+// precedence over the daemon.env fallback (e.g. a one-off override).
+func TestResolveDoltHost_ProcessEnvWins(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "override.lan")
+	t.Setenv("GT_DOLT_HOST", "")
+	os.Unsetenv("GT_DOLT_HOST")
+
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "daemon"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(town, "daemon", "daemon.env"), []byte("GT_DOLT_HOST=dolt.lan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveDoltHost(town); got != "override.lan" {
+		t.Fatalf("resolveDoltHost = %q, want override.lan (process env wins)", got)
+	}
+}
+
+// TestResolveDoltHost_NoneConfigured returns empty so callers leave bd's own
+// default (127.0.0.1) in place rather than injecting a bogus host.
+func TestResolveDoltHost_NoneConfigured(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("GT_DOLT_HOST", "")
+	os.Unsetenv("BEADS_DOLT_SERVER_HOST")
+	os.Unsetenv("GT_DOLT_HOST")
+
+	if got := resolveDoltHost(t.TempDir()); got != "" {
+		t.Fatalf("resolveDoltHost = %q, want empty", got)
+	}
+}
