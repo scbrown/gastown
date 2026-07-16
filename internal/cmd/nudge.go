@@ -275,8 +275,9 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// this watcher. It exits on: delivery, session death, or timeout.
 		// Must be synchronous (not a goroutine) because gt nudge is a CLI
 		// command — the process exits after return, killing any goroutines.
-		watchAndDeliver(t, townRoot, sessionName)
-		return nil
+		// Propagate delivery failure: a false ✓ + exit 0 on an undelivered
+		// message is the bug this fixes (aegis-ri87).
+		return watchAndDeliver(t, townRoot, sessionName)
 
 	default: // NudgeModeImmediate
 		opts := tmux.NudgeOpts{TownRoot: townRoot}
@@ -299,15 +300,27 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 // send-keys input, so we cannot rely on it.
 //
 // This runs synchronously — gt nudge blocks until the watcher exits.
-// Errors are logged to stderr rather than returned since delivery failure
-// after successful queue write is non-fatal (queue persists for next drain).
+//
+// Returns an error ONLY when a delivery was actually attempted and FAILED.
+// Everything else returns nil, because the nudge is still queued and a later
+// drain will deliver it — that part of the original design is right.
+//
+// It previously returned nothing, and the caller did `watchAndDeliver(...);
+// return nil`, on the reasoning that "delivery failure after successful queue
+// write is non-fatal (queue persists for next drain)". The premise is true; the
+// conclusion did not follow. Non-fatal justifies EXIT 0. It does not justify
+// printing "✓ Nudged <target>", which asserts a delivery that did not happen —
+// so a send-keys failure produced a checkmark and exit 0 while the message never
+// arrived, and the sender had no reason to check (aegis-ri87). The failure line
+// went to stderr, one line above the checkmark that contradicted it.
 //
 // Exit conditions:
-//   - Agent becomes idle: drain queue and deliver formatted content, exit.
-//   - Queue is empty (someone else drained it): exit.
-//   - Session disappears: exit (nothing to deliver to).
-//   - Timeout: exit (queue stays for next input or watcher cycle).
-func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
+//   - Agent becomes idle: drain queue and deliver formatted content.
+//     Delivery OK -> nil. Delivery FAILED -> error (the caller must not claim success).
+//   - Queue is empty (someone else drained it): nil — it was delivered by another drainer.
+//   - Session disappears: nil — nothing to deliver to; the nudge stays queued.
+//   - Timeout: nil — genuinely non-fatal, queue stays for next input or watcher cycle.
+func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) error {
 	fmt.Fprintf(os.Stderr, "Watching %s for idle (up to %s)...\n", sessionName, idleWatcherTimeout)
 	deadline := time.Now().Add(idleWatcherTimeout)
 	for time.Now().Before(deadline) {
@@ -315,12 +328,12 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 
 		// If queue is already empty, someone else drained it.
 		if nudge.QueueLen(townRoot, sessionName) == 0 {
-			return
+			return nil
 		}
 
 		// Check if session still exists — no point watching a dead session.
 		if exists, _ := t.HasSession(sessionName); !exists {
-			return
+			return nil
 		}
 
 		// Use WaitForIdle with a short timeout instead of single-snapshot
@@ -333,16 +346,22 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			// empty slice and skip delivery to avoid duplicates.
 			drained, _ := nudge.Drain(townRoot, sessionName)
 			if len(drained) == 0 {
-				return
+				return nil
 			}
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+				// Do NOT swallow this. The caller prints "✓ Nudged" on a nil
+				// return, and the message did not arrive (aegis-ri87).
 				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+				return fmt.Errorf("delivering nudge to %s: %w", sessionName, err)
 			}
-			return
+			return nil
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
+	// Genuinely non-fatal: nil, and the caller's checkmark is honest because
+	// the nudge really is queued for the next drain.
+	return nil
 }
 
 // validNudgeModes is the set of allowed --mode values.
