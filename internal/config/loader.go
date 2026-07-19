@@ -2118,7 +2118,16 @@ func GetRuntimeCommandWithPrompt(rigPath, prompt string) string {
 
 // GetRuntimeCommandWithPromptAndAgentOverride returns the full command with an initial prompt,
 // using agentOverride if non-empty.
-func GetRuntimeCommandWithPromptAndAgentOverride(rigPath, prompt, agentOverride string) (string, error) {
+//
+// role is the resolved simple role (e.g. "crew", "witness") of the session being
+// (re)spawned. It exists ONLY so this override path applies the same role
+// --settings flag the launcher does via withRoleSettingsFlag. Without it, a
+// respawn whose agent is pinned by GT_AGENT (all crew: GT_AGENT=claude) went
+// through this role-blind resolver and silently dropped --settings — the
+// aegis-05up bug, where a handoff-cycled crew session lost ALL its hooks
+// (rm -rf / git push --force tap guards, gt prime, mail inject). Pass "" for
+// town-level roles (mayor/deacon); withRoleSettingsFlag no-ops for those.
+func GetRuntimeCommandWithPromptAndAgentOverride(rigPath, prompt, agentOverride, role string) (string, error) {
 	if rigPath == "" {
 		townRoot, err := findTownRootFromCwd()
 		if err != nil {
@@ -2128,6 +2137,7 @@ func GetRuntimeCommandWithPromptAndAgentOverride(rigPath, prompt, agentOverride 
 		if resolveErr != nil {
 			return "", resolveErr
 		}
+		rc = withRoleSettingsFlag(rc, role, "")
 		return rc.BuildCommandWithPrompt(prompt), nil
 	}
 
@@ -2136,6 +2146,7 @@ func GetRuntimeCommandWithPromptAndAgentOverride(rigPath, prompt, agentOverride 
 	if err != nil {
 		return "", err
 	}
+	rc = withRoleSettingsFlag(rc, role, rigPath)
 	return rc.BuildCommandWithPrompt(prompt), nil
 }
 

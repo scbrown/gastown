@@ -960,3 +960,80 @@ func TestEnforceHandoffCooldown(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildRestartCommand_CrewWithAgentOverrideCarriesSettings is the aegis-05up
+// regression guard. A crew session ALWAYS has GT_AGENT set (crew run
+// GT_AGENT=claude), so its handoff respawn takes the agent-override resolution
+// path. That path was role-blind and dropped the --settings flag, so a
+// handoff-cycled crew session silently lost every hook in crew/.claude/settings.json
+// — including the rm -rf and git-push-force tap guards, gt prime, and mail
+// injection. The launcher (gt crew start) keeps --settings; the respawn must too.
+//
+// Pre-fix: this test FAILS (no --settings). Post-fix: the override path applies
+// the same withRoleSettingsFlag the launcher does.
+func TestBuildRestartCommand_CrewWithAgentOverrideCarriesSettings(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+
+	townRoot := t.TempDir()
+
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+	rigPath := filepath.Join(townRoot, "gastown")
+	crewDir := filepath.Join(rigPath, "crew", "bear")
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(crewDir, 0755); err != nil {
+		t.Fatalf("mkdir crew dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	// A claude-based agent pinned via GT_AGENT — mirrors crew's GT_AGENT=claude.
+	townSettings.Agents = map[string]*config.RuntimeConfig{
+		"claude": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions"},
+		},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	// GT_AGENT set -> the handoff override path (the aegis-05up bug path).
+	_ = os.Setenv("GT_AGENT", "claude")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	if err := os.Chdir(crewDir); err != nil {
+		t.Fatalf("chdir crew dir: %v", err)
+	}
+
+	cmd, err := buildRestartCommand("gt-crew-bear")
+	if err != nil {
+		t.Fatalf("buildRestartCommand: %v", err)
+	}
+
+	if !strings.Contains(cmd, "--settings") {
+		t.Errorf("crew respawn dropped --settings (aegis-05up): a cycled crew session would lose all hooks\ncmd: %s", cmd)
+	}
+	wantSettings := filepath.Join(rigPath, "crew", ".claude", "settings.json")
+	if !strings.Contains(cmd, wantSettings) {
+		t.Errorf("crew respawn --settings path wrong; want %q\ncmd: %s", wantSettings, cmd)
+	}
+}

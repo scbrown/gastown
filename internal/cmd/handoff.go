@@ -866,7 +866,7 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	var runtimeCmd string
 	if currentAgent != "" {
 		var err error
-		runtimeCmd, err = config.GetRuntimeCommandWithPromptAndAgentOverride(rigPath, beacon, currentAgent)
+		runtimeCmd, err = config.GetRuntimeCommandWithPromptAndAgentOverride(rigPath, beacon, currentAgent, simpleRole)
 		if err != nil {
 			return "", fmt.Errorf("resolving agent config: %w", err)
 		}
