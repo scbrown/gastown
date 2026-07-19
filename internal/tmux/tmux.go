@@ -1214,8 +1214,11 @@ func (t *Tmux) SendKeys(session, keys string) error {
 // This prevents race conditions where Enter arrives before paste is processed.
 func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr error) {
 	defer func() { telemetry.RecordPromptSend(context.Background(), session, keys, debounceMs, retErr) }()
-	// Send text using literal mode (-l) to handle special chars
-	if _, err := t.run("send-keys", "-t", session, "-l", keys); err != nil {
+	// Send text using literal mode (-l) to handle special chars.
+	// The "--" terminator stops tmux getopt from parsing a payload that begins
+	// with a dash (e.g. a chunk starting "-D...") as a flag — the aegis-ri87 bug
+	// (tmux "unknown flag -D"). -l alone does NOT protect the following token.
+	if _, err := t.run("send-keys", "-t", session, "-l", "--", keys); err != nil {
 		return err
 	}
 	// Wait for paste to be processed
@@ -1562,7 +1565,9 @@ func (t *Tmux) sendMessageToTarget(target, text string) error {
 				return err
 			}
 		} else {
-			if _, err := t.run("send-keys", "-t", target, "-l", chunk); err != nil {
+			// "--" terminator: a mid-message chunk can begin with a dash and
+			// tmux would parse it as a flag without it (aegis-ri87).
+			if _, err := t.run("send-keys", "-t", target, "-l", "--", chunk); err != nil {
 				return err
 			}
 		}
@@ -1593,7 +1598,9 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 	var lastErr error
 
 	for time.Now().Before(deadline) {
-		_, err := t.run("send-keys", "-t", target, "-l", text)
+		// "--" terminator so a payload beginning with a dash is treated as
+		// literal text, not a tmux flag (aegis-ri87).
+		_, err := t.run("send-keys", "-t", target, "-l", "--", text)
 		if err == nil {
 			return nil
 		}
