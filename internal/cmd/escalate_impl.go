@@ -715,12 +715,23 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 				status.Warning = "contacts.sms_webhook not configured"
 				style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
 			} else {
-				if err := sendEscalationSMS(cfg, beadID, severity, description); err != nil {
+				receipt, err := sendEscalationSMS(cfg, beadID, severity, description)
+				if err != nil {
 					status.Error = err.Error()
+					// LOUD, and on stdout as well as the warning stream. The failure and
+					// the success used to leave by different doors: success via stdout,
+					// failure via a warning. An operator reading one stream saw a missing
+					// line and nothing else, which reads as success to someone in a hurry
+					// and as failure to someone careful — both happened within an hour.
+					fmt.Printf("  ❌ PUSH NOT DELIVERED to %s: %v\n", cfg.Contacts.HumanSMS, err)
 					style.PrintWarning("sms send failed: %v", err)
 				} else {
 					status.RuntimeNotified = true
-					fmt.Printf("  📱 SMS sent to %s\n", cfg.Contacts.HumanSMS)
+					// Says only what was proven: the server accepted a message and gave
+					// back a receipt. NOT "a human has it" — the topic is LAN-only, so a
+					// phone off the network receives nothing however green this line is.
+					fmt.Printf("  📤 push PUBLISHED (receipt %s) — accepted by the server, "+
+						"NOT proof a device received it\n", receipt)
 				}
 			}
 			statuses = append(statuses, status)
@@ -823,28 +834,79 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 	return nil
 }
 
-// sendEscalationSMS posts an escalation notification via SMS webhook (e.g. Twilio).
-func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description string) error {
+// sendEscalationSMS posts an escalation notification via the push webhook and returns a
+// RECEIPT identifying what was published, or an error. It deliberately returns evidence
+// rather than a bare nil: the caller prints what this establishes, and it can only print
+// as much as this proves (aegis-uz6i).
+func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description string) (string, error) {
 	payload := map[string]string{
 		"to":   cfg.Contacts.HumanSMS,
 		"body": fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshaling sms payload: %w", err)
+		return "", fmt.Errorf("marshaling sms payload: %w", err)
 	}
 
 	resp, err := http.Post(cfg.Contacts.SMSWebhook, "application/json", strings.NewReader(string(body)))
 	if err != nil {
-		return fmt.Errorf("posting to sms webhook: %w", err)
+		return "", fmt.Errorf("posting to sms webhook: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("sms webhook returned %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("sms webhook returned %d: %s", resp.StatusCode, truncateReceiptBody(string(respBody)))
 	}
-	return nil
+	return parsePublishReceipt(respBody)
+}
+
+// parsePublishReceipt turns the webhook's response body into PROOF THAT SOMETHING WAS
+// PUBLISHED, or an error. A 2xx on its own is not that proof (aegis-uz6i).
+//
+// MEASURED 2026-07-20 against the configured endpoint: a real publish answers with
+// JSON — {"id":"NQ2oOnDcFWQr","time":...,"topic":"ops-alerts",...} — while a GET
+// of the very same URL answers 200 with the notification server's WEB UI HTML. Both
+// are 2xx. So the old check could not tell "a message was queued" from "a web page was
+// served", and it printed the same confident line either way.
+//
+// That gap is not hypothetical, and it does not require anyone to misconfigure the URL
+// by hand: Go's http.Post FOLLOWS redirects and reissues 301/302 as a GET. The day this
+// endpoint gains an http->https redirect — the single most common change a reverse proxy
+// ever receives — every escalation would land on the web UI, publish nothing, return
+// 200, and still print success. The check would not merely be weak; it would be
+// reporting the opposite of what happened, on the path that carries "something is badly
+// wrong".
+//
+// A CHECK THAT CANNOT FAIL IS NOT A CHECK, so this one is written to be failable and is
+// tested in both directions, including against the exact HTML bytes that endpoint really
+// returns.
+func parsePublishReceipt(body []byte) (string, error) {
+	var r struct {
+		ID    string `json:"id"`
+		Topic string `json:"topic"`
+		Time  int64  `json:"time"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", fmt.Errorf("webhook returned 2xx but the body is not a publish receipt "+
+			"(got %q) — a 2xx alone does not mean a notification was queued", truncateReceiptBody(string(body)))
+	}
+	// An empty id is the tell for JSON that is not a receipt: an error object, a health
+	// payload, or an unrelated API's 200. Requiring the id is what makes the check fail
+	// on anything except an actual publish.
+	if r.ID == "" || r.Topic == "" {
+		return "", fmt.Errorf("webhook returned 2xx and JSON, but no publish receipt "+
+			"(id=%q topic=%q) — nothing proves a notification was queued", r.ID, r.Topic)
+	}
+	return fmt.Sprintf("%s/%s", r.Topic, r.ID), nil
+}
+
+func truncateReceiptBody(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 120 {
+		return s[:120] + "…"
+	}
+	return s
 }
 
 // writeEscalationLog appends an escalation entry to the log file.
