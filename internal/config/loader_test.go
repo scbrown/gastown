@@ -4926,7 +4926,9 @@ func TestBuildStartupCommand_SetsGTProcessNames(t *testing.T) {
 // This is a regression test for the bug where `gt deacon start --agent codex`
 // would still launch Claude if run from outside the town directory.
 func TestBuildStartupCommandWithAgentOverride_UsesOverrideWhenNoTownRoot(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): mutates the package-global agent registry
+	// (Reset/RegisterAgentForTesting); parallel siblings reading the registry
+	// see the mutation mid-flight (aegis-2hdj: run-to-run-varying flaky set).
 	ResetRegistryForTesting()
 
 	// Change to a directory that is definitely NOT in a Gas Town workspace

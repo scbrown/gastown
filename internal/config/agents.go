@@ -1057,6 +1057,11 @@ func NewExampleAgentRegistry() *AgentRegistry {
 
 // ResetRegistryForTesting clears all registry state.
 // This is intended for use in tests only to ensure test isolation.
+//
+// Callers must NOT use t.Parallel(): the registry is package-global, so a
+// parallel test resetting or registering into it races every other parallel
+// test that resolves agents through it (aegis-2hdj — the failing test set
+// varies run to run, framing whoever touches the package next).
 func ResetRegistryForTesting() {
 	registryMu.Lock()
 	defer registryMu.Unlock()
@@ -1067,6 +1072,7 @@ func ResetRegistryForTesting() {
 
 // RegisterAgentForTesting adds a custom agent preset to the registry.
 // The registry is initialized first if needed. Intended for test use only.
+// Callers must NOT use t.Parallel() — see ResetRegistryForTesting.
 func RegisterAgentForTesting(name string, info AgentPresetInfo) {
 	registryMu.Lock()
 	initRegistryLocked()

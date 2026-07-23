@@ -276,7 +276,9 @@ func TestGetProcessNamesRespectsRegistryOverride(t *testing.T) {
 }
 
 func TestResolveProcessNames(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): mutates the package-global agent registry
+	// (Reset/RegisterAgentForTesting); parallel siblings reading the registry
+	// see the mutation mid-flight (aegis-2hdj: run-to-run-varying flaky set).
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
@@ -1450,7 +1452,9 @@ func TestAllHookSupportingAgentsHaveHookFields(t *testing.T) {
 }
 
 func TestResolveACPConfig(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): mutates the package-global agent registry
+	// (Reset/RegisterAgentForTesting); parallel siblings reading the registry
+	// see the mutation mid-flight (aegis-2hdj: run-to-run-varying flaky set).
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
@@ -1535,7 +1539,9 @@ func TestSupportsACPWithCustomAgent(t *testing.T) {
 }
 
 func TestGetACPCommand(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): mutates the package-global agent registry
+	// (Reset/RegisterAgentForTesting); parallel siblings reading the registry
+	// see the mutation mid-flight (aegis-2hdj: run-to-run-varying flaky set).
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
