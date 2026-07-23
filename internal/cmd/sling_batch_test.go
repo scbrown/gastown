@@ -1548,8 +1548,9 @@ exit 0
 }
 
 // TestFindConvoyByDescription_FallsBackToTrackedDeps verifies that when no
-// description matches, the function falls back to checking tracked deps of
-// each convoy via convoyTracksBead.
+// description matches, the function falls back to the tracked-deps check —
+// now ONE direction=up dependency query intersected against the open-convoy
+// list, not a per-convoy subprocess (the aegis-eu3s N+1).
 func TestFindConvoyByDescription_FallsBackToTrackedDeps(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows — shell stubs")
@@ -1573,8 +1574,8 @@ case "$cmd" in
     exit 0
     ;;
   sql)
-    # bdDepListRawIDs down: return tracked bead IDs
-    echo '[{"depends_on_id":"gt-abc"}]'
+    # bdDepListRawIDs up: who tracks gt-abc -> the manually-created convoy
+    echo '[{"issue_id":"hq-cv-manual"}]'
     exit 0
     ;;
   dep)
@@ -1953,5 +1954,71 @@ esac
 	got := getConvoyInfoForIssue("gt-test")
 	if got != nil {
 		t.Errorf("getConvoyInfoForIssue returned %+v, want nil for phantom convoy", got)
+	}
+}
+
+// TestFindConvoyByDescription_OneQueryRegardlessOfConvoyCount pins the
+// aegis-eu3s fix: the tracked-deps fallback must issue ONE dependency query
+// however many open convoys exist. The old code called convoyTracksBead per
+// convoy — one `bd sql` SUBPROCESS each — so a fresh sling's cost scaled with
+// the fleet's open-convoy count (13 open convoys = 13 identical queries = the
+// measured 51s dry-run). The observable is the SUBPROCESS COUNT in the stub's
+// command log, not a stopwatch.
+func TestFindConvoyByDescription_OneQueryRegardlessOfConvoyCount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows — shell stubs")
+	}
+
+	townRoot, logPath := setupTownWithBdStub(t, "")
+
+	// 13 open convoys (the measured Jul-15 population), none matching by
+	// description; the up-query finds no tracker (a fresh bead).
+	convoys := make([]string, 13)
+	for i := range convoys {
+		convoys[i] = fmt.Sprintf(`{"id":"hq-cv-%02d","description":"unrelated convoy %02d"}`, i, i)
+	}
+	bdScript := fmt.Sprintf(`#!/bin/sh
+echo "CMD:$*" >> "%s"
+cmd="$1"
+if [ "$cmd" = "--allow-stale" ]; then
+  shift || true
+  cmd="$1"
+fi
+shift || true
+case "$cmd" in
+  list)
+    echo '[%s]'
+    exit 0
+    ;;
+  sql)
+    echo '[]'
+    exit 0
+    ;;
+esac
+exit 0
+`, logPath, strings.Join(convoys, ","))
+	if err := os.WriteFile(filepath.Join(townRoot, "bin", "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("rewrite bd stub: %v", err)
+	}
+
+	got := findConvoyByDescription(townRoot, "gt-fresh")
+	if got != "" {
+		t.Errorf("findConvoyByDescription() = %q, want empty (nothing tracks gt-fresh)", got)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stub log: %v", err)
+	}
+	sqlCalls := strings.Count(string(logBytes), "CMD:sql") + strings.Count(string(logBytes), " sql ")
+	// Count invocations whose subcommand is sql, tolerating the --allow-stale prefix.
+	sqlCalls = 0
+	for _, line := range strings.Split(string(logBytes), "\n") {
+		if strings.HasPrefix(line, "CMD:") && strings.Contains(line, "sql ") {
+			sqlCalls++
+		}
+	}
+	if sqlCalls != 1 {
+		t.Errorf("tracked-deps fallback issued %d sql subprocesses for 13 open convoys; must be exactly 1 (the aegis-eu3s N+1)", sqlCalls)
 	}
 }

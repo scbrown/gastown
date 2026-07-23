@@ -81,12 +81,28 @@ func findConvoyByDescription(townRoot, beadID string) string {
 		}
 	}
 
-	// Check tracked deps of each convoy (for manually-created convoys).
-	// This handles the case where cross-rig dep resolution (direction=up) fails
-	// but the convoy does have a tracks dependency on the bead.
+	// Check tracked deps (for manually-created convoys) with ONE query, not
+	// one subprocess per convoy. This loop used to call convoyTracksBead per
+	// open convoy — each spawn a fresh `bd sql` process opening its own Dolt
+	// connections — which was the measured N+1 behind sling's 51s dry-run
+	// (aegis-eu3s: 13 identical dependency queries, 20 bd spawns, 68 Dolt
+	// connections for a command that writes nothing). One direction=up query
+	// over the dependencies table answers "who tracks this bead" for ALL
+	// convoys at once — the same cross-database raw-SQL resolution the
+	// per-convoy down-query used (GH #2624), just asked from the other end —
+	// and the open-convoy check intersects against the list already fetched
+	// above instead of spawning bd show per candidate.
+	trackerIDs, err := bdDepListRawIDs(townBeads, beadID, "up", "tracks")
+	if err != nil {
+		return ""
+	}
+	openConvoyIDs := make(map[string]bool, len(convoys))
 	for _, convoy := range convoys {
-		if convoyTracksBead(townBeads, convoy.ID, beadID) {
-			return convoy.ID
+		openConvoyIDs[convoy.ID] = true
+	}
+	for _, trackerID := range trackerIDs {
+		if openConvoyIDs[trackerID] {
+			return trackerID
 		}
 	}
 
