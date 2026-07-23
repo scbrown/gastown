@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func TestEnqueueAndDrain(t *testing.T) {
@@ -1046,5 +1048,153 @@ func TestSweepExpiredEmptyRoot(t *testing.T) {
 	}
 	if res.DirsScanned != 0 || len(res.Discarded) != 0 {
 		t.Errorf("empty town should sweep nothing, got %+v", res)
+	}
+}
+
+// --- rename-following (aegis-qlkj) ------------------------------------------
+
+func TestCrewMember(t *testing.T) {
+	cases := []struct {
+		session string
+		extra   []string
+		want    string
+		ok      bool
+	}{
+		{"aegis-crew-kelly", nil, "kelly", true},
+		{"gt-crew-kelly", nil, "kelly", true},
+		{"gt-gastown-crew-sean", nil, "sean", true}, // multi-segment rig prefix
+		{"shanty-kelly", []string{"shanty-"}, "kelly", true},
+		{"shanty-kelly", nil, "", false},             // prefix not configured
+		{"hq-mayor", []string{"shanty-"}, "", false}, // no scheme matches
+		{"aegis-crew-", nil, "", false},              // empty member
+		{"shanty-", []string{"shanty-"}, "", false},  // empty member
+	}
+	for _, c := range cases {
+		got, ok := crewMember(c.session, c.extra)
+		if got != c.want || ok != c.ok {
+			t.Errorf("crewMember(%q, %v) = (%q, %v), want (%q, %v)",
+				c.session, c.extra, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// The measured failure: nudges enqueued to the member's OLD session name are
+// delivered when the member drains under a DIFFERENT scheme's name.
+func TestDrainFollowsRenameAcrossSchemes(t *testing.T) {
+	townRoot := t.TempDir()
+	writeNudgeConfig(t, townRoot, &config.NudgeThresholds{
+		SessionAliasPrefixes: []string{"shanty-"},
+	})
+
+	// Sender addressed kelly under the crew scheme...
+	if err := Enqueue(townRoot, "aegis-crew-kelly", QueuedNudge{
+		Sender: "sattler", Message: "stranded-1", Priority: PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue crew: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	// ...and a second under a different rig prefix, same member.
+	if err := Enqueue(townRoot, "gt-crew-kelly", QueuedNudge{
+		Sender: "dearing", Message: "stranded-2", Priority: PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue crew2: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	// kelly's own live session has a message too.
+	if err := Enqueue(townRoot, "shanty-kelly", QueuedNudge{
+		Sender: "arnold", Message: "own", Priority: PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue own: %v", err)
+	}
+
+	// kelly, running as shanty-kelly, drains — and gets ALL three, FIFO.
+	got, err := Drain(townRoot, "shanty-kelly")
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("Drain returned %d nudges, want 3 (own + 2 stranded)", len(got))
+	}
+	wantOrder := []string{"stranded-1", "stranded-2", "own"}
+	for i, w := range wantOrder {
+		if got[i].Message != w {
+			t.Errorf("nudge[%d] = %q, want %q (FIFO by timestamp across dirs)", i, got[i].Message, w)
+		}
+	}
+
+	// The alias queues are now empty — a second drain yields nothing.
+	if again, _ := Drain(townRoot, "shanty-kelly"); len(again) != 0 {
+		t.Errorf("second Drain returned %d, want 0 (aliases consumed, no double-delivery)", len(again))
+	}
+	if n, _ := Pending(townRoot, "aegis-crew-kelly"); n != 0 {
+		t.Errorf("alias dir still holds %d after drain, want 0", n)
+	}
+}
+
+// A different member's queue must never be swept up by the alias scan.
+func TestDrainAliasDoesNotCrossMembers(t *testing.T) {
+	townRoot := t.TempDir()
+	writeNudgeConfig(t, townRoot, &config.NudgeThresholds{
+		SessionAliasPrefixes: []string{"shanty-"},
+	})
+	if err := Enqueue(townRoot, "aegis-crew-tim", QueuedNudge{
+		Sender: "x", Message: "for-tim", Priority: PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// kelly drains; tim's queue must be untouched.
+	got, err := Drain(townRoot, "shanty-kelly")
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("kelly drained %d nudges, want 0 (tim's must not cross over)", len(got))
+	}
+	if n, _ := Pending(townRoot, "aegis-crew-tim"); n != 1 {
+		t.Errorf("tim's queue holds %d, want 1 (undisturbed)", n)
+	}
+}
+
+// Without the alias prefix configured, cross-scheme drain does NOT happen —
+// the native crew scheme still cross-drains, but shanty- does not.
+func TestDrainNoAliasWhenUnconfigured(t *testing.T) {
+	townRoot := t.TempDir()
+	writeNudgeConfig(t, townRoot, &config.NudgeThresholds{}) // no alias prefixes
+	if err := Enqueue(townRoot, "aegis-crew-kelly", QueuedNudge{
+		Sender: "x", Message: "stranded", Priority: PriorityNormal,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// shanty-kelly is not a recognized member without the prefix -> no aliasing.
+	got, _ := Drain(townRoot, "shanty-kelly")
+	if len(got) != 0 {
+		t.Errorf("drained %d without alias prefix configured, want 0", len(got))
+	}
+	// But a crew-scheme session for the same member DOES cross-drain natively.
+	got2, _ := Drain(townRoot, "gt-crew-kelly")
+	if len(got2) != 1 || got2[0].Message != "stranded" {
+		t.Errorf("native crew cross-drain failed: got %d", len(got2))
+	}
+}
+
+// writeNudgeConfig writes a town settings file so nudgeConfig() picks up the
+// given thresholds — the same on-disk path production loads from.
+func writeNudgeConfig(t *testing.T, townRoot string, n *config.NudgeThresholds) {
+	t.Helper()
+	dir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir settings: %v", err)
+	}
+	ts := config.TownSettings{
+		Type:        "town-settings",
+		Version:     1,
+		Operational: &config.OperationalConfig{Nudge: n},
+	}
+	data, err := json.MarshalIndent(ts, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), data, 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
 	}
 }

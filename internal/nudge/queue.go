@@ -152,6 +152,64 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 	return nil
 }
 
+// crewMember extracts the stable crew-member identity from a session name, so a
+// member's nudge queue can follow them across naming schemes. Two schemes are
+// recognized:
+//
+//   - the native "<rigPrefix>-crew-<name>" scheme (always) — any rig prefix maps
+//     to <name>, e.g. "aegis-crew-kelly" and "gt-crew-kelly" both → "kelly";
+//   - each prefix in extraPrefixes, whose "<prefix><name>" maps to <name>, e.g.
+//     with "shanty-" configured, "shanty-kelly" → "kelly".
+//
+// Returns ("", false) for a session name matching no recognized scheme, so an
+// unrecognized session aliases nothing (it drains only its own queue).
+func crewMember(session string, extraPrefixes []string) (string, bool) {
+	const crewInfix = "-crew-"
+	if i := strings.Index(session, crewInfix); i >= 0 {
+		if name := session[i+len(crewInfix):]; name != "" {
+			return name, true
+		}
+	}
+	for _, p := range extraPrefixes {
+		if p != "" && strings.HasPrefix(session, p) {
+			if name := strings.TrimPrefix(session, p); name != "" {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// aliasQueueDirs returns queue directories, other than the member's own current
+// session dir, whose session name reduces to the SAME crew member — i.e. queues
+// that were addressed to the member under a different session-name scheme and
+// would otherwise strand undelivered. ownDir is skipped; unreadable roots yield
+// no aliases (the caller still drains its own dir).
+func aliasQueueDirs(townRoot, session, member string, extraPrefixes []string) []string {
+	root := filepath.Join(townRoot, constants.DirRuntime, "nudge_queue")
+	ownDir := queueDir(townRoot, session)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		d := filepath.Join(root, e.Name())
+		if d == ownDir {
+			continue
+		}
+		// The dir name is the (slash-sanitized) session name; crew/shanty
+		// session names carry no slash, so the name round-trips as-is.
+		if m, ok := crewMember(e.Name(), extraPrefixes); ok && m == member {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
+}
+
 // Drain reads and removes all queued nudges for a session, returning them
 // in FIFO order. This is called by the hook to pick up pending nudges.
 //
@@ -161,9 +219,51 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 //
 // Expired nudges (past ExpiresAt) are silently discarded during drain.
 // Orphaned .claimed files from crashed drainers are swept if older than 5 minutes.
+//
+// Rename-following (aegis-qlkj): a member's queue is keyed by the session name
+// at SEND time, which can differ from the member's live session identity across
+// naming schemes (e.g. queued to "aegis-crew-kelly" while kelly runs as
+// "shanty-kelly"). So Drain also drains any sibling queue that reduces to the
+// same crew member, delivering messages that would otherwise strand. The same
+// atomic-claim protocol runs per dir, so a concurrent drainer of the old-name
+// session never causes double-delivery.
 func Drain(townRoot, session string) ([]QueuedNudge, error) {
-	dir := queueDir(townRoot, session)
+	nudges, err := drainDir(townRoot, queueDir(townRoot, session))
+	if err != nil {
+		return nil, err
+	}
 
+	// Also drain any sibling queue addressed to the same crew member under a
+	// different session-name scheme (rename-following). A missing/own dir simply
+	// contributes nothing; alias drains are best-effort and never fail the primary.
+	if member, ok := crewMember(session, nudgeConfig(townRoot).SessionAliasPrefixesV()); ok {
+		for _, aliasDir := range aliasQueueDirs(townRoot, session, member, nudgeConfig(townRoot).SessionAliasPrefixesV()) {
+			aliasNudges, aerr := drainDir(townRoot, aliasDir)
+			if aerr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: draining alias queue %s: %v\n", aliasDir, aerr)
+				continue
+			}
+			nudges = append(nudges, aliasNudges...)
+		}
+		// Restore global FIFO across the merged dirs: filenames are
+		// "<UnixNano>-<suffix>", but across dirs we order by the nudge's own
+		// Timestamp, which is what the filename encodes.
+		if len(nudges) > 1 {
+			sort.SliceStable(nudges, func(i, j int) bool {
+				return nudges[i].Timestamp.Before(nudges[j].Timestamp)
+			})
+		}
+	}
+
+	return nudges, nil
+}
+
+// drainDir reads and removes all queued nudges from a single queue directory,
+// returning them in FIFO (filename/timestamp) order. It is the per-dir half of
+// Drain: the atomic-claim protocol, orphan-requeue, and expiry/defer handling
+// all live here so Drain can apply them uniformly to a member's own queue and to
+// any alias queue that follows the member across a rename.
+func drainDir(townRoot, dir string) ([]QueuedNudge, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {

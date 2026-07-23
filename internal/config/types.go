@@ -300,6 +300,18 @@ type NudgeThresholds struct {
 	// StaleClaimThreshold is how long a .claimed file must be untouched
 	// before treated as orphan (default "5m").
 	StaleClaimThreshold string `json:"stale_claim_threshold,omitempty"`
+
+	// SessionAliasPrefixes are additional session-name prefixes that identify a
+	// crew member, beyond the native "<rig>-crew-<name>" scheme. A nudge queue is
+	// keyed by the session name at SEND time, but a member's live session identity
+	// can differ from what the sender assumed (e.g. a member queued under
+	// "aegis-crew-kelly" is actually running as "shanty-kelly"): the messages then
+	// strand, never drained, though the member is alive. At drain time a session
+	// also drains any sibling queue whose name reduces to the SAME member identity;
+	// the "<rig>-crew-<name>" scheme is always recognized, and each prefix here
+	// (e.g. "shanty-") adds one more scheme whose "<prefix><name>" maps to <name>.
+	// Empty (default) = only the native crew scheme is cross-drained.
+	SessionAliasPrefixes []string `json:"session_alias_prefixes,omitempty"`
 }
 
 // DaemonThresholds configures daemon lifecycle and patrol thresholds.
