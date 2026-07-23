@@ -730,6 +730,38 @@ func outputState(ctx RoleContext, jsonOutput bool) {
 	}
 }
 
+// checkpointBeadStatus returns the CURRENT status of a bead named by a
+// checkpoint, or "" when it cannot be determined. Package var for testability.
+//
+// Why the live lookup matters: a checkpoint is FROZEN at capture time, but it
+// is presented at pickup time — and the bead may have been closed in between.
+// Presenting a closed bead as "resume work" trains the successor to either
+// distrust the checkpoint or silently flip a closed bead back to in_progress
+// with no comment (both observed in production). The sling path has had a
+// closed-bead guard for exactly this reason; this is its mirror on the
+// checkpoint-resume path.
+var checkpointBeadStatus = func(ctx RoleContext, beadID string) string {
+	b := beads.New(rigBeadsRoot(ctx))
+	issue, err := b.Show(beadID)
+	if err != nil || issue == nil {
+		return ""
+	}
+	return string(issue.Status)
+}
+
+// checkpointBeadLine renders the "Hooked bead" line for a checkpoint, flagged
+// when the bead has been closed since the checkpoint was captured.
+func checkpointBeadLine(ctx RoleContext, beadID string) string {
+	status := checkpointBeadStatus(ctx, beadID)
+	if status == "closed" || status == "tombstone" {
+		return fmt.Sprintf("  **Hooked bead:** %s — ⚠️ NOW %s (closed since this checkpoint was captured).\n"+
+			"    Do NOT restart work or set it in_progress. Verify the close still holds\n"+
+			"    (`bd show %s`); if it genuinely must reopen, reopen it EXPLICITLY with a\n"+
+			"    comment stating why — never silently.\n", beadID, strings.ToUpper(status), beadID)
+	}
+	return fmt.Sprintf("  **Hooked bead:** %s\n", beadID)
+}
+
 // outputCheckpointContext reads and displays any previous session checkpoint.
 // This enables crash recovery by showing what the previous session was working on.
 func outputCheckpointContext(ctx RoleContext) {
@@ -771,7 +803,7 @@ func outputCheckpointContext(ctx RoleContext) {
 		fmt.Printf("  **Step:** %s\n", cp.CurrentStep)
 	}
 	if cp.HookedBead != "" {
-		fmt.Printf("  **Hooked bead:** %s\n", cp.HookedBead)
+		fmt.Print(checkpointBeadLine(ctx, cp.HookedBead))
 	}
 	if cp.Branch != "" {
 		fmt.Printf("  **Branch:** %s\n", cp.Branch)
@@ -791,11 +823,17 @@ func outputCheckpointContext(ctx RoleContext) {
 		}
 	}
 	if cp.Notes != "" {
-		fmt.Printf("  **Notes:** %s\n", cp.Notes)
+		// Stamp the notes with their capture time: a note saying "X is LIVE"
+		// reads very differently as "X was live as of 01:14". Frozen notes
+		// asserting a live emergency were replayed verbatim across multiple
+		// session cycles and cost a full re-verification pass each time.
+		fmt.Printf("  **Notes (as of %s — frozen at capture; verify 'live'/'urgent' claims against current state):** %s\n",
+			cp.Timestamp.Format("2006-01-02 15:04 MST"), cp.Notes)
 	}
 	fmt.Println()
 
 	fmt.Println("Use this context to resume work. The checkpoint will be updated as you progress.")
+	fmt.Println("State shown above is from CAPTURE TIME — statuses and alerts may have moved since.")
 	fmt.Println()
 }
 

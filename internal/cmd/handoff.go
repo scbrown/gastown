@@ -1253,6 +1253,20 @@ func getSessionPane(sessionName string) (string, error) {
 
 // sendHandoffMail sends a handoff mail to self and auto-hooks it.
 // Returns the created bead ID and any error.
+// stampHandoffMessage prefixes a handoff note with its capture timestamp.
+//
+// Handoff mail is FROZEN at capture and read at pickup — sometimes hours and
+// several session cycles later. Un-stamped notes asserting a live emergency
+// ("criticals are LIVE, real, urgent") were replayed verbatim across 3+ cycles
+// after the incident was fixed, and beads closed in between were silently
+// flipped back to in_progress by successors acting on the stale note. The
+// stamp makes staleness visible at a glance; the checkpoint display's
+// closed-bead guard (prime_output.go) covers the status half.
+func stampHandoffMessage(message string, capturedAt time.Time) string {
+	return fmt.Sprintf("[handoff captured %s — this note is frozen at capture time. Verify any 'live'/'urgent' claims and every referenced bead's CURRENT status (`bd show`) before acting; a bead closed since capture must not be silently reopened.]\n\n%s",
+		capturedAt.UTC().Format("2006-01-02 15:04 UTC"), message)
+}
+
 func sendHandoffMail(subject, message string) (string, error) {
 	// Build subject with handoff prefix if not already present
 	if subject == "" {
@@ -1265,6 +1279,8 @@ func sendHandoffMail(subject, message string) (string, error) {
 	if message == "" {
 		message = "Context cycling. Check bd ready for pending work."
 	}
+
+	message = stampHandoffMessage(message, time.Now())
 
 	// Detect agent identity for self-mail
 	agentID, _, _, err := resolveSelfTarget()
