@@ -5,10 +5,13 @@ import "testing"
 // The classifier is the load-bearing logic: a crew session is recognized by
 // the Gas Town beacon, and only crew sessions are audited for --settings.
 func TestClassifySessionCmdline(t *testing.T) {
-	launcher := `claude --dangerously-skip-permissions --settings /x/crew/.claude/settings.json [GAS TOWN] crew arnold ... <- human • start`
-	handoff := `claude --dangerously-skip-permissions [GAS TOWN] crew arnold ... <- self • handoff`
-	bare := `claude --dangerously-skip-permissions`
-	unrelated := `vim notes.md`
+	launcher := []string{"claude", "--dangerously-skip-permissions", "--settings", "/x/crew/.claude/settings.json", "[GAS TOWN] crew arnold ... <- human • start"}
+	handoff := []string{"/usr/local/bin/claude", "--dangerously-skip-permissions", "[GAS TOWN] crew arnold ... <- self • handoff"}
+	bare := []string{"claude", "--dangerously-skip-permissions"}
+	unrelated := []string{"vim", "notes.md"}
+	// A shell CARRYING the beacon strings as arguments is not a session — the
+	// first live run flagged its own test harness before argv0 was pinned.
+	carrier := []string{"bash", "-c", "sleep 90", "claude-decoy", "[GAS TOWN] crew decoytest"}
 
 	if crew, has := classifySessionCmdline(launcher); !crew || !has {
 		t.Fatalf("launcher session must classify crew=true settings=true, got %v %v", crew, has)
@@ -25,5 +28,8 @@ func TestClassifySessionCmdline(t *testing.T) {
 	}
 	if crew, _ := classifySessionCmdline(unrelated); crew {
 		t.Fatal("non-claude process must not classify as crew")
+	}
+	if crew, _ := classifySessionCmdline(carrier); crew {
+		t.Fatal("a shell carrying the beacon strings as arguments must not classify as crew")
 	}
 }

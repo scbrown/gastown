@@ -42,14 +42,29 @@ func NewSessionSettingsCheck() *SessionSettingsCheck {
 // ("[GAS TOWN] crew ..."), which every launch path embeds — bare interactive
 // `claude` runs are deliberately NOT flagged (they are not crew sessions and
 // carry no expectation of crew hooks).
-func classifySessionCmdline(cmdline string) (isCrew bool, hasSettings bool) {
-	if !strings.Contains(cmdline, "claude") {
+// argv0 must BE the claude binary (basename match), not merely appear as a
+// substring anywhere in the command line: a shell that happens to CARRY these
+// strings as arguments (a grep, a test harness, a script quoting the beacon)
+// is not a session — the first live run of this check flagged its own test
+// shell and escalated a phantom before this tightening.
+func classifySessionCmdline(argv []string) (isCrew bool, hasSettings bool) {
+	if len(argv) == 0 {
 		return false, false
 	}
-	if !strings.Contains(cmdline, "[GAS TOWN] crew") {
+	base := argv[0]
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	if base != "claude" {
 		return false, false
 	}
-	return true, strings.Contains(cmdline, "--settings")
+	joined := strings.Join(argv[1:], " ")
+	if !strings.Contains(joined, "[GAS TOWN] crew") {
+		return false, false
+	}
+	// The flag is its own argv element on every real launch path; substring
+	// over the remaining args is safe because argv[0] is already pinned.
+	return true, strings.Contains(joined, "--settings")
 }
 
 // Run scans the process table for crew Claude sessions missing --settings.
@@ -78,8 +93,9 @@ func (c *SessionSettingsCheck) Run(ctx *CheckContext) *CheckResult {
 		if err != nil {
 			continue // process exited mid-scan, or not ours to read
 		}
-		cmdline := strings.ReplaceAll(string(raw), "\x00", " ")
-		isCrew, hasSettings := classifySessionCmdline(cmdline)
+		argv := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+		isCrew, hasSettings := classifySessionCmdline(argv)
+		cmdline := strings.Join(argv, " ")
 		if !isCrew {
 			continue
 		}
