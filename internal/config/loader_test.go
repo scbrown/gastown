@@ -15,6 +15,17 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
+// missingPath returns a path guaranteed NOT to exist but whose parent IS
+// accessible, so os.Open returns ENOENT — never EACCES. The bare absent-path
+// literal fails this: on hosts where that path exists as a 0750 system-user
+// home directory (a Debian convention, e.g. promtail/nobody), open() returns
+// EACCES, so every test that expects the missing-file branch fails
+// deterministically rather than exercising it (aegis-pu9i).
+func missingPath(t *testing.T, name string) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "missing", name)
+}
+
 // skipIfAgentBinaryMissing skips the test if any of the specified agent binaries
 // are not found in PATH. This allows tests that depend on specific agents to be
 // skipped in environments where those agents aren't installed.
@@ -129,7 +140,7 @@ func TestRigsConfigRoundTrip(t *testing.T) {
 
 func TestLoadTownConfigNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadTownConfig("/nonexistent/path.json")
+	_, err := LoadTownConfig(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -444,7 +455,7 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 
 func TestLoadRigConfigNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadRigConfig("/nonexistent/path.json")
+	_, err := LoadRigConfig(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -452,7 +463,7 @@ func TestLoadRigConfigNotFound(t *testing.T) {
 
 func TestLoadRigSettingsNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadRigSettings("/nonexistent/path.json")
+	_, err := LoadRigSettings(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -463,7 +474,7 @@ func TestLoadRepoSettings(t *testing.T) {
 
 	t.Run("returns nil when file missing", func(t *testing.T) {
 		t.Parallel()
-		settings, err := LoadRepoSettings("/nonexistent/repo")
+		settings, err := LoadRepoSettings(missingPath(t, "repo"))
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
 		}
@@ -605,7 +616,7 @@ func TestMayorConfigRoundTrip(t *testing.T) {
 
 func TestLoadMayorConfigNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadMayorConfig("/nonexistent/path.json")
+	_, err := LoadMayorConfig(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -723,7 +734,7 @@ func TestAccountsConfigValidation(t *testing.T) {
 
 func TestLoadAccountsConfigNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadAccountsConfig("/nonexistent/path.json")
+	_, err := LoadAccountsConfig(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -924,7 +935,7 @@ func TestMessagingConfigValidation(t *testing.T) {
 
 func TestLoadMessagingConfigNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadMessagingConfig("/nonexistent/path.json")
+	_, err := LoadMessagingConfig(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -949,7 +960,7 @@ func TestLoadMessagingConfigMalformedJSON(t *testing.T) {
 func TestLoadOrCreateMessagingConfig(t *testing.T) {
 	t.Parallel()
 	// Test creating default when not found
-	config, err := LoadOrCreateMessagingConfig("/nonexistent/path.json")
+	config, err := LoadOrCreateMessagingConfig(missingPath(t, "path.json"))
 	if err != nil {
 		t.Fatalf("LoadOrCreateMessagingConfig: %v", err)
 	}
@@ -1807,7 +1818,7 @@ func TestResolveRoleAgentConfigFromRigSettings(t *testing.T) {
 func TestResolveRoleAgentConfigFallsBackToDefaults(t *testing.T) {
 	t.Parallel()
 	// Non-existent paths should use defaults
-	rc := ResolveRoleAgentConfig("polecat", "/nonexistent/town", "/nonexistent/rig")
+	rc := ResolveRoleAgentConfig("polecat", missingPath(t, "town"), missingPath(t, "rig"))
 	if !isClaudeCommand(rc.Command) {
 		t.Errorf("Command = %q, want claude or path ending in /claude (default)", rc.Command)
 	}
@@ -2177,7 +2188,7 @@ func TestDaemonPatrolConfigValidation(t *testing.T) {
 
 func TestLoadDaemonPatrolConfigNotFound(t *testing.T) {
 	t.Parallel()
-	_, err := LoadDaemonPatrolConfig("/nonexistent/path.json")
+	_, err := LoadDaemonPatrolConfig(missingPath(t, "path.json"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
 	}
@@ -2819,7 +2830,7 @@ func TestSaveTownSettings(t *testing.T) {
 func TestGetDefaultFormula(t *testing.T) {
 	t.Parallel()
 	t.Run("returns empty string for nonexistent rig", func(t *testing.T) {
-		result := GetDefaultFormula("/nonexistent/path")
+		result := GetDefaultFormula(missingPath(t, "path"))
 		if result != "" {
 			t.Errorf("GetDefaultFormula() = %q, want empty string", result)
 		}
