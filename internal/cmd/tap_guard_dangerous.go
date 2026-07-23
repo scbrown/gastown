@@ -26,8 +26,14 @@ This guard blocks operations that could cause irreversible damage:
   - git push --force/-f  (--force-with-lease is allowed)
   - git reset --hard
   - git clean -f / git clean -fd
-  - drop table/database
-  - truncate table
+  - drop table/database, truncate table (as arguments to a database CLI)
+
+Matching is COMMAND-POSITION aware, not substring containment: the command
+line is shell-scanned (quotes, heredoc bodies, command substitutions,
+sh -c / eval / xargs payloads), so prose that merely NAMES a dangerous
+command — a quoted heredoc documenting 'git reset --hard', an
+echo/grep/commit-message mentioning sudo — is not blocked, while
+'/usr/bin/sudo' and '$(sudo ...)' are. See tap_guard_shellscan.go.
 
 The guard reads the tool input from stdin (Claude Code hook protocol)
 and exits with code 2 to block dangerous operations.
@@ -42,26 +48,24 @@ func init() {
 	tapGuardCmd.AddCommand(tapGuardDangerousCmd)
 }
 
-// dangerousPattern defines a pattern to match and its human-readable reason.
-// All substrings must appear in the command (simple containment check).
-// For patterns that need smarter matching (rm -rf, git push --force),
-// use the dedicated match functions instead.
-type dangerousPattern struct {
+// sqlFragments are checked by containment against the arguments of a known
+// database CLI (they live inside quoted -e/-q strings, so token matching
+// cannot see them). They are NOT checked against arbitrary commands — a bead
+// comment mentioning "drop table" is prose, not SQL.
+var sqlFragments = []struct {
 	contains []string
 	reason   string
-}
-
-// fragmentPatterns use simple containment matching (all substrings must appear).
-var fragmentPatterns = []dangerousPattern{
-	{[]string{"git", "reset", "--hard"}, "Hard reset discards all uncommitted changes irreversibly"},
-	{[]string{"git", "clean", "-f"}, "git clean -f deletes untracked files irreversibly"},
+}{
 	{[]string{"drop", "table"}, "database table destruction"},
 	{[]string{"drop", "database"}, "database destruction"},
 	{[]string{"truncate", "table"}, "database table truncation"},
 }
 
-// safeForceFlags are git push flags that look like --force but are safe.
-var safeForceFlags = []string{"--force-with-lease", "--force-if-includes"}
+// dbClients are argv0 basenames whose arguments are treated as SQL.
+var dbClients = map[string]bool{
+	"mysql": true, "mariadb": true, "psql": true, "sqlite3": true,
+	"dolt": true, "mycli": true, "pgcli": true, "sqlcmd": true,
+}
 
 func runTapGuardDangerous(cmd *cobra.Command, args []string) error {
 	// Read hook input from stdin (Claude Code protocol)
@@ -75,37 +79,33 @@ func runTapGuardDangerous(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	lower := strings.ToLower(command)
+	if reason := findDangerousCommand(command); reason != "" {
+		printDangerousBlock(reason, command)
+		return NewSilentExit(2)
+	}
+	return nil
+}
 
-	// Check privilege escalation and package manager commands first
-	if reason := matchesSudo(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
-	}
-	if reason := matchesPackageInstall(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
-	}
-
-	// Check special patterns that need smarter matching
-	if reason := matchesDangerousRmRf(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
-	}
-	if reason := matchesDangerousGitPush(lower); reason != "" {
-		printDangerousBlock(reason, command)
-		return NewSilentExit(2)
-	}
-
-	// Check simple fragment patterns
-	for _, pattern := range fragmentPatterns {
-		if matchesAllFragments(lower, pattern.contains) {
-			printDangerousBlock(pattern.reason, command)
-			return NewSilentExit(2)
+// findDangerousCommand shell-scans the command line and returns the reason for
+// the first dangerous simple command found, or "" if none.
+func findDangerousCommand(command string) string {
+	for _, c := range scanCommands(command) {
+		if len(c.tokens) == 0 {
+			continue
+		}
+		for _, check := range []func(*simpleCommand) string{
+			matchesSudo,
+			matchesPackageInstall,
+			matchesDangerousRm,
+			matchesDangerousGit,
+			matchesDangerousSQL,
+		} {
+			if reason := check(&c); reason != "" {
+				return reason
+			}
 		}
 	}
-
-	return nil
+	return ""
 }
 
 // printDangerousBlock prints the standard block banner to stderr.
@@ -148,106 +148,130 @@ func matchesAllFragments(command string, fragments []string) bool {
 	return true
 }
 
-// matchesDangerousRmRf blocks "rm -rf /" targeting the root filesystem.
+// matchesSudo blocks privilege escalation: sudo/doas at command position
+// (path-normalized, so /usr/bin/sudo counts) or as an unquoted argument
+// (find -exec sudo, etc.). A quoted "sudo" is prose and does not match.
+func matchesSudo(c *simpleCommand) string {
+	const reason = "Agents must never use sudo — do not elevate privileges or modify the host OS"
+	a := c.argv0Base()
+	if a == "sudo" || a == "doas" {
+		return reason
+	}
+	if c.hasUnquotedToken("sudo") || c.hasUnquotedToken("doas") {
+		return reason
+	}
+	return ""
+}
+
+// packageManagerVerbs maps a package-manager argv0 to its install verb.
+var packageManagerVerbs = map[string]struct {
+	verb   string
+	reason string
+}{
+	"apt":     {"install", "System package install (apt) — use workspace tools instead"},
+	"apt-get": {"install", "System package install (apt-get) — use workspace tools instead"},
+	"dnf":     {"install", "System package install (dnf) — use workspace tools instead"},
+	"yum":     {"install", "System package install (yum) — use workspace tools instead"},
+	"brew":    {"install", "Package install (brew) — use workspace tools instead"},
+	"gem":     {"install", "System gem install — use workspace tools instead"},
+}
+
+// matchesPackageInstall blocks system package manager install commands.
+// The manager must be at command position; `echo "apt install foo"` is prose.
+func matchesPackageInstall(c *simpleCommand) string {
+	a := c.argv0Base()
+	if p, ok := packageManagerVerbs[a]; ok && c.hasUnquotedToken(p.verb) {
+		return p.reason
+	}
+	if a == "pacman" {
+		for _, t := range c.tokens[1:] {
+			if !t.quoted && strings.HasPrefix(strings.ToLower(t.text), "-s") {
+				return "System package install (pacman) — use workspace tools instead"
+			}
+		}
+	}
+	if (a == "pip" || a == "pip2" || a == "pip3") &&
+		c.hasUnquotedToken("install") && c.hasUnquotedToken("--system") {
+		return "System-level pip install — use a virtualenv or workspace tools instead"
+	}
+	if a == "npm" && c.hasUnquotedToken("install") &&
+		(c.hasUnquotedToken("-g") || c.hasUnquotedToken("--global")) {
+		return "Global npm install — use workspace tools instead"
+	}
+	return ""
+}
+
+// matchesDangerousRm blocks "rm -rf /" targeting the root filesystem.
 // Only blocks when the target is literally "/" or "/*". Normal cleanup
 // commands like "rm -rf ./build/" are allowed.
-func matchesDangerousRmRf(command string) string {
-	if !strings.Contains(command, "rm") {
+func matchesDangerousRm(c *simpleCommand) string {
+	if c.argv0Base() != "rm" {
 		return ""
 	}
-	fields := strings.Fields(command)
-	hasRm := false
 	hasRecursiveForce := false
-	for _, f := range fields {
-		if f == "rm" {
-			hasRm = true
+	for _, t := range c.tokens[1:] {
+		if t.quoted {
+			continue
 		}
-		if strings.HasPrefix(f, "-") && strings.Contains(f, "r") && strings.Contains(f, "f") {
+		low := strings.ToLower(t.text)
+		if strings.HasPrefix(low, "-") && strings.Contains(low, "r") && strings.Contains(low, "f") {
 			hasRecursiveForce = true
 		}
-		if hasRm && hasRecursiveForce && (f == "/" || f == "/*") {
+		if hasRecursiveForce && (t.text == "/" || t.text == "/*") {
 			return "filesystem destruction (rm -rf /)"
 		}
 	}
 	return ""
 }
 
-// matchesSudo blocks any command that starts with or contains "sudo".
-// Agents must never elevate privileges on the host system.
-func matchesSudo(command string) string {
-	fields := strings.Fields(command)
-	for _, f := range fields {
-		if f == "sudo" {
-			return "Agents must never use sudo — do not elevate privileges or modify the host OS"
-		}
-	}
-	return ""
-}
-
-// packageManagerPatterns lists system package manager install commands.
-// Each entry has the command prefix tokens and a reason.
-var packageManagerPatterns = []struct {
-	tokens []string
-	reason string
-}{
-	{[]string{"apt", "install"}, "System package install (apt) — use workspace tools instead"},
-	{[]string{"apt-get", "install"}, "System package install (apt-get) — use workspace tools instead"},
-	{[]string{"dnf", "install"}, "System package install (dnf) — use workspace tools instead"},
-	{[]string{"yum", "install"}, "System package install (yum) — use workspace tools instead"},
-	{[]string{"pacman", "-s"}, "System package install (pacman) — use workspace tools instead"},
-	{[]string{"brew", "install"}, "Package install (brew) — use workspace tools instead"},
-	{[]string{"gem", "install"}, "System gem install — use workspace tools instead"},
-}
-
-// matchesPackageInstall blocks system package manager install commands.
-// Also blocks "pip install" with --system flag and "npm install -g" (global installs).
-func matchesPackageInstall(command string) string {
-	// Check simple token-based patterns (apt install, dnf install, etc.)
-	for _, p := range packageManagerPatterns {
-		if matchesAllFragments(command, p.tokens) {
-			return p.reason
-		}
-	}
-
-	// pip install --system (but not regular pip install into a venv)
-	if strings.Contains(command, "pip") && strings.Contains(command, "install") && strings.Contains(command, "--system") {
-		return "System-level pip install — use a virtualenv or workspace tools instead"
-	}
-
-	// npm install -g / npm install --global
-	if strings.Contains(command, "npm") && strings.Contains(command, "install") {
-		if strings.Contains(command, " -g ") || strings.Contains(command, " -g") || strings.Contains(command, "--global") {
-			return "Global npm install — use workspace tools instead"
-		}
-	}
-
-	return ""
-}
-
-// matchesDangerousGitPush blocks "git push --force" while allowing safe
-// variants like "--force-with-lease" and "--force-if-includes".
-func matchesDangerousGitPush(command string) string {
-	if !strings.Contains(command, "git") || !strings.Contains(command, "push") {
+// matchesDangerousGit blocks destructive git operations at command position:
+// reset --hard, clean -f, push --force/-f. Flags must be real unquoted
+// tokens, so `git commit -m "forbid git reset --hard"` is prose and allowed.
+// Safe force variants (--force-with-lease, --force-if-includes) are distinct
+// exact tokens and simply never match --force/-f.
+func matchesDangerousGit(c *simpleCommand) string {
+	if c.argv0Base() != "git" {
 		return ""
 	}
-	fields := strings.Fields(command)
-	hasPush := false
-	for i, f := range fields {
-		if f == "push" && i > 0 && fields[i-1] == "git" {
-			hasPush = true
-			continue
-		}
-		if !hasPush {
-			continue
-		}
-		if f == "--force" || f == "-f" {
-			return "Force push rewrites remote history and can destroy others' work"
-		}
-		// Skip safe force variants (don't accidentally match their substrings)
-		for _, safe := range safeForceFlags {
-			if f == safe {
-				break
+	if c.hasUnquotedToken("reset") {
+		for _, t := range c.tokens[1:] {
+			if !t.quoted && strings.EqualFold(t.text, "--hard") {
+				return "Hard reset discards all uncommitted changes irreversibly"
 			}
+		}
+	}
+	if c.hasUnquotedToken("clean") {
+		for _, t := range c.tokens[1:] {
+			if t.quoted {
+				continue
+			}
+			low := strings.ToLower(t.text)
+			if strings.HasPrefix(low, "-") && !strings.HasPrefix(low, "--") && strings.Contains(low, "f") {
+				return "git clean -f deletes untracked files irreversibly"
+			}
+		}
+	}
+	if c.hasUnquotedToken("push") {
+		for _, t := range c.tokens[1:] {
+			if !t.quoted && (t.text == "--force" || t.text == "-f") {
+				return "Force push rewrites remote history and can destroy others' work"
+			}
+		}
+	}
+	return ""
+}
+
+// matchesDangerousSQL blocks destructive SQL handed to a database CLI.
+// SQL rides inside quoted -e/-q arguments, so this is the one place
+// containment matching is still used — scoped to known db clients.
+func matchesDangerousSQL(c *simpleCommand) string {
+	a := c.argv0Base()
+	if !dbClients[a] && a != "drop" && a != "truncate" {
+		return ""
+	}
+	for _, p := range sqlFragments {
+		if matchesAllFragments(c.raw, p.contains) {
+			return p.reason
 		}
 	}
 	return ""
