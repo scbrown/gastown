@@ -610,3 +610,67 @@ func TestGetNextSeverityMatchesConfig(t *testing.T) {
 		}
 	}
 }
+
+// delivery truth must come from the statuses, and bead/log/mail must
+// never count as a human being notified.
+func TestSummarizeDeliveryHumanReaching(t *testing.T) {
+	cases := []struct {
+		name       string
+		statuses   []deliveryStatus
+		wantHuman  bool
+		wantDelivd []string
+	}{
+		{
+			name: "only bead + log delivered — nobody human notified",
+			statuses: []deliveryStatus{
+				{Channel: "bead", Created: true, RuntimeNotified: false},
+				{Channel: "log", Target: "log", RuntimeNotified: true},
+			},
+			wantHuman:  false,
+			wantDelivd: []string{"log"},
+		},
+		{
+			name: "mail to an agent inbox is NOT human-reaching",
+			statuses: []deliveryStatus{
+				{Channel: "bead", Created: true},
+				{Channel: "mail", Target: "mayor", RuntimeNotified: true},
+			},
+			wantHuman:  false,
+			wantDelivd: []string{"mail:mayor"},
+		},
+		{
+			name: "email skipped (unconfigured) — nobody notified, nothing delivered",
+			statuses: []deliveryStatus{
+				{Channel: "bead", Created: true},
+				{Channel: "email", Target: "human", Warning: "contacts.smtp_host not configured"},
+			},
+			wantHuman:  false,
+			wantDelivd: nil,
+		},
+		{
+			name: "sms actually sent — human reached",
+			statuses: []deliveryStatus{
+				{Channel: "bead", Created: true},
+				{Channel: "sms", Target: "stiwi", RuntimeNotified: true},
+			},
+			wantHuman:  true,
+			wantDelivd: []string{"sms:stiwi"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			human, delivered := summarizeDelivery(tc.statuses)
+			if human != tc.wantHuman {
+				t.Errorf("humanReaching = %v, want %v", human, tc.wantHuman)
+			}
+			if len(delivered) != len(tc.wantDelivd) {
+				t.Fatalf("deliveredTo = %v, want %v", delivered, tc.wantDelivd)
+			}
+			for i := range delivered {
+				if delivered[i] != tc.wantDelivd[i] {
+					t.Errorf("deliveredTo[%d] = %q, want %q", i, delivered[i], tc.wantDelivd[i])
+				}
+			}
+		})
+	}
+}

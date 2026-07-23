@@ -191,6 +191,17 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Process external notification actions (email:, sms:, slack, log)
 	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
 
+	// Delivery truth: summarize from what HAPPENED (the per-channel
+	// statuses gt already computed), NOT from the route CONFIG. A "human-reaching"
+	// delivery is a runtime-CONFIRMED send on an external human channel — email,
+	// sms, or slack. "bead" and "log" are local artifacts and "mail" is an agent
+	// inbox; none of them is a human being paged, so none counts. This is what
+	// stops the summary claiming success the delivery did not earn: previously it
+	// printed "Routed to:" from the intended targets and always exited 0, so on a
+	// host where every human channel is unconfigured, CRITICAL escalations that
+	// reached NOBODY reported success.
+	humanReaching, deliveredTo := summarizeDelivery(statuses)
+
 	// Log to activity feed
 	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
 	payload["severity"] = severity
@@ -210,12 +221,14 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 			}
 		}
 		result := map[string]interface{}{
-			"id":       issue.ID,
-			"severity": severity,
-			"actions":  actions,
-			"targets":  targets,
-			"delivery": statuses,
-			"status":   map[bool]string{true: "partial_failure", false: "ok"}[hasFailure],
+			"id":             issue.ID,
+			"severity":       severity,
+			"actions":        actions,
+			"targets":        targets,
+			"delivery":       statuses,
+			"delivered_to":   deliveredTo,
+			"human_reaching": humanReaching,
+			"status":         map[bool]string{true: "partial_failure", false: "ok"}[hasFailure],
 		}
 		if escalateSource != "" {
 			result["source"] = escalateSource
@@ -235,14 +248,42 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if fingerprintLabel != "" {
 			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
+		// "Routed to:" reflects what DELIVERED, not what was intended. Empty when
+		// nothing delivered — do not print a dangling label naming config-only
+		// targets (it used to print "Routed to: mayor" for a process
+		// that does not exist on a crew-only host).
+		if len(deliveredTo) > 0 {
+			fmt.Printf("  Routed to: %s\n", strings.Join(deliveredTo, ", "))
+		}
 		for _, status := range statuses {
 			if status.Error != "" {
 				fmt.Printf("  Delivery issue [%s:%s]: %s\n", status.Channel, status.Target, status.Error)
 			}
 		}
+		if !humanReaching {
+			fmt.Println()
+			style.PrintWarning("NOBODY WAS NOTIFIED. This escalation is a bead and nothing more.")
+			for _, status := range statuses {
+				if status.Channel != "email" && status.Channel != "sms" && status.Channel != "slack" {
+					continue
+				}
+				switch {
+				case status.Warning != "":
+					fmt.Printf("  %s:%s skipped — %s\n", status.Channel, status.Target, status.Warning)
+				case status.Error != "":
+					fmt.Printf("  %s:%s failed — %s\n", status.Channel, status.Target, status.Error)
+				}
+			}
+			fmt.Println("  Reach a human another way and say so on the bead.")
+		}
 	}
 
+	// Exit nonzero when no human-reaching channel delivered. The bead
+	// is still created above — this signals that NOTIFICATION failed, which the old
+	// unconditional exit 0 hid. An escalation that reaches nobody is a failure.
+	if !humanReaching {
+		return fmt.Errorf("escalation %s reached NO human-notifying channel (email/sms/slack) — it is a bead only; notify a human another way", issue.ID)
+	}
 	return nil
 }
 
@@ -683,6 +724,29 @@ func extractMailTargetsFromActions(actions []string) []string {
 }
 
 // executeExternalActions processes external notification actions (email:, sms:, slack, log).
+// summarizeDelivery reports delivery TRUTH from the per-channel statuses gt built
+//. It returns whether any HUMAN-reaching channel (email/sms/slack)
+// was runtime-confirmed, and the list of channels that actually delivered. "bead"
+// and "log" are local artifacts and "mail" is an agent inbox — none is a human
+// being paged, so none makes humanReaching true or appears as a human delivery.
+// Pure over its input so the zero-delivery path is directly testable.
+func summarizeDelivery(statuses []deliveryStatus) (humanReaching bool, deliveredTo []string) {
+	for _, s := range statuses {
+		if !s.RuntimeNotified {
+			continue
+		}
+		if s.Channel == "email" || s.Channel == "sms" || s.Channel == "slack" {
+			humanReaching = true
+		}
+		label := s.Channel
+		if s.Target != "" && s.Target != s.Channel {
+			label = s.Channel + ":" + s.Target
+		}
+		deliveredTo = append(deliveredTo, label)
+	}
+	return humanReaching, deliveredTo
+}
+
 func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, townRoot string) []deliveryStatus {
 	statuses := []deliveryStatus{}
 	for _, action := range actions {
@@ -837,7 +901,7 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 // sendEscalationSMS posts an escalation notification via the push webhook and returns a
 // RECEIPT identifying what was published, or an error. It deliberately returns evidence
 // rather than a bare nil: the caller prints what this establishes, and it can only print
-// as much as this proves (aegis-uz6i).
+// as much as this proves (an internal incident).
 func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description string) (string, error) {
 	payload := map[string]string{
 		"to":   cfg.Contacts.HumanSMS,
@@ -862,7 +926,7 @@ func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, descripti
 }
 
 // parsePublishReceipt turns the webhook's response body into PROOF THAT SOMETHING WAS
-// PUBLISHED, or an error. A 2xx on its own is not that proof (aegis-uz6i).
+// PUBLISHED, or an error. A 2xx on its own is not that proof (an internal incident).
 //
 // MEASURED 2026-07-20 against the configured endpoint: a real publish answers with
 // JSON — {"id":"NQ2oOnDcFWQr","time":...,"topic":"ops-alerts",...} — while a GET

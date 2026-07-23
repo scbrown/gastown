@@ -25,6 +25,9 @@ var escalateCmd = &cobra.Command{
 	GroupID: GroupComm,
 	Short:   "Escalation system for critical issues",
 	RunE:    runEscalate,
+	// A zero-delivery escalation returns an error to exit nonzero.
+	// That is not a usage error, so do not dump the help text after it.
+	SilenceUsage: true,
 	Long: `Create and manage escalations for critical issues.
 
 The escalation system provides severity-based routing for issues that need
