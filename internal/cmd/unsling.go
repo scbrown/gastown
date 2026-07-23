@@ -57,6 +57,15 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 }
 
 func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error {
+	// Past this point every error is a RUNTIME refusal (guard declining to
+	// unsling incomplete work, wrong bead, missing identity), not a syntax
+	// error — suppress the usage block so the refusal reason is the output,
+	// not the footnote. A guard refusal rendered above seven lines of usage
+	// reads as "you typed it wrong" and sends the caller hunting for syntax
+	// that was never wrong (aegis-1xol). Args/flag errors still show usage:
+	// they fail before RunE runs.
+	cmd.SilenceUsage = true
+
 	var targetBeadID string
 	var targetAgent string
 

@@ -172,7 +172,12 @@ func init() {
 	// Flags for attach subcommand
 	hookAttachCmd.Flags().BoolVarP(&hookForce, "force", "f", false, "Replace existing incomplete hooked bead")
 
-	// Flags for detach subcommand (mirror unsling flags)
+	// Flags for detach subcommand (mirror unsling flags).
+	// --dry-run was missing here while detach's RunE already passed hookDryRun
+	// through — so the one flag that reveals the unsling guard's reasoning
+	// didn't exist on the door whose --help claims equivalence with clear
+	// (aegis-1xol).
+	hookDetachCmd.Flags().BoolVarP(&hookDryRun, "dry-run", "n", false, "Show what would be done")
 	hookDetachCmd.Flags().BoolVarP(&hookForce, "force", "f", false, "Detach even if work is incomplete")
 
 	// Flags for clear subcommand (mirror unsling flags)
