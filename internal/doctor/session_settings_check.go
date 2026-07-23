@@ -123,7 +123,7 @@ func (c *SessionSettingsCheck) Run(ctx *CheckContext) *CheckResult {
 				"injection, and no PreCompact self-cycle. They cannot recover in-session:",
 				"--settings binds at process start (aegis-05up / gt-qiz2s3u).",
 			}, flagged...),
-			FixHint: "Kill the flagged session(s); the crew watchdog relaunches them through the guarded launcher path within ~3 minutes. `gt handoff` cannot produce a guarded session until the respawn fix is installed.",
+			FixHint: "tmux kill-session the flagged session(s) — NOT just the claude pid (a live pane reads healthy to the crew watchdog); it relaunches them through the guarded launcher path within ~3 minutes. `gt handoff` cannot produce a guarded session until the respawn fix is installed.",
 		}
 	}
 
