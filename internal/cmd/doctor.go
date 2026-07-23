@@ -184,6 +184,10 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// its EnsureSettingsForRole sees stale files → returns early → sessions
 	// start with missing PATH exports. See gt-99u.
 	d.Register(doctor.NewClaudeSettingsCheck())
+	// Live-session audit (aegis-05up / gt-qiz2s3u): a crew session respawned
+	// without --settings runs hookless — no tap guards, no priming, no mail —
+	// and is invisible from the inside. Only the process table can see it.
+	d.Register(doctor.NewSessionSettingsCheck())
 	d.Register(doctor.NewDaemonCheck())
 	d.Register(doctor.NewTmuxGlobalEnvCheck())
 	d.Register(doctor.NewBootHealthCheck())
