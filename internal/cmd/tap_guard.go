@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -27,11 +28,13 @@ Available guards:
 External guards (standalone scripts, not compiled into gt):
   context-budget   - scripts/guards/context-budget-guard.sh
 
-Example hook configuration:
+Example hook configuration (matcher MUST be the tool name "Bash" —
+the "Bash(cmd*)" form is PERMISSIONS syntax and as a hook matcher NEVER fires;
+guards filter the command themselves):
   {
     "PreToolUse": [{
-      "matcher": "Bash(gh pr create*)",
-      "hooks": [{"command": "gt tap guard pr-workflow"}]
+      "matcher": "Bash",
+      "hooks": [{"command": "gt tap guard dangerous-command"}]
     }]
   }`,
 }
@@ -66,7 +69,58 @@ func init() {
 	tapGuardCmd.AddCommand(tapGuardPRWorkflowCmd)
 }
 
+// prWorkflowCommandMatch reports whether the hook command actually attempts a
+// PR-workflow operation (gh pr create / git checkout -b / git switch -c) at
+// command position. Rides the same shell-aware scanner as dangerous-command
+// (tap_guard_shellscan.go), so path-prefixed argv0, wrappers (bash -c, eval,
+// xargs) and command substitutions are seen, while quoted prose, heredoc
+// bodies and commit messages that merely NAME the operations are not.
+func prWorkflowCommandMatch(command string) bool {
+	for _, c := range scanCommands(command) {
+		switch c.argv0Base() {
+		case "gh":
+			if len(c.tokens) >= 3 &&
+				!c.tokens[1].quoted && strings.EqualFold(c.tokens[1].text, "pr") &&
+				!c.tokens[2].quoted && strings.EqualFold(c.tokens[2].text, "create") {
+				return true
+			}
+		case "git":
+			if len(c.tokens) >= 2 && !c.tokens[1].quoted {
+				switch strings.ToLower(c.tokens[1].text) {
+				case "checkout":
+					if c.hasUnquotedToken("-b") {
+						return true
+					}
+				case "switch":
+					if c.hasUnquotedToken("-c") {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
+	// SELF-FILTERING (aegis-ptfb): this guard historically never read the
+	// command — it blocked on CONTEXT alone (GT_* env or an agent cwd), and
+	// relied on `Bash(gh pr create*)` hook matchers for command filtering.
+	// Claude Code hook matchers match TOOL NAMES; the paren form is
+	// permissions syntax and fires NEVER (measured: matcher "Bash(echo *)"
+	// did not fire on an echo; matcher "Bash" did) — so wired correctly on
+	// matcher "Bash", the unfiltered guard would block EVERY bash call in
+	// every agent session (measured: exit 2 on `echo hello` with GT_CREW
+	// set). Filter here: only commands that actually attempt a PR-workflow
+	// operation reach the context decision. When stdin carries no command
+	// (manual invocation, non-Bash hook), keep the historical context-only
+	// behavior.
+	if input, err := io.ReadAll(os.Stdin); err == nil {
+		if command := extractCommand(input); command != "" && !prWorkflowCommandMatch(command) {
+			return nil
+		}
+	}
+
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
 		fmt.Fprintln(os.Stderr, "")
