@@ -2233,17 +2233,25 @@ func TestLooksLikeBeadID(t *testing.T) {
 		{"mol-release", true}, // 3-char prefix matches pattern (formula check runs first in sling)
 		{"mol-abc123", true},  // 3-char prefix matches pattern
 
+		// >=6-char prefixes (aegis-hg3i): the old cap of 5 silently disabled
+		// the routing-miss fallback for any rig with a longer name — "bobbin"
+		// missed it by ONE character and was born broken. No length cap now:
+		// bd does not bound prefix length, so neither may this fallback.
+		{"bobbin-jdlkh", true},           // THE specimen: 6-char rig prefix
+		{"bobbin-66ds6", true},           // the bead that surfaced the split-brain
+		{"aaaaaa-b", true},               // exactly one over the old cap
+		{"verylongrigname-abc123", true}, // no cap means NO cap
+		{"formula-name", true},           // matches pattern; formula check runs first in sling, and the batch path lets bd reject it with a real error
+
 		// Non-bead strings - should return false
-		{"formula-name", false}, // "formula" is 7 chars (> 5)
-		{"mayor", false},        // no hyphen
-		{"gastown", false},      // no hyphen
-		{"deacon/dogs", false},  // contains slash
-		{"", false},             // empty
-		{"-abc", false},         // starts with hyphen
-		{"GT-abc", false},       // uppercase prefix
-		{"123-abc", false},      // numeric prefix
-		{"a-", false},           // nothing after hyphen
-		{"aaaaaa-b", false},     // prefix too long (6 chars)
+		{"mayor", false},       // no hyphen
+		{"gastown", false},     // no hyphen
+		{"deacon/dogs", false}, // contains slash
+		{"", false},            // empty
+		{"-abc", false},        // starts with hyphen
+		{"GT-abc", false},      // uppercase prefix
+		{"123-abc", false},     // numeric prefix
+		{"a-", false},          // nothing after hyphen
 
 		// Injection / invalid suffix characters - should return false
 		{"gt-abc;rm -rf /", false}, // shell injection in suffix

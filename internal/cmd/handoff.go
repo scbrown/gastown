@@ -1396,13 +1396,23 @@ func warnHandoffGitStatus() {
 }
 
 // looksLikeBeadID checks if a string looks like a bead ID.
-// Bead IDs have format: prefix-xxxx where prefix is 1-5 lowercase letters and xxxx is alphanumeric.
-// Examples: "gt-abc123", "bd-ka761", "hq-cv-abc", "beads-xyz", "ap-qtsup.16"
+// Bead IDs have format: prefix-xxxx where prefix is lowercase letters and
+// xxxx is alphanumeric (dots/hyphens allowed after the first char, which also
+// covers multi-part prefixes like "beads-vscode-1").
+// Examples: "gt-abc123", "bd-ka761", "hq-cv-abc", "bobbin-jdlkh", "ap-qtsup.16"
+//
+// There is deliberately NO length cap on the prefix (aegis-hg3i): bd itself
+// does not bound prefix length, so any cap here is an undocumented constraint
+// on rig naming that silently disables sling's routing-miss fallback for
+// rigs whose name exceeds it — "bobbin" (6 letters) was born broken against
+// the old cap of 5. This is a last-resort fallback: over-accepting means bd
+// rejects the ID moments later with a real error; under-accepting means a
+// hard "not a valid bead or formula" for a perfectly valid bead.
 func looksLikeBeadID(s string) bool {
 	// Find the first hyphen
 	idx := strings.Index(s, "-")
-	if idx < 1 || idx > 5 {
-		// No hyphen, or prefix is empty/too long
+	if idx < 1 {
+		// No hyphen, or empty prefix
 		return false
 	}
 
