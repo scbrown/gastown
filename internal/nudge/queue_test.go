@@ -1,6 +1,7 @@
 package nudge
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -789,5 +790,261 @@ func TestConcurrentDrainNoDoubleDeli(t *testing.T) {
 	// Verify no double-delivery: total must be exactly count, not more.
 	if total > count {
 		t.Errorf("double delivery detected: got %d total nudges, want exactly %d", total, count)
+	}
+}
+
+// --- SweepExpired -----------------------------------------------------------
+
+// countDiscardsBySession returns how many discards a sweep recorded for a given
+// session name.
+func countDiscardsBySession(res SweepResult, session string) int {
+	n := 0
+	for _, d := range res.Discarded {
+		if d.Session == session {
+			n++
+		}
+	}
+	return n
+}
+
+func dirRemoved(res SweepResult, session string) bool {
+	for _, s := range res.DirsRemoved {
+		if s == session {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSweepExpiredReclaimsDeadSessionDir is the aegis-l7nn case: a queue whose
+// session no longer exists is never drained, so an expired nudge (and its dir)
+// strand forever. The sweep must discard the nudge and reclaim the empty dir.
+func TestSweepExpiredReclaimsDeadSessionDir(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "aegis-crew-ghost"
+
+	expired := QueuedNudge{
+		Sender:    "gt-mayor",
+		Message:   "window-GO",
+		Kind:      "direct",
+		Timestamp: time.Now().Add(-3 * time.Hour),
+		ExpiresAt: time.Now().Add(-2 * time.Hour),
+	}
+	if err := Enqueue(townRoot, session, expired); err != nil {
+		t.Fatalf("Enqueue expired: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, false)
+	if err != nil {
+		t.Fatalf("SweepExpired: %v", err)
+	}
+	if got := countDiscardsBySession(res, session); got != 1 {
+		t.Fatalf("discarded %d for %s, want 1", got, session)
+	}
+	if res.Discarded[0].Reason != "expired" {
+		t.Errorf("reason = %q, want expired", res.Discarded[0].Reason)
+	}
+	if res.Discarded[0].Kind != "direct" {
+		t.Errorf("kind = %q, want direct", res.Discarded[0].Kind)
+	}
+	if !dirRemoved(res, session) {
+		t.Errorf("empty dead-session dir %s should have been reclaimed", session)
+	}
+	if _, err := os.Stat(filepath.Join(townRoot, ".runtime", "nudge_queue", session)); !os.IsNotExist(err) {
+		t.Errorf("dir %s should no longer exist on disk", session)
+	}
+}
+
+// TestSweepExpiredKeepsUnexpired: a still-valid nudge (and its dir, which may
+// belong to a session that is merely restarting) must survive untouched.
+func TestSweepExpiredKeepsUnexpired(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "aegis-crew-live"
+
+	fresh := QueuedNudge{Sender: "ian", Message: "reindex done"} // Enqueue sets a future TTL
+	if err := Enqueue(townRoot, session, fresh); err != nil {
+		t.Fatalf("Enqueue fresh: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, false)
+	if err != nil {
+		t.Fatalf("SweepExpired: %v", err)
+	}
+	if got := countDiscardsBySession(res, session); got != 0 {
+		t.Errorf("discarded %d for live session, want 0", got)
+	}
+	if dirRemoved(res, session) {
+		t.Errorf("non-empty dir %s must not be removed", session)
+	}
+	pending, _ := Pending(townRoot, session)
+	if pending != 1 {
+		t.Errorf("Pending = %d, want 1 (fresh nudge preserved)", pending)
+	}
+}
+
+// TestSweepExpiredMixed: expired discarded, fresh kept, dir NOT reclaimed
+// because it is still non-empty.
+func TestSweepExpiredMixed(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "aegis-crew-mixed"
+
+	expired := QueuedNudge{
+		Sender:    "old",
+		Message:   "stale",
+		Timestamp: time.Now().Add(-time.Hour),
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	if err := Enqueue(townRoot, session, expired); err != nil {
+		t.Fatalf("Enqueue expired: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "new", Message: "fresh"}); err != nil {
+		t.Fatalf("Enqueue fresh: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, false)
+	if err != nil {
+		t.Fatalf("SweepExpired: %v", err)
+	}
+	if got := countDiscardsBySession(res, session); got != 1 {
+		t.Fatalf("discarded %d, want 1 (only the expired one)", got)
+	}
+	if dirRemoved(res, session) {
+		t.Errorf("dir still holds a fresh nudge; must not be reclaimed")
+	}
+	pending, _ := Pending(townRoot, session)
+	if pending != 1 {
+		t.Errorf("Pending = %d, want 1 (fresh survives)", pending)
+	}
+}
+
+// TestSweepExpiredDryRun reports the discard but changes nothing on disk.
+func TestSweepExpiredDryRun(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "aegis-crew-dry"
+
+	expired := QueuedNudge{
+		Sender:    "old",
+		Message:   "stale",
+		Timestamp: time.Now().Add(-time.Hour),
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	if err := Enqueue(townRoot, session, expired); err != nil {
+		t.Fatalf("Enqueue expired: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, true)
+	if err != nil {
+		t.Fatalf("SweepExpired dry-run: %v", err)
+	}
+	if got := countDiscardsBySession(res, session); got != 1 {
+		t.Errorf("dry-run should still report 1 discard, got %d", got)
+	}
+	if len(res.DirsRemoved) != 0 {
+		t.Errorf("dry-run must not remove dirs, got %v", res.DirsRemoved)
+	}
+	// File must still be on disk.
+	pending, _ := Pending(townRoot, session)
+	if pending != 1 {
+		t.Errorf("dry-run left %d pending, want 1 (nothing removed)", pending)
+	}
+}
+
+// TestSweepExpiredMalformed reclaims an unparseable file that no drain would
+// ever deliver.
+func TestSweepExpiredMalformed(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "aegis-crew-junk"
+	dir := queueDir(townRoot, session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "100-abcd.json"), []byte("not json"), 0644); err != nil {
+		t.Fatalf("write malformed: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, false)
+	if err != nil {
+		t.Fatalf("SweepExpired: %v", err)
+	}
+	if got := countDiscardsBySession(res, session); got != 1 || res.Discarded[0].Reason != "malformed" {
+		t.Fatalf("want 1 malformed discard, got %+v", res.Discarded)
+	}
+	if !dirRemoved(res, session) {
+		t.Errorf("dir should be reclaimed after removing the only (malformed) file")
+	}
+}
+
+// TestSweepExpiredLegacyNoExpiresAt: a nudge written before ExpiresAt existed
+// (zero ExpiresAt) still gets reclaimed via the Timestamp+TTL fallback once old
+// enough, and a recent one with zero ExpiresAt is kept.
+func TestSweepExpiredLegacyNoExpiresAt(t *testing.T) {
+	townRoot := t.TempDir()
+	dir := queueDir(townRoot, "aegis-legacy")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Old legacy nudge: zero ExpiresAt, timestamp well beyond the urgent TTL.
+	old := QueuedNudge{Sender: "ancient", Message: "x", Timestamp: time.Now().Add(-DefaultUrgentTTL - time.Hour)}
+	oldData, _ := json.Marshal(old)
+	if err := os.WriteFile(filepath.Join(dir, "100-old.json"), oldData, 0644); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+	// Recent legacy nudge: zero ExpiresAt, timestamp within the fallback window.
+	recent := QueuedNudge{Sender: "recent", Message: "y", Timestamp: time.Now().Add(-time.Minute)}
+	recentData, _ := json.Marshal(recent)
+	if err := os.WriteFile(filepath.Join(dir, "200-recent.json"), recentData, 0644); err != nil {
+		t.Fatalf("write recent: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, false)
+	if err != nil {
+		t.Fatalf("SweepExpired: %v", err)
+	}
+	if got := countDiscardsBySession(res, "aegis-legacy"); got != 1 {
+		t.Fatalf("want 1 discard (only the old legacy nudge), got %d", got)
+	}
+	if res.Discarded[0].Sender != "ancient" {
+		t.Errorf("discarded wrong nudge: %q, want ancient", res.Discarded[0].Sender)
+	}
+}
+
+// TestSweepExpiredSkipsClaimed leaves an in-flight .claimed file to the live
+// drainer's own orphan sweep.
+func TestSweepExpiredSkipsClaimed(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "aegis-crew-claimed"
+	dir := queueDir(townRoot, session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	claimed := QueuedNudge{Sender: "inflight", Timestamp: time.Now().Add(-time.Hour), ExpiresAt: time.Now().Add(-time.Minute)}
+	data, _ := json.Marshal(claimed)
+	claimedPath := filepath.Join(dir, "100-abcd.json.claimed.deadbeef")
+	if err := os.WriteFile(claimedPath, data, 0644); err != nil {
+		t.Fatalf("write claimed: %v", err)
+	}
+
+	res, err := SweepExpired(townRoot, false)
+	if err != nil {
+		t.Fatalf("SweepExpired: %v", err)
+	}
+	if got := countDiscardsBySession(res, session); got != 0 {
+		t.Errorf("sweep must not touch .claimed files, discarded %d", got)
+	}
+	if _, err := os.Stat(claimedPath); err != nil {
+		t.Errorf("claimed file should still exist: %v", err)
+	}
+}
+
+// TestSweepExpiredEmptyRoot: no nudge_queue directory yet is not an error.
+func TestSweepExpiredEmptyRoot(t *testing.T) {
+	res, err := SweepExpired(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("SweepExpired on empty town: %v", err)
+	}
+	if res.DirsScanned != 0 || len(res.Discarded) != 0 {
+		t.Errorf("empty town should sweep nothing, got %+v", res)
 	}
 }

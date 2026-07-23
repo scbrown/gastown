@@ -278,6 +278,146 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 	return nudges, nil
 }
 
+// SweepDiscard describes a single nudge removed by SweepExpired, for logging.
+type SweepDiscard struct {
+	Session string        // queue dir (session name) the nudge was stranded in
+	Sender  string        // who sent it (empty for malformed files)
+	Kind    string        // nudge kind ("direct" has no durable copy — its loss is real)
+	Reason  string        // "expired" or "malformed"
+	Age     time.Duration // how long past ExpiresAt at sweep time (0 for malformed)
+}
+
+// SweepResult summarizes a SweepExpired run.
+type SweepResult struct {
+	DirsScanned int            // number of per-session queue dirs examined
+	Discarded   []SweepDiscard // every nudge removed, in scan order
+	DirsRemoved []string       // queue dirs deleted because they became empty
+}
+
+// SweepExpired enforces ExpiresAt across EVERY queue dir, independent of whether
+// the target session is still alive.
+//
+// This closes the gap that lets nudges strand forever: ExpiresAt is otherwise
+// only honored inside Drain, and Drain runs only for a live session (via its
+// UserPromptSubmit hook or a running nudge-poller). A queue dir whose session no
+// longer exists is never drained, so its nudges — and the dir itself —
+// accumulate without bound. (aegis-l7nn: 127 messages stranded across 27 dead
+// session names, every send having reported success.)
+//
+// It removes only nudges that can never be validly delivered:
+//   - expired well-formed nudges (past ExpiresAt); and
+//   - malformed files that cannot be parsed at all.
+//
+// A live session's still-valid, unexpired nudges are left untouched, so it is
+// safe to run at any time, including against sessions that are merely restarting
+// under the same name. In-flight ".claimed" files (a live drainer mid-flight)
+// are skipped entirely — Drain's own orphan sweep owns those. After sweeping a
+// dir, an empty dir is removed best-effort; a concurrent Enqueue racing the
+// rmdir simply leaves the (now non-empty) dir in place.
+//
+// Legacy nudges written before ExpiresAt was populated fall back to
+// Timestamp+DefaultUrgentTTL so they too can eventually be reclaimed.
+//
+// When dryRun is true, nothing is removed: Discarded still lists every nudge
+// that would be dropped (so an operator can see direct-kind losses before
+// committing), but DirsRemoved is only populated on a real run.
+func SweepExpired(townRoot string, dryRun bool) (SweepResult, error) {
+	var result SweepResult
+
+	root := filepath.Join(townRoot, constants.DirRuntime, "nudge_queue")
+	dirs, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return result, nil
+		}
+		return result, fmt.Errorf("reading nudge queue root: %w", err)
+	}
+
+	now := time.Now()
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		session := d.Name()
+		dir := filepath.Join(root, session)
+		result.DirsScanned++
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			// Vanished (a concurrent sweep removed it) or unreadable — skip.
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				// Leave ".claimed" and anything else to the live drainer.
+				continue
+			}
+
+			path := filepath.Join(dir, entry.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				// Claimed/removed by a racing drainer between ReadDir and here.
+				continue
+			}
+
+			var n QueuedNudge
+			if err := json.Unmarshal(data, &n); err != nil {
+				// Undeliverable regardless of session liveness — reclaim it.
+				if dryRun {
+					result.Discarded = append(result.Discarded, SweepDiscard{
+						Session: session,
+						Reason:  "malformed",
+					})
+				} else if rmErr := os.Remove(path); rmErr == nil {
+					result.Discarded = append(result.Discarded, SweepDiscard{
+						Session: session,
+						Reason:  "malformed",
+					})
+				}
+				continue
+			}
+
+			// Effective expiry: ExpiresAt when set, else a bounded fallback so
+			// legacy entries that predate the ExpiresAt field can still expire.
+			expiry := n.ExpiresAt
+			if expiry.IsZero() && !n.Timestamp.IsZero() {
+				expiry = n.Timestamp.Add(DefaultUrgentTTL)
+			}
+			if expiry.IsZero() || !now.After(expiry) {
+				continue // no basis to expire it, or still within TTL
+			}
+
+			discard := SweepDiscard{
+				Session: session,
+				Sender:  n.Sender,
+				Kind:    n.Kind,
+				Reason:  "expired",
+				Age:     now.Sub(expiry),
+			}
+			if dryRun {
+				result.Discarded = append(result.Discarded, discard)
+			} else if rmErr := os.Remove(path); rmErr == nil {
+				result.Discarded = append(result.Discarded, discard)
+			}
+		}
+
+		if dryRun {
+			continue // never mutate the filesystem in a preview
+		}
+
+		// Reclaim the dir if it is now empty. os.Remove refuses a non-empty
+		// dir, so a nudge that lands after this ReadDir is preserved.
+		if remaining, err := os.ReadDir(dir); err == nil && len(remaining) == 0 {
+			if err := os.Remove(dir); err == nil {
+				result.DirsRemoved = append(result.DirsRemoved, session)
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // Pending returns the count of queued nudges for a session without draining.
 // This is an approximate count — it does not check expiry or read file contents.
 func Pending(townRoot, session string) (int, error) {
