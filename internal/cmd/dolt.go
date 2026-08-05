@@ -266,20 +266,35 @@ Examples:
 }
 
 var doltCleanupCmd = &cobra.Command{
-	Use:   "cleanup",
-	Short: "Remove orphaned databases from .dolt-data/",
-	Long: `Detect and remove orphaned databases from the .dolt-data/ directory.
+	Use:   "cleanup [database...]",
+	Short: "Remove named orphaned databases",
+	Long: `List orphaned databases, and remove the ones you name.
 
-An orphaned database is one that exists in .dolt-data/ but is not referenced
-by any rig's metadata.json. These are typically left over from partial setups,
-renamed databases, or failed migrations.
+An orphaned database is one that is not referenced by any rig's metadata.json
+dolt_database field, rig name, or rig prefix. These are typically left over from
+partial setups, renamed databases, or failed migrations.
 
-Use --dry-run to preview what would be removed without making changes.
+WHERE THIS LOOKS. Candidates come from wherever this town's Dolt server is: the
+remote server when one is configured, otherwise .dolt-data/. Every listing says
+which, per database. A database on a remote server is NOT removed by this
+command — the server is shared with other towns whose metadata cannot be read
+from here, so "unreferenced in this town" is not evidence that it is disused.
+
+NAMING IS THE CONFIRMATION. With no arguments this command lists and removes
+nothing. Each database to remove must be named on the command line, and must
+appear in the orphan listing.
 
 Examples:
-  gt dolt cleanup             # Remove all orphaned databases
-  gt dolt cleanup --dry-run   # Preview what would be removed`,
-	RunE: runDoltCleanup,
+  gt dolt cleanup                      # List orphans; remove nothing
+  gt dolt cleanup --dry-run            # Same, stated as a preview
+  gt dolt cleanup testdb_abc123        # Remove one named orphan
+  gt dolt cleanup testdb_a testdb_b    # Remove two named orphans`,
+	// A refusal here is a decision about a database, not a usage error. Without
+	// this, cobra prints the flag block under it and the message reads as "you
+	// called me wrong" — inviting the reader to adjust flags until it goes
+	// through, which is the opposite of what a refusal is for. (aegis-pg0g7)
+	SilenceUsage: true,
+	RunE:         runDoltCleanup,
 }
 
 var doltRollbackCmd = &cobra.Command{
@@ -1072,21 +1087,54 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("finding orphaned databases: %w", err)
 	}
 
+	source, remote := doltserver.DatabaseSource(townRoot)
+	sourceLabel := "local directory " + source
+	if remote {
+		sourceLabel = "remote Dolt server " + source
+	}
+
 	if len(orphans) == 0 {
-		fmt.Printf("%s No orphaned databases found in .dolt-data/\n", style.Bold.Render("✓"))
+		fmt.Printf("%s No orphaned databases on %s\n", style.Bold.Render("✓"), sourceLabel)
 		return nil
 	}
 
-	fmt.Printf("Found %d orphaned database(s) in .dolt-data/:\n\n", len(orphans))
+	// Say where these names came from BEFORE listing them. The listing is what
+	// gets acted on, and a reader who assumes .dolt-data/ will read a live
+	// remote database as a stale local directory. (aegis-hphtm)
+	fmt.Printf("Found %d orphaned database(s) on %s:\n\n", len(orphans), sourceLabel)
 	for _, o := range orphans {
-		fmt.Printf("  %s %s (%s)\n", style.Bold.Render("!"), o.Name, formatBytes(o.SizeBytes))
-		fmt.Printf("    %s\n", style.Dim.Render(o.Path))
+		switch {
+		case o.LocalDir:
+			fmt.Printf("  %s %s (%s)\n", style.Bold.Render("!"), o.Name, formatBytes(o.SizeBytes))
+			fmt.Printf("    %s\n", style.Dim.Render(o.Path))
+		default:
+			// No local directory: no path and no size exist to report. Printing
+			// a .dolt-data/ path at 0 B here is what made a live database look
+			// like an empty leftover.
+			fmt.Printf("  %s %s (size unknown — not on this host)\n", style.Bold.Render("!"), o.Name)
+			fmt.Printf("    %s\n", style.Dim.Render("on "+o.Source+"; no local directory"))
+		}
+	}
+
+	// Only databases named on the command line are candidates for removal, and
+	// only if they are in the listing above.
+	requested, err := selectCleanupTargets(orphans, args)
+	if err != nil {
+		return err
 	}
 
 	if doltCleanupDry {
 		fmt.Println("\nDry run: no changes made.")
 		return nil
 	}
+
+	if len(requested) == 0 {
+		fmt.Printf("\nNothing removed. Name each database you want removed:\n")
+		fmt.Printf("  %s\n", style.Dim.Render("gt dolt cleanup "+firstRemovableName(orphans)))
+		return nil
+	}
+
+	orphans = requested
 
 	// BALK: If orphans are a large fraction of all databases, something is likely
 	// wrong with the orphan detection (e.g., metadata files not found). Refuse to
@@ -1114,11 +1162,19 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
 			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
 		fmt.Printf("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
-		fmt.Printf("  Instead, stop the server and clean the filesystem:\n\n")
-		fmt.Printf("    gt dolt stop\n")
-		fmt.Printf("    cd %s/.dolt-data && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*\n", townRoot)
-		fmt.Printf("    gt dolt start\n\n")
-		fmt.Printf("  This is safe — orphan databases have no production data.\n")
+		if remote {
+			// The filesystem recipe below is for a town that owns its data
+			// directory. This one does not: the databases are on %s, which
+			// other towns also use. (aegis-hphtm)
+			fmt.Printf("  These databases are on %s, not on this host — there is no\n", source)
+			fmt.Printf("  local directory to clean, and that server is shared. Clean it there.\n")
+		} else {
+			fmt.Printf("  Instead, stop the server and clean the filesystem:\n\n")
+			fmt.Printf("    gt dolt stop\n")
+			fmt.Printf("    cd %s && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*\n", source)
+			fmt.Printf("    gt dolt start\n\n")
+			fmt.Printf("  This is safe for test-suite leftovers — check the names first.\n")
+		}
 		return fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans))
 	}
 
@@ -1161,32 +1217,97 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// selectCleanupTargets resolves the database names given on the command line
+// against the orphan listing. Naming a database IS the confirmation to remove
+// it (aegis-hphtm) — so this refuses anything that is not in the listing, rather
+// than becoming a general-purpose DROP.
+//
+// A database with no local directory is refused even when named: this command
+// removes local directories, and the shared server is not this town's to sweep.
+func selectCleanupTargets(orphans []doltserver.OrphanedDatabase, names []string) ([]doltserver.OrphanedDatabase, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	byName := make(map[string]doltserver.OrphanedDatabase, len(orphans))
+	for _, o := range orphans {
+		byName[o.Name] = o
+	}
+
+	var selected []doltserver.OrphanedDatabase
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		o, listed := byName[name]
+		if !listed {
+			return nil, fmt.Errorf("%q is not in the orphan listing above — refusing to remove it. "+
+				"Only databases this command reported as orphaned can be removed by it", name)
+		}
+		if !o.LocalDir {
+			return nil, fmt.Errorf("%q is on %s and has no directory on this host — refusing. "+
+				"That server is shared with other towns whose metadata is not readable from here, "+
+				"so this town listing it as unreferenced is not evidence that it is disused. "+
+				"Drop it deliberately on the server if you are certain", name, o.Source)
+		}
+		selected = append(selected, o)
+	}
+	return selected, nil
+}
+
+// firstRemovableName returns an orphan name to show in the usage hint,
+// preferring one this command could actually remove.
+func firstRemovableName(orphans []doltserver.OrphanedDatabase) string {
+	for _, o := range orphans {
+		if o.LocalDir {
+			return o.Name
+		}
+	}
+	return "<database>"
+}
+
 func runDoltList(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	config := doltserver.DefaultConfig(townRoot)
 	databases, err := doltserver.ListDatabases(townRoot)
 	if err != nil {
 		return fmt.Errorf("listing databases: %w", err)
 	}
 
+	// Name the place these came from. RigDatabaseDir composes a .dolt-data/
+	// path for any name at all, so on a remote town it used to render every
+	// database — live ones included — as a local directory. (aegis-hphtm)
+	source, remote := doltserver.DatabaseSource(townRoot)
+	sourceLabel := source
+	if remote {
+		sourceLabel = "remote Dolt server " + source
+	}
+
 	if len(databases) == 0 {
-		fmt.Printf("No rig databases found in %s\n", config.DataDir)
+		fmt.Printf("No rig databases found on %s\n", sourceLabel)
 		fmt.Printf("\nInitialize with: %s\n", style.Dim.Render("gt dolt init-rig <name>"))
 		return nil
 	}
 
 	owners := doltserver.CollectDatabaseOwners(townRoot)
-	fmt.Printf("Rig databases in %s:\n\n", config.DataDir)
+	fmt.Printf("Rig databases on %s:\n\n", sourceLabel)
 	for _, db := range databases {
+		owner, ok := owners[db]
+		if !ok {
+			owner = "orphan"
+		}
+		fmt.Printf("  %s (%s)\n", style.Bold.Render(db), owner)
 		dbDir := doltserver.RigDatabaseDir(townRoot, db)
-		if owner, ok := owners[db]; ok {
-			fmt.Printf("  %s (%s)\n    %s\n", style.Bold.Render(db), owner, style.Dim.Render(dbDir))
+		if _, statErr := os.Stat(filepath.Join(dbDir, ".dolt")); statErr == nil {
+			fmt.Printf("    %s\n", style.Dim.Render(dbDir))
 		} else {
-			fmt.Printf("  %s (orphan)\n    %s\n", style.Bold.Render(db), style.Dim.Render(dbDir))
+			fmt.Printf("    %s\n", style.Dim.Render("no local directory"))
 		}
 	}
 

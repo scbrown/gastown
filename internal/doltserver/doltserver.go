@@ -2985,18 +2985,47 @@ type BrokenWorkspace struct {
 	NotServed bool
 }
 
-// OrphanedDatabase represents a database in .dolt-data/ that is not referenced
-// by any rig's metadata.json. These are leftover from partial setups, renames,
-// or failed migrations.
+// OrphanedDatabase represents a database that is not referenced by any rig's
+// metadata.json. These are leftover from partial setups, renames, or failed
+// migrations.
+//
+// The enumeration source is part of the record, not an assumption (aegis-hphtm).
+// When the town points at a remote Dolt server, the candidate names come from
+// SHOW DATABASES on that server, and most of them have no local directory at
+// all. Earlier versions still rendered every candidate as a path under
+// .dolt-data/ with a size measured from that nonexistent path — so a live
+// remote database displayed as a local directory containing 0 B, which is the
+// most reassuring thing a cleanup tool can show you. Callers must print Source
+// and must not print Path or SizeBytes unless LocalDir is true.
 type OrphanedDatabase struct {
-	// Name is the database directory name in .dolt-data/.
+	// Name is the database name.
 	Name string
 
-	// Path is the full path to the database directory.
+	// Path is the local filesystem path to the database directory. Empty when
+	// no such directory exists — never a manufactured path.
 	Path string
 
-	// SizeBytes is the total size of the database directory.
+	// SizeBytes is the total size of Path. Meaningful only when LocalDir is
+	// true; the size of a remote database is not observable from here.
 	SizeBytes int64
+
+	// LocalDir reports whether the database has a real directory on this host.
+	LocalDir bool
+
+	// Source names where the candidate was enumerated from: "host:port" for a
+	// remote server, or the local data directory path for a filesystem scan.
+	Source string
+
+	// Remote reports whether Source is a remote Dolt server rather than this
+	// host's filesystem.
+	Remote bool
+
+	// Unverifiable is true when nothing on this host can confirm what the
+	// database is. It is set for remote databases with no local directory: the
+	// shared server is used by other towns and hosts, so this town's metadata
+	// is not a complete ownership record for it. Removal must refuse these
+	// rather than treat "not referenced here" as "belongs to nobody".
+	Unverifiable bool
 }
 
 // protectedSharedServerDatabases returns the registry of databases that are
@@ -3021,9 +3050,25 @@ func isProtectedSharedServerDatabase(dbName string) bool {
 	return ok
 }
 
-// FindOrphanedDatabases scans .dolt-data/ for databases that are not referenced
-// by any rig's metadata.json dolt_database field. These orphans consume disk space
-// and are served by the Dolt server unnecessarily.
+// DatabaseSource describes where ListDatabases enumerated names from: a remote
+// Dolt server, or this host's .dolt-data/ directory. Reporting surfaces must
+// use this rather than assuming the local data directory (aegis-hphtm).
+func DatabaseSource(townRoot string) (source string, remote bool) {
+	config := DefaultConfig(townRoot)
+	if config.IsRemote() {
+		return config.HostPort(), true
+	}
+	return config.DataDir, false
+}
+
+// FindOrphanedDatabases lists databases that are not referenced by any rig's
+// metadata.json dolt_database field, by rig name, or by rig prefix.
+//
+// It enumerates from wherever ListDatabases reads — the remote server when the
+// town points at one — and records that source on every result. A candidate
+// with no local directory is marked Unverifiable: the shared server is used by
+// other towns, so "this town's metadata does not mention it" is not evidence
+// that it is disused, and RemoveDatabase refuses it.
 func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 	databases, err := ListDatabases(townRoot)
 	if err != nil {
@@ -3036,23 +3081,39 @@ func FindOrphanedDatabases(townRoot string) ([]OrphanedDatabase, error) {
 	// Collect all referenced database names from metadata.json files
 	referenced := collectReferencedDatabases(townRoot)
 
-	// Find databases that exist on disk but aren't referenced
-	config := DefaultConfig(townRoot)
+	source, remote := DatabaseSource(townRoot)
+	return buildOrphanList(DefaultConfig(townRoot).DataDir, databases, referenced, source, remote), nil
+}
+
+// buildOrphanList turns enumerated database names into orphan records. Split
+// out from FindOrphanedDatabases so the remote case is testable without a
+// server: the whole defect in aegis-hphtm lived in this loop, and it only shows up
+// when the names came from somewhere other than dataDir.
+func buildOrphanList(dataDir string, databases []string, referenced map[string]bool, source string, remote bool) []OrphanedDatabase {
 	var orphans []OrphanedDatabase
 	for _, dbName := range databases {
 		if referenced[dbName] || isProtectedSharedServerDatabase(dbName) {
 			continue
 		}
-		dbPath := filepath.Join(config.DataDir, dbName)
-		size := dirSize(dbPath)
-		orphans = append(orphans, OrphanedDatabase{
-			Name:      dbName,
-			Path:      dbPath,
-			SizeBytes: size,
-		})
+		orphan := OrphanedDatabase{
+			Name:   dbName,
+			Source: source,
+			Remote: remote,
+		}
+		// Only claim a path and a size if the directory is actually here.
+		// dirSize on a nonexistent path returns 0, which renders as an empty
+		// directory — the single most reassuring thing this output can show.
+		dbPath := filepath.Join(dataDir, dbName)
+		if _, statErr := os.Stat(filepath.Join(dbPath, ".dolt")); statErr == nil {
+			orphan.Path = dbPath
+			orphan.SizeBytes = dirSize(dbPath)
+			orphan.LocalDir = true
+		} else if remote {
+			orphan.Unverifiable = true
+		}
+		orphans = append(orphans, orphan)
 	}
-
-	return orphans, nil
+	return orphans
 }
 
 // readExistingDoltDatabase reads the dolt_database field from an existing metadata.json.
@@ -3158,7 +3219,37 @@ func collectReferencedDatabases(townRoot string) map[string]bool {
 		referenced[prefix] = true
 	}
 
+	// Safety net: rig NAMES too, not just their prefixes and dolt_database
+	// fields. A rig's database is often named after the rig, and the two can
+	// diverge from each other — the aegis fleet has a rig "bobbin" whose
+	// prefix is "bo" and whose metadata points at "bobbin_v52", so a live
+	// database literally called "bobbin" matched none of the three lookups
+	// above and was proposed for removal. (aegis-hphtm)
+	for rigName := range rigNames(townRoot) {
+		referenced[rigName] = true
+	}
+
 	return referenced
+}
+
+// rigNames returns the rig names declared in mayor/rigs.json.
+func rigNames(townRoot string) map[string]bool {
+	names := make(map[string]bool)
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	data, err := os.ReadFile(rigsPath)
+	if err != nil {
+		return names
+	}
+	var cfg struct {
+		Rigs map[string]interface{} `json:"rigs"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return names
+	}
+	for rigName := range cfg.Rigs {
+		names[rigName] = true
+	}
+	return names
 }
 
 // CollectDatabaseOwners returns a map from database name to a human-readable
@@ -3240,6 +3331,16 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 		}
 	}
 
+	// A database named after a rig belongs to that rig, even when the rig's
+	// metadata points somewhere else. Weakest signal, so it never overwrites a
+	// metadata-derived label — but it is the difference between "bobbin
+	// (orphan)" and "bobbin (bobbin rig, by name)". (aegis-hphtm)
+	for rigName := range rigNames(townRoot) {
+		if _, already := owners[rigName]; !already {
+			owners[rigName] = rigName + " rig (matched by rig name)"
+		}
+	}
+
 	// Label protected shared-server databases so `gt dolt list` doesn't render
 	// them as orphans. Only labels protected DBs that actually exist on disk —
 	// otherwise we'd advertise a phantom owner. Never overwrites a rig-derived
@@ -3257,10 +3358,21 @@ func CollectDatabaseOwners(townRoot string) map[string]string {
 	return owners
 }
 
-// RemoveDatabase removes an orphaned database directory from .dolt-data/.
+// ErrNoLocalDatabaseDir is returned by RemoveDatabase for a database that has
+// no directory under this town's .dolt-data/. On a town pointed at a remote
+// Dolt server most databases are in exactly that state, and removing them would
+// mean issuing DROP DATABASE against a server shared with other towns.
+var ErrNoLocalDatabaseDir = errors.New("no local database directory")
+
+// RemoveDatabase removes an orphaned database directory from .dolt-data/,
+// DROPping it from a running Dolt server first.
 // The caller should verify the database is actually orphaned before calling this.
-// If the Dolt server is running, it will DROP the database first.
 // If force is false and the database has real user tables, it refuses to remove. (gt-q8f6n)
+//
+// It removes LOCAL database directories only. A database that was enumerated
+// from a remote server but has no local directory is refused — and the refusal
+// says so, rather than reporting it "not found" at a path that this command
+// invented and never expected to exist (aegis-hphtm).
 func RemoveDatabase(townRoot, dbName string, force bool) error {
 	if isProtectedSharedServerDatabase(dbName) {
 		return fmt.Errorf("database %q is a protected shared-server database", dbName)
@@ -3271,7 +3383,13 @@ func RemoveDatabase(townRoot, dbName string, force bool) error {
 
 	// Verify the directory exists
 	if _, err := os.Stat(filepath.Join(dbPath, ".dolt")); err != nil {
-		return fmt.Errorf("database %q not found at %s", dbName, dbPath)
+		if source, remote := DatabaseSource(townRoot); remote {
+			return fmt.Errorf("%w: database %q lives on the remote Dolt server %s, not on this host; "+
+				"this command removes local database directories only, and %s is shared with other towns "+
+				"whose metadata is not readable from here — drop it deliberately on the server instead: %w",
+				ErrNoLocalDatabaseDir, dbName, source, source, err)
+		}
+		return fmt.Errorf("%w: database %q not found at %s: %w", ErrNoLocalDatabaseDir, dbName, dbPath, err)
 	}
 
 	// Safety check: if DB has real data and force is not set, refuse. (gt-q8f6n, gt-xvh)

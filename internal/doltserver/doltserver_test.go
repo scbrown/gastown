@@ -3575,8 +3575,15 @@ func TestCollectReferencedDatabases_CustomDatabaseName(t *testing.T) {
 	if !referenced["custom_db_name"] {
 		t.Error("expected 'custom_db_name' to be referenced")
 	}
-	if referenced["myrig"] {
-		t.Error("rig name 'myrig' should not be in referenced set (only dolt_database value)")
+	// The rig NAME is referenced too, deliberately. This assertion was inverted
+	// in aegis-hphtm: the referenced set is orphan detection's safe list, and
+	// anything missing from it is proposed for deletion, so it must fail closed
+	// rather than be exactly the set of dolt_database values. A live database
+	// called "bobbin" was proposed for removal on a fleet that has a rig named
+	// "bobbin" — its prefix was "bo" and its metadata pointed at "bobbin_v52",
+	// so all three of the precise lookups missed it.
+	if !referenced["myrig"] {
+		t.Error("rig name 'myrig' should be referenced — the safe list fails closed (aegis-hphtm)")
 	}
 }
 
@@ -3586,8 +3593,14 @@ func TestCollectReferencedDatabases_NoMetadata(t *testing.T) {
 	// No metadata.json for gastown — should not crash
 
 	referenced := collectReferencedDatabases(townRoot)
-	if len(referenced) != 0 {
-		t.Errorf("expected 0 referenced with no metadata, got %d: %v", len(referenced), referenced)
+	// Missing metadata is exactly when the safe list must not shrink: the rig
+	// is declared in rigs.json, so a database named after it is still spoken
+	// for, and orphan detection must not propose dropping it. (aegis-hphtm)
+	if !referenced["gastown"] {
+		t.Error("expected declared rig 'gastown' to be referenced even with no metadata")
+	}
+	if len(referenced) != 1 {
+		t.Errorf("expected only the rig name referenced, got %d: %v", len(referenced), referenced)
 	}
 }
 
@@ -4339,8 +4352,16 @@ func TestCollectDatabaseOwners_MultipleRigs(t *testing.T) {
 	if owners["beads"] != "beads rig beads" {
 		t.Errorf("expected 'beads' owner 'beads rig beads', got %q", owners["beads"])
 	}
-	if len(owners) != 3 {
-		t.Errorf("expected 3 owners, got %d: %v", len(owners), owners)
+	// A metadata-derived label always wins: "beads" is both a rig name and this
+	// rig's dolt_database, and it must still read "beads rig beads".
+	// "gastown" gains a weaker by-name label so that `gt dolt list` does not
+	// call it an orphan while cleanup protects it — the two surfaces disagreeing
+	// is what made the aegis-hphtm proposal look credible.
+	if owners["gastown"] != "gastown rig (matched by rig name)" {
+		t.Errorf("expected 'gastown' labelled by rig name, got %q", owners["gastown"])
+	}
+	if len(owners) != 4 {
+		t.Errorf("expected 4 owners, got %d: %v", len(owners), owners)
 	}
 }
 
@@ -4355,8 +4376,11 @@ func TestCollectDatabaseOwners_CustomDatabaseName(t *testing.T) {
 	if owners["custom_db"] != "myrig rig beads" {
 		t.Errorf("expected 'custom_db' owner 'myrig rig beads', got %q", owners["custom_db"])
 	}
-	if _, exists := owners["myrig"]; exists {
-		t.Error("rig name 'myrig' should not be a key in owners (only dolt_database value)")
+	// Inverted in aegis-hphtm, to match the referenced set. A database named after
+	// a declared rig is attributed to it, and the label says on what evidence —
+	// so a reader can tell a metadata match from a name match.
+	if owners["myrig"] != "myrig rig (matched by rig name)" {
+		t.Errorf("expected 'myrig' labelled by rig name, got %q", owners["myrig"])
 	}
 }
 
