@@ -3,6 +3,8 @@ package doctor
 import (
 	"os"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/testenv"
 )
 
 // TestMain neutralises an inherited remote-server environment for this
@@ -21,12 +23,6 @@ import (
 // failures read as ordinary breakage rather than as a suite pointed at
 // production. Tests that want a real server ask for one explicitly.
 func TestMain(m *testing.M) {
-	for _, key := range []string{
-		"GT_DOLT_HOST", "GT_DOLT_PORT", "GT_DOLT_USER", "GT_DOLT_PASSWORD",
-		"BEADS_DOLT_HOST", "BEADS_DOLT_PORT", "BEADS_DOLT_PASSWORD",
-		"BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT",
-	} {
-		_ = os.Unsetenv(key)
-	}
+	testenv.ScrubAmbientDoltEnv()
 	os.Exit(m.Run())
 }
