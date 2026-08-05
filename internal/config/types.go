@@ -1713,6 +1713,13 @@ type EscalationContacts struct {
 	SMTPUser     string `json:"smtp_user,omitempty"`     // SMTP auth username (optional)
 	SMTPPass     string `json:"smtp_pass,omitempty"`     // SMTP auth password (optional)
 	SMSWebhook   string `json:"sms_webhook,omitempty"`   // webhook URL for SMS delivery (e.g. Twilio)
+
+	// UnresolvedRefs records secret indirections that could not be resolved
+	// at load, keyed by JSON field name (aegis-n3izl). Never serialized: it is
+	// a property of this load, not of the policy. The delivery path reports it
+	// so a skipped push says WHICH reference failed rather than the
+	// indistinguishable "not configured".
+	UnresolvedRefs map[string]string `json:"-"`
 }
 
 // CurrentEscalationVersion is the current schema version for EscalationConfig.

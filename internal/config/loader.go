@@ -2829,6 +2829,12 @@ func LoadEscalationConfig(path string) (*EscalationConfig, error) {
 		return nil, fmt.Errorf("parsing escalation config: %w", err)
 	}
 
+	// Expand ${ENV_VAR} / ${file:...} in the secret-bearing contact fields so
+	// the policy file can be versioned with its credentials out (aegis-n3izl).
+	// Unresolved references are recorded, not fatal: the escalation must still
+	// create its bead, and the delivery path reports precisely what failed.
+	resolveContactSecrets(&config.Contacts)
+
 	if err := validateEscalationConfig(&config); err != nil {
 		return nil, err
 	}

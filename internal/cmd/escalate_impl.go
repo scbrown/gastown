@@ -731,8 +731,18 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 				status.Warning = "contacts.human_sms not configured"
 				style.PrintWarning("sms action '%s' skipped: contacts.human_sms not configured in settings/escalation.json", action)
 			} else if cfg.Contacts.SMSWebhook == "" {
-				status.Warning = "contacts.sms_webhook not configured"
-				style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
+				// Distinguish "you never configured this" from "you configured an
+				// indirection and it did not resolve" (aegis-n3izl). Both leave the
+				// field empty and skip the push, but only one of them is an
+				// omission — reporting the other as "not configured" sends the
+				// operator to edit a file that is already correct.
+				if reason := cfg.Contacts.UnresolvedRef("sms_webhook"); reason != "" {
+					status.Warning = "contacts.sms_webhook unresolved: " + reason
+					style.PrintWarning("sms action '%s' NOT SENT: contacts.sms_webhook %s — the policy is configured, the credential is not reachable", action, reason)
+				} else {
+					status.Warning = "contacts.sms_webhook not configured"
+					style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
+				}
 			} else {
 				receipt, err := sendEscalationSMS(cfg, beadID, severity, description)
 				if err != nil {
