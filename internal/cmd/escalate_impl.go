@@ -34,9 +34,20 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		escalateReason = strings.TrimRight(string(data), "\n")
 	}
 
-	// Require at least a description when creating an escalation
+	// Require at least a description when creating an escalation.
+	//
+	// This used to `return cmd.Help()`, which prints the help text and returns
+	// NIL — so the fleet's paging path printed a usage blurb and EXITED 0 while
+	// sending nothing (aegis-pg0g7). Any caller checking $? saw success. That is
+	// the not-paged direction of a paging tool, reported as success, which is the
+	// worst combination available.
+	//
+	// Measured before the change: `gt escalate -s HIGH --stdin < file` and
+	// `gt escalate -s HIGH` both exited 0 having created no bead and sent no push.
 	if len(args) == 0 {
-		return cmd.Help()
+		return fmt.Errorf("no description given: nothing was escalated and NO PAGE WAS SENT.\n" +
+			"Usage: gt escalate \"<description>\" --severity <critical|high|medium|low> [--reason ...]\n" +
+			"Note --stdin supplies the REASON, not the description — a description is still required")
 	}
 
 	description := strings.Join(args, " ")
@@ -46,6 +57,14 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	if !config.IsValidSeverity(severity) {
 		return fmt.Errorf("invalid severity '%s': must be critical, high, medium, or low", escalateSeverity)
 	}
+
+	// PAST THIS POINT THE INVOCATION IS WELL-FORMED, so every remaining failure is
+	// a RUNTIME failure — the bead write, the config load, the push. Cobra prints
+	// the usage blurb for any error a RunE returns unless told otherwise, which is
+	// how a failing bead write came to look like a flag typo. Setting it HERE
+	// rather than on the command keeps usage where it belongs: genuine argument
+	// mistakes above still get it.
+	cmd.SilenceUsage = true
 
 	// Find workspace
 	townRoot, err := workspace.FindFromCwdOrError()

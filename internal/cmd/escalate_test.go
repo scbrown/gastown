@@ -556,15 +556,25 @@ func TestRunEscalateValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("no args shows help", func(t *testing.T) {
+	t.Run("no args is an ERROR, not a silent success", func(t *testing.T) {
 		escalateStdin = false
 		escalateReason = ""
 		escalateSeverity = "medium"
 
-		// No args should return nil (shows help)
+		// This test used to assert the opposite — "No args should return nil
+		// (shows help)" — and that assertion was enforcing the defect
+		// (aegis-pg0g7). Returning nil made the fleet's paging path print a usage
+		// blurb and EXIT 0 while sending nothing, so every caller checking $? saw
+		// success. A test that requires a paging tool to report success when it
+		// sent no page is worse than no test: it holds the bug in place.
 		err := runEscalate(escalateCmd, []string{})
-		if err != nil {
-			t.Errorf("expected nil error for no args (help case), got: %v", err)
+		if err == nil {
+			t.Fatal("expected an ERROR for no args: escalate sent nothing, and must not report success")
+		}
+		// The message has to say nothing was sent, because usage text alone reads
+		// as "you typed it wrong" rather than "no page went out".
+		if !strings.Contains(err.Error(), "NO PAGE WAS SENT") {
+			t.Errorf("error must state that no page was sent, got: %v", err)
 		}
 	})
 

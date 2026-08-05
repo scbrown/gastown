@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/spf13/cobra"
 )
 
@@ -20,11 +23,32 @@ var (
 	escalateStdin       bool // Read reason from stdin
 )
 
+// runEscalateGuarded wraps runEscalate so a failure to escalate is unmistakable.
+//
+// WHY (aegis-pg0g7). This is the fleet's paging path for CRITICAL and HIGH. Its
+// failure output used to be indistinguishable from a flag typo — cobra's usage
+// blurb — and in the no-description case it exited 0 as well. An operator reading
+// that fixes their flags; they do not think to check whether the alert ever left
+// the host. The reason this is worth a banner rather than a tidy error string is
+// that the cost of misreading it is a page nobody receives during an incident.
+func runEscalateGuarded(cmd *cobra.Command, args []string) error {
+	err := runEscalate(cmd, args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "############################################################")
+		fmt.Fprintln(os.Stderr, "##  NOTHING WAS SENT.                                     ##")
+		fmt.Fprintln(os.Stderr, "##  No escalation was created and no page was published.  ##")
+		fmt.Fprintln(os.Stderr, "##  If this was urgent, reach a human another way NOW.    ##")
+		fmt.Fprintln(os.Stderr, "############################################################")
+	}
+	return err
+}
+
 var escalateCmd = &cobra.Command{
 	Use:     "escalate [description]",
 	GroupID: GroupComm,
 	Short:   "Escalation system for critical issues",
-	RunE:    runEscalate,
+	RunE:    runEscalateGuarded,
 	Long: `Create and manage escalations for critical issues.
 
 The escalation system provides severity-based routing for issues that need
