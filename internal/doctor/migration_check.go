@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,9 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 var verifyExpectedDatabasesAtConfig = doltserver.VerifyExpectedDatabasesAtConfig
@@ -526,35 +527,73 @@ func (c *DoltOrphanedDatabaseCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
+	// Name the place these came from. This check used to say ".dolt-data/" and
+	// print a size for every orphan; on a town pointed at a remote server most
+	// have no local directory, so the size was measured from a path that does
+	// not exist and rendered as 0 B — a live remote database displayed as an
+	// empty local directory (aegis-hphtm).
+	source, remote := doltserver.DatabaseSource(ctx.TownRoot)
+	sourceLabel := source
+	if remote {
+		sourceLabel = "remote Dolt server " + source
+	}
+
 	if len(orphans) == 0 {
 		return &CheckResult{
 			Name:     c.Name(),
 			Status:   StatusOK,
-			Message:  "No orphaned databases in .dolt-data/",
+			Message:  "No orphaned databases on " + sourceLabel,
 			Category: c.CheckCategory,
 		}
 	}
 
 	details := make([]string, len(orphans))
 	for i, o := range orphans {
-		details[i] = fmt.Sprintf("Orphaned: %s (%s)", o.Name, formatBytes(o.SizeBytes))
+		if o.LocalDir {
+			details[i] = fmt.Sprintf("Orphaned: %s (%s)", o.Name, formatBytes(o.SizeBytes))
+		} else {
+			details[i] = fmt.Sprintf("Orphaned: %s (on %s; not on this host, size unknown)", o.Name, o.Source)
+		}
 		c.orphanNames = append(c.orphanNames, o.Name)
+	}
+
+	// The fix hint has to match what the fix can actually do. `gt dolt cleanup`
+	// refuses databases with no local directory, so pointing at it for a remote
+	// orphan sends the reader somewhere that will decline.
+	fixHint := "Run 'gt dolt cleanup <name>' to remove orphaned databases"
+	if remote {
+		fixHint = "Databases on " + source + " are reported and recorded, not dropped — " +
+			"Gas Town does not DROP on a server shared with other towns"
 	}
 
 	return &CheckResult{
 		Name:     c.Name(),
 		Status:   StatusWarning,
-		Message:  fmt.Sprintf("%d orphaned database(s) in .dolt-data/", len(orphans)),
+		Message:  fmt.Sprintf("%d orphaned database(s) on %s", len(orphans), sourceLabel),
 		Details:  details,
-		FixHint:  "Run 'gt dolt cleanup' to remove orphaned databases",
+		FixHint:  fixHint,
 		Category: c.CheckCategory,
 	}
 }
 
-// Fix removes orphaned databases.
+// Fix removes orphaned databases that are on this host.
+//
+// A database on a shared remote Dolt server is REPORTED and recorded, never
+// dropped (aegis-i08ls). The doctor's job is to clean up after this town; that
+// server is used by others, and one town's bookkeeping is not authority to
+// destroy data on it.
 func (c *DoltOrphanedDatabaseCheck) Fix(ctx *CheckContext) error {
+	source, remote := doltserver.DatabaseSource(ctx.TownRoot)
 	for _, name := range c.orphanNames {
 		if err := doltserver.RemoveDatabase(ctx.TownRoot, name, true); err != nil {
+			if remote && errors.Is(err, doltserver.ErrNoLocalDatabaseDir) {
+				doltserver.ReportRetainedDatabase(ctx.TownRoot, doltserver.RetainedDatabase{
+					Database: name,
+					Server:   source,
+					Reason:   "doctor orphan check; on a shared remote server, which Gas Town does not drop",
+				})
+				continue
+			}
 			return fmt.Errorf("removing orphaned database %s: %w", name, err)
 		}
 	}

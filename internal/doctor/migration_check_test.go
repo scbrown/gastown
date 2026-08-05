@@ -406,8 +406,16 @@ func TestDoltOrphanedDatabaseCheck_DetectsOrphans(t *testing.T) {
 	if result.Status != StatusWarning {
 		t.Fatalf("expected StatusWarning, got %v: %s", result.Status, result.Message)
 	}
-	if result.Message != "1 orphaned database(s) in .dolt-data/" {
+	// The message must name the place it actually enumerated, not a hardcoded
+	// ".dolt-data/" (aegis-hphtm): on a town pointed at a remote server that
+	// literal was simply false, and it made live remote databases read as stale
+	// local directories. Asserted as a property rather than an exact string so
+	// it keeps testing the point rather than the wording.
+	if !strings.HasPrefix(result.Message, "1 orphaned database(s) on ") {
 		t.Errorf("unexpected message: %s", result.Message)
+	}
+	if !strings.Contains(result.Message, filepath.Join(townRoot, ".dolt-data")) {
+		t.Errorf("message does not name the source it enumerated: %s", result.Message)
 	}
 	if len(result.Details) != 1 {
 		t.Fatalf("expected 1 detail, got %d", len(result.Details))

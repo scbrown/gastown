@@ -1116,6 +1116,24 @@ func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
 			continue
 		}
 		if err := doltserver.RemoveDatabase(townRoot, name, true); err != nil {
+			// A database on a shared remote server is not this town's to drop
+			// (aegis-i08ls). That is not a failure of rig setup, so it must not
+			// fail it — but it must be SAID, and attributed while the mapping
+			// from database to rig still exists. After this function returns,
+			// nothing on this host can reconstruct which rig this database came
+			// from, which is why orphan tooling later has to guess by name.
+			if errors.Is(err, doltserver.ErrNoLocalDatabaseDir) {
+				if source, remote := doltserver.DatabaseSource(townRoot); remote {
+					doltserver.ReportRetainedDatabase(townRoot, doltserver.RetainedDatabase{
+						Database: name,
+						Server:   source,
+						Rig:      rigName,
+						Prefix:   prefix,
+						Reason:   "orphan from bd init; on a shared remote server, which Gas Town does not drop",
+					})
+					continue
+				}
+			}
 			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
