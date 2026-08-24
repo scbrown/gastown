@@ -254,7 +254,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		if fingerprintLabel != "" {
 			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
 		}
-		fmt.Printf("  Routed to: %s\n", strings.Join(targets, ", "))
+		fmt.Printf("  Routed to: %s\n", describeReach(statuses))
 		for _, status := range statuses {
 			if status.Error != "" {
 				fmt.Printf("  Delivery issue [%s:%s]: %s\n", status.Channel, status.Target, status.Error)
@@ -272,6 +272,62 @@ func escalationFingerprintLabel(raw string) string {
 	}
 	sum := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("escalation-fp:%x", sum[:6])
+}
+
+// describeReach renders the "Routed to:" field from what delivery ACTUALLY did,
+// never from the configured route list (aegis-xkale).
+//
+// THE BUG THIS REPLACES. The field was `strings.Join(targets, ", ")`, and
+// `targets` is `extractMailTargetsFromActions(actions)` — MAIL targets only. So
+// it was mislabelled: it said "Routed to" and computed "mail recipients". Two
+// consequences, and the second is the one that cost someone a night:
+//
+//   - MEDIUM routes to [bead, log]: no mail action, so the line rendered EMPTY
+//     under a ✅ "Escalation created" and rc=0. Blank reads as a rendering glitch,
+//     not as "no human was notified".
+//   - HIGH publishes a PUSH: also not a mail action, so the line rendered EMPTY
+//     THERE TOO — beside a real, observed `push PUBLISHED` receipt. The one case
+//     where a human genuinely was reached was reported identically to the case
+//     where nobody was. That is aegis-w08lh's residual, and it is the whole
+//     reason `scripts/escalate-verified.sh` exists to read the OUTPUT rather
+//     than trust this summary.
+//
+// So this reads `statuses`, which already carries every channel — bead, mail,
+// email, sms, slack, log — with its own Error field. Three rules:
+//
+//  1. Only SUCCESSFUL deliveries count. A channel that errored is reported on
+//     its own "Delivery issue" line below and must not be listed as reached.
+//  2. `bead` and `log` are RECORDS, not recipients. Listing them would let
+//     "Routed to: bead, log" read as delivery, which is the exact confusion
+//     aegis-tg5h was filed about when this printed a mayor that did not exist.
+//  3. When nothing human-reaching succeeded, SAY SO IN WORDS. A blank is not a
+//     statement; "(nobody — …)" is one, and it makes the MEDIUM run
+//     self-describing with no behaviour change at all.
+func describeReach(statuses []deliveryStatus) string {
+	var reached []string
+	records := 0
+	for _, st := range statuses {
+		if st.Error != "" {
+			continue // reported separately; never counts as reach
+		}
+		switch st.Channel {
+		case "bead", "log":
+			records++
+			continue
+		}
+		label := st.Channel
+		if st.Target != "" && st.Target != st.Channel {
+			label = fmt.Sprintf("%s:%s", st.Channel, st.Target)
+		}
+		reached = append(reached, label)
+	}
+	if len(reached) > 0 {
+		return strings.Join(reached, ", ")
+	}
+	if records > 0 {
+		return "(nobody — this severity files a record only; no human was notified)"
+	}
+	return "(nobody — no delivery succeeded)"
 }
 
 type deliveryStatus struct {
