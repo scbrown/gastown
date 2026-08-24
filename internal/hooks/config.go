@@ -1016,50 +1016,6 @@ func ValidTarget(target string) bool {
 // This includes resolved gt hook commands that all agents need.
 func DefaultBase() *HooksConfig {
 	return &HooksConfig{
-		PreToolUse: []HookEntry{
-			{
-				Matcher: "Bash(gh pr create*)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
-				}},
-			},
-			{
-				Matcher: "Bash(git checkout -b*)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
-				}},
-			},
-			{
-				Matcher: "Bash(git switch -c*)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
-				}},
-			},
-			{
-				Matcher: "Bash(rm -rf /*)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard dangerous-command"),
-				}},
-			},
-			{
-				Matcher: "Bash(git push --force*)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard dangerous-command"),
-				}},
-			},
-			{
-				Matcher: "Bash(git push -f*)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard dangerous-command"),
-				}},
-			},
-		},
 		SessionStart: []HookEntry{
 			{
 				Matcher: "",

@@ -245,6 +245,9 @@ func TestGetApplicableOverrides(t *testing.T) {
 
 func TestDefaultBase(t *testing.T) {
 	cfg := DefaultBase()
+	if len(cfg.PreToolUse) != 0 {
+		t.Fatalf("DefaultBase should not emit command-shaped hook matchers; got %d PreToolUse entries", len(cfg.PreToolUse))
+	}
 
 	if len(cfg.SessionStart) == 0 {
 		t.Error("DefaultBase should have SessionStart hooks")
