@@ -1255,6 +1255,11 @@ func (b *Beads) Show(id string) (*Issue, error) {
 		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
 		if targetDir != b.getResolvedBeadsDir() {
 			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+			// ResolveRoutingTarget has already selected the owning database. Do not
+			// route again from the target wrapper: redirect chains can make its
+			// resolved directory differ from targetDir and otherwise bounce Show
+			// between cross-rig targets until the process exhausts its stack.
+			target.noRoute = true
 			return target.Show(id)
 		}
 	}

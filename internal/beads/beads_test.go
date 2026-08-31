@@ -25,6 +25,54 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestShowCrossRigRoutingStopsAfterOneDispatch(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	townBeads := filepath.Join(townRoot, ".beads")
+	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	rigBeads := filepath.Join(rigDir, ".beads")
+	alternateBeads := filepath.Join(townRoot, "alternate", ".beads")
+	for _, dir := range []string{townBeads, rigBeads, alternateBeads} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteRoutes(townBeads, []Route{{Prefix: "gt-", Path: "gastown/mayor/rig"}}); err != nil {
+		t.Fatal(err)
+	}
+	// A redirect cycle is malformed, but routing must still be bounded. The
+	// redirect resolver has its own depth cap; historically Show repeatedly
+	// applied that capped resolution and recursed forever.
+	if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte(alternateBeads+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(alternateBeads, "redirect"), []byte(rigBeads+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	bdStub := "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"gt-rig-gastown\",\"title\":\"Gastown\"}]'\n"
+	if err := os.WriteFile(bdPath, []byte(bdStub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	issue, err := New(townRoot).Show("gt-rig-gastown")
+	if err != nil {
+		t.Fatalf("Show returned error: %v", err)
+	}
+	if issue.ID != "gt-rig-gastown" {
+		t.Fatalf("Show returned issue %q, want %q", issue.ID, "gt-rig-gastown")
+	}
+}
+
 // TestListOptions verifies ListOptions defaults.
 func TestListOptions(t *testing.T) {
 	opts := ListOptions{
