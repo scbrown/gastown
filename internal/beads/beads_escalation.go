@@ -310,8 +310,8 @@ func (b *Beads) ListEscalations() ([]*Issue, error) {
 		return nil, err
 	}
 
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
+	issues, err := parseBrIssueList(out)
+	if err != nil {
 		return nil, fmt.Errorf("parsing br list output: %w", err)
 	}
 
@@ -334,8 +334,8 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 		return nil, err
 	}
 
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
+	issues, err := parseBrIssueList(out)
+	if err != nil {
 		return nil, fmt.Errorf("parsing br list output: %w", err)
 	}
 
@@ -355,8 +355,8 @@ func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
 		return nil, err
 	}
 
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
+	issues, err := parseBrIssueList(out)
+	if err != nil {
 		return nil, fmt.Errorf("parsing br list output: %w", err)
 	}
 
@@ -380,7 +380,14 @@ func (b *Beads) runBrWithStdin(stdinData []byte, args ...string) ([]byte, error)
 	cmd := exec.CommandContext(ctx, "br", fullArgs...) //nolint:gosec // G204: args are constructed internally
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
-	cmd.Env = b.buildRunEnv()
+	if b.isolated {
+		cmd.Env = filterBeadsEnv(os.Environ())
+	} else {
+		// --db is authoritative for br. Do not inherit the legacy Dolt target
+		// environment assembled for bd; an inconsistent BEADS_DIR can make br
+		// reject an otherwise valid explicit SQLite database.
+		cmd.Env = StripBDTargetEnv(os.Environ())
+	}
 	if stdinData != nil {
 		cmd.Stdin = bytes.NewReader(stdinData)
 	}
@@ -416,6 +423,23 @@ func (b *Beads) brDBPath() string {
 		}
 	}
 	return filepath.Join(b.getResolvedBeadsDir(), "beads.db")
+}
+
+func parseBrIssueList(data []byte) ([]*Issue, error) {
+	var result struct {
+		Issues []*Issue `json:"issues"`
+	}
+	if err := json.Unmarshal(data, &result); err == nil && result.Issues != nil {
+		return result.Issues, nil
+	}
+
+	// Keep compatibility with early br builds and test doubles that emitted a
+	// bare array before the paginated object became the public JSON contract.
+	var issues []*Issue
+	if err := json.Unmarshal(data, &issues); err != nil {
+		return nil, err
+	}
+	return issues, nil
 }
 
 func filterEscalationRecords(issues []*Issue) []*Issue {

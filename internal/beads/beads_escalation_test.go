@@ -459,7 +459,7 @@ printf '%s\n' '---' >> "` + argsPath + `"
 for a in "$@"; do
   printf '%s\n' "$a" >> "` + argsPath + `"
 done
-echo '[]'
+echo '{"issues":[],"total":0,"limit":0,"offset":0,"has_more":false}'
 `
 	if err := os.WriteFile(filepath.Join(stubDir, "br"), []byte(stubScript), 0755); err != nil {
 		t.Fatalf("write br stub: %v", err)
@@ -518,5 +518,15 @@ func TestEscalationBrDBPathAcceptsAlreadyResolvedCutoverStore(t *testing.T) {
 	}
 	if strings.Contains(got, filepath.Join("_beads", ".beads")) {
 		t.Fatalf("brDBPath() rediscovered beneath the cutover store: %q", got)
+	}
+}
+
+func TestParseBrIssueListPaginatedObject(t *testing.T) {
+	issues, err := parseBrIssueList([]byte(`{"issues":[{"id":"aegis-escalation-1","title":"x","status":"open","issue_type":"task","labels":["gt:escalation"]}],"total":1,"limit":0,"offset":0,"has_more":false}`))
+	if err != nil {
+		t.Fatalf("parseBrIssueList: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "aegis-escalation-1" {
+		t.Fatalf("parseBrIssueList() = %#v", issues)
 	}
 }
