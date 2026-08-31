@@ -2,12 +2,18 @@
 package beads
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // EscalationFields holds structured fields for escalation beads.
@@ -175,26 +181,23 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 
 	description := FormatEscalationDescription(title, fields)
 
-	// Pass description via stdin (--body-file=-) instead of --description=...
-	// to avoid embedding newlines in a flag value. bd 1.0.3+ rejects newline-
-	// containing flag values, which broke `gt escalate` for any escalation
-	// with structured YAML metadata in the description.
+	// Pass description via stdin instead of a flag value so structured,
+	// multi-line escalation metadata reaches br byte-for-byte.
 	args := []string{"create", "--json",
 		"--title=" + title,
-		"--body-file=-",
+		"--description-file=-",
 		"--type=task",
 		"--ephemeral",
-		"--wisp-type=escalation",
-		"--labels=gt:escalation",
 	}
 
-	// Add severity as a label for easy filtering
+	labels := []string{"gt:escalation"}
 	if fields != nil && fields.Severity != "" {
-		args = append(args, fmt.Sprintf("--labels=severity:%s", fields.Severity))
+		labels = append(labels, fmt.Sprintf("severity:%s", fields.Severity))
 	}
 	if fields != nil && fields.Fingerprint != "" {
-		args = append(args, "--labels="+fields.Fingerprint)
+		labels = append(labels, fields.Fingerprint)
 	}
+	args = append(args, "--labels="+strings.Join(labels, ","))
 
 	// Default actor from BD_ACTOR env var for provenance tracking
 	// Uses getActor() to respect isolated mode (tests)
@@ -202,14 +205,14 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 		args = append(args, "--actor="+actor)
 	}
 
-	out, err := b.runWithStdin([]byte(description), args...)
+	out, err := b.runBrWithStdin([]byte(description), args...)
 	if err != nil {
 		return nil, err
 	}
 
 	var issue Issue
 	if err := json.Unmarshal(out, &issue); err != nil {
-		return nil, fmt.Errorf("parsing bd create output: %w", err)
+		return nil, fmt.Errorf("parsing br create output: %w", err)
 	}
 
 	return &issue, nil
@@ -301,14 +304,14 @@ func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) 
 
 // ListEscalations returns all open escalation beads.
 func (b *Beads) ListEscalations() ([]*Issue, error) {
-	out, err := b.run("list", "--label=gt:escalation", "--status=open", "--json")
+	out, err := b.runBr("list", "--label=gt:escalation", "--status=open", "--limit=0", "--json")
 	if err != nil {
 		return nil, err
 	}
 
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+		return nil, fmt.Errorf("parsing br list output: %w", err)
 	}
 
 	return filterEscalationRecords(issues), nil
@@ -319,10 +322,11 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 	if fingerprintLabel == "" {
 		return nil, nil
 	}
-	out, err := b.run("list",
+	out, err := b.runBr("list",
 		"--label=gt:escalation",
 		"--label="+fingerprintLabel,
 		"--status=open",
+		"--limit=0",
 		"--json",
 	)
 	if err != nil {
@@ -331,7 +335,7 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+		return nil, fmt.Errorf("parsing br list output: %w", err)
 	}
 
 	return filterEscalationRecords(issues), nil
@@ -339,10 +343,11 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
 func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
-	out, err := b.run("list",
+	out, err := b.runBr("list",
 		"--label=gt:escalation",
 		"--label=severity:"+severity,
 		"--status=open",
+		"--limit=0",
 		"--json",
 	)
 	if err != nil {
@@ -351,10 +356,49 @@ func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
 
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+		return nil, fmt.Errorf("parsing br list output: %w", err)
 	}
 
 	return filterEscalationRecords(issues), nil
+}
+
+func (b *Beads) runBr(args ...string) ([]byte, error) {
+	return b.runBrWithStdin(nil, args...)
+}
+
+// runBrWithStdin runs br against the database selected by the same redirect
+// resolution used by Beads. The explicit --db makes escalation persistence
+// independent of the caller's current directory.
+func (b *Beads) runBrWithStdin(stdinData []byte, args ...string) ([]byte, error) {
+	beadsDir := b.getResolvedBeadsDir()
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	fullArgs := append([]string{"--db", dbPath}, args...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "br", fullArgs...) //nolint:gosec // G204: args are constructed internally
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Dir = b.workDir
+	cmd.Env = b.buildRunEnv()
+	if stdinData != nil {
+		cmd.Stdin = bytes.NewReader(stdinData)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if execErr, ok := err.(*exec.Error); ok && errors.Is(execErr.Err, exec.ErrNotFound) {
+			return nil, ErrNotInstalled
+		}
+		message := strings.TrimSpace(stderr.String())
+		if message != "" {
+			return nil, fmt.Errorf("br %s: %s", strings.Join(args, " "), message)
+		}
+		return nil, fmt.Errorf("br %s: %w", strings.Join(args, " "), err)
+	}
+	return stdout.Bytes(), nil
 }
 
 func filterEscalationRecords(issues []*Issue) []*Issue {
