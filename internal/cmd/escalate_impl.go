@@ -3,7 +3,6 @@ package cmd
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
