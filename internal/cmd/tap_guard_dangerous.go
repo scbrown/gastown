@@ -89,6 +89,9 @@ func runTapGuardDangerous(cmd *cobra.Command, args []string) error {
 // findDangerousCommand shell-scans the command line and returns the reason for
 // the first dangerous simple command found, or "" if none.
 func findDangerousCommand(command string) string {
+	if reason := matchesPipedDangerousSQL(command); reason != "" {
+		return reason
+	}
 	for _, c := range scanCommands(command) {
 		if len(c.tokens) == 0 {
 			continue
@@ -102,6 +105,36 @@ func findDangerousCommand(command string) string {
 		} {
 			if reason := check(&c); reason != "" {
 				return reason
+			}
+		}
+	}
+	return ""
+}
+
+// matchesPipedDangerousSQL blocks literal SQL emitted by echo/printf directly
+// into a known database client. The ordinary scanner intentionally treats
+// quoted producer arguments as data, but across this pipeline edge that data
+// becomes the database client's executable input.
+func matchesPipedDangerousSQL(command string) string {
+	for _, pipeline := range splitTopLevelPipelines(command) {
+		for i := 0; i+1 < len(pipeline); i++ {
+			left := scanText(pipeline[i], 0)
+			right := scanText(pipeline[i+1], 0)
+			if len(left) == 0 || len(right) == 0 {
+				continue
+			}
+			producer := left[len(left)-1]
+			consumer := right[0]
+			if producer.argv0Base() != "echo" && producer.argv0Base() != "printf" {
+				continue
+			}
+			if !dbClients[consumer.argv0Base()] {
+				continue
+			}
+			for _, pattern := range sqlFragments {
+				if matchesAllFragments(producer.raw, pattern.contains) {
+					return pattern.reason
+				}
 			}
 		}
 	}

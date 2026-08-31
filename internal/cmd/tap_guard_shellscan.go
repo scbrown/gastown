@@ -157,6 +157,79 @@ func scanCommands(cmd string) []simpleCommand {
 
 const maxScanDepth = 8 // substitution/wrapper recursion bound
 
+// splitTopLevelPipelines returns top-level single-pipe command chains. Pipes in
+// quotes or command substitutions are data/nested syntax, and || is a command
+// separator rather than a producer-to-consumer edge.
+func splitTopLevelPipelines(s string) [][]string {
+	var pipelines [][]string
+	var current []string
+	start := 0
+	quote := byte(0)
+	depth := 0
+	escaped := false
+	flushPipeline := func(end int) {
+		current = append(current, strings.TrimSpace(s[start:end]))
+		if len(current) > 1 {
+			pipelines = append(pipelines, current)
+		}
+		current = nil
+		start = end + 1
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote = ch
+			continue
+		}
+		if ch == '(' {
+			depth++
+			continue
+		}
+		if ch == ')' && depth > 0 {
+			depth--
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		switch ch {
+		case '|':
+			if (i > 0 && s[i-1] == '|') || (i+1 < len(s) && s[i+1] == '|') {
+				continue
+			}
+			current = append(current, strings.TrimSpace(s[start:i]))
+			start = i + 1
+		case ';', '\n', '&':
+			if len(current) > 0 {
+				flushPipeline(i)
+			} else {
+				start = i + 1
+			}
+		}
+	}
+	if len(current) > 0 {
+		current = append(current, strings.TrimSpace(s[start:]))
+		if len(current) > 1 {
+			pipelines = append(pipelines, current)
+		}
+	}
+	return pipelines
+}
+
 func scanText(s string, depth int) []simpleCommand {
 	if depth > maxScanDepth {
 		return nil
@@ -229,7 +302,7 @@ func scanText(s string, depth int) []simpleCommand {
 				}
 			}
 			cmds = append(cmds, scanText(s[i+2:j-1], depth+1)...)
-			tok.WriteString(s[i : min(j, len(s))])
+			tok.WriteString(s[i:min(j, len(s))])
 			tokAny, tokQuot = true, true // substitution result is data in the outer command
 			i = j - 1
 		case ch == '`':

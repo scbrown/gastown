@@ -57,9 +57,9 @@ func containsWord(s, w string) bool {
 
 func TestScanCommandsArgv0(t *testing.T) {
 	tests := []struct {
-		name  string
-		cmd   string
-		want  []string // argv0Base of each scanned command, order-insensitive not needed
+		name string
+		cmd  string
+		want []string // argv0Base of each scanned command, order-insensitive not needed
 	}{
 		{"simple", "ls -la", []string{"ls"}},
 		{"path prefix", "/usr/bin/sudo id", []string{"sudo"}},
@@ -153,6 +153,9 @@ func TestDangerousGuard_Integration(t *testing.T) {
 		{"drop database via psql", `psql -c "drop database prod"`, true},
 		{"truncate via dolt", `dolt sql -q "truncate table logs"`, true},
 		{"bare SQL drop", "DROP TABLE users", true},
+		{"drop database piped from printf", `printf '%s\n' 'DROP DATABASE demo' | mysql`, true},
+		{"drop table piped from echo", `echo 'DROP TABLE users' | psql`, true},
+		{"truncate piped through db flags", `printf 'TRUNCATE TABLE logs' | mysql --database app`, true},
 
 		// Allowed — measured false positives (aegis-ptfb defect 1)
 		{"quoted heredoc naming reset --hard", "cat > /tmp/msg.md <<'EOF'\nnever run git reset --hard on shared trees\nEOF\nbd comment x --file /tmp/msg.md", false},
@@ -162,6 +165,11 @@ func TestDangerousGuard_Integration(t *testing.T) {
 		{"single-quoted sudo prose", "echo 'do not use sudo'", false},
 		{"drop table prose in comment body", `bd comment x -m "never drop table by hand"`, false},
 		{"quoted push --force prose", `git commit -m "explain why git push --force is banned"`, false},
+		{"safe select piped to database", `printf '%s\n' 'SELECT * FROM users' | mysql`, false},
+		{"destructive SQL prose piped to grep", `echo 'never DROP TABLE users' | grep DROP`, false},
+		{"pipe character inside producer data", `echo 'DROP TABLE users | mysql'`, false},
+		{"logical-or is not a pipeline", `echo 'DROP TABLE users' || mysql`, false},
+		{"separate database command has no stdin edge", `echo 'DROP TABLE users'; mysql`, false},
 
 		// Allowed — legacy negatives
 		{"rm -rf ./build/", "rm -rf ./build/", false},
