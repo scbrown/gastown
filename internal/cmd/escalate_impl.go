@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,6 +21,19 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+func escalationBeads(townRoot string) *beads.Beads {
+	// Prefer the store selected by the caller's actual workspace. The outer
+	// town root can still contain a retained pre-cutover store while a rig CWD
+	// redirects to the authoritative br database.
+	if cwd, err := os.Getwd(); err == nil {
+		beadsDir := beads.ResolveBeadsDir(cwd)
+		if _, err := os.Stat(filepath.Join(beadsDir, "beads.db")); err == nil {
+			return beads.New(beadsDir)
+		}
+	}
+	return beads.New(beads.ResolveBeadsDir(townRoot))
+}
 
 func runEscalate(cmd *cobra.Command, args []string) error {
 	// Handle --stdin: read reason from stdin (avoids shell quoting issues)
@@ -106,7 +120,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create escalation bead
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	bd := escalationBeads(townRoot)
 	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
 	if fingerprintLabel != "" {
 		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
@@ -185,7 +199,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		status.Persisted = true
 		status.RuntimeNotified = true
 
-		mailBeads := beads.New(beads.ResolveBeadsDir(townRoot))
+		mailBeads := escalationBeads(townRoot)
 		mailIssue, err := mailBeads.FindLatestIssueByTitleAndAssignee(msg.Subject, mail.AddressToIdentity(target))
 		if err != nil {
 			status.Warning = fmt.Sprintf("annotation lookup failed: %v", err)
@@ -349,7 +363,7 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	bd := escalationBeads(townRoot)
 
 	var issues []*beads.Issue
 	if escalateListAll {
@@ -442,7 +456,7 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 		ackedBy = "unknown"
 	}
 
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	bd := escalationBeads(townRoot)
 	if err := bd.AckEscalation(escalationID, ackedBy); err != nil {
 		return fmt.Errorf("acknowledging escalation: %w", err)
 	}
@@ -471,7 +485,7 @@ func runEscalateClose(cmd *cobra.Command, args []string) error {
 		closedBy = "unknown"
 	}
 
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	bd := escalationBeads(townRoot)
 	if err := bd.CloseEscalation(escalationID, closedBy, escalateCloseReason); err != nil {
 		return fmt.Errorf("closing escalation: %w", err)
 	}
@@ -503,7 +517,7 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 	threshold := escalationConfig.GetStaleThreshold()
 	maxReescalations := escalationConfig.GetMaxReescalations()
 
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	bd := escalationBeads(townRoot)
 	stale, err := bd.ListStaleEscalations(threshold)
 	if err != nil {
 		return fmt.Errorf("listing stale escalations: %w", err)
@@ -685,7 +699,7 @@ func runEscalateShow(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	bd := escalationBeads(townRoot)
 	issue, fields, err := bd.GetEscalationBead(escalationID)
 	if err != nil {
 		return fmt.Errorf("getting escalation: %w", err)
