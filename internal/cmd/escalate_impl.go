@@ -382,28 +382,6 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Cross-check each entry against live Dolt to filter out phantom escalations.
-	// When a rig's Dolt server dies and is restarted fresh, the label-based list
-	// query may still return stale IDs (e.g. from a cached or cross-rig query)
-	// that no longer exist in the live database. We skip any entries that cannot
-	// be fetched individually, since they cannot be acked or closed anyway.
-	var live []*beads.Issue
-	var phantomCount int
-	for _, issue := range issues {
-		if _, err := bd.Show(issue.ID); err != nil {
-			if errors.Is(err, beads.ErrNotFound) {
-				phantomCount++
-				fmt.Fprintf(os.Stderr, "warning: skipping unresolvable escalation %s (not found in live Dolt)\n", issue.ID)
-				continue
-			}
-			// For other errors (e.g. Dolt temporarily unreachable), include
-			// the entry so the user can see it — just warn.
-			fmt.Fprintf(os.Stderr, "warning: could not verify escalation %s: %v\n", issue.ID, err)
-		}
-		live = append(live, issue)
-	}
-	issues = live
-
 	if escalateListJSON {
 		out, _ := json.MarshalIndent(issues, "", "  ")
 		fmt.Println(string(out))
@@ -411,12 +389,7 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(issues) == 0 {
-		if phantomCount > 0 {
-			fmt.Printf("No escalations found (%d phantom entr%s skipped — bead IDs no longer exist in live Dolt)\n",
-				phantomCount, map[bool]string{true: "y", false: "ies"}[phantomCount == 1])
-		} else {
-			fmt.Println("No escalations found")
-		}
+		fmt.Println("No escalations found")
 		return nil
 	}
 
