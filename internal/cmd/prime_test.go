@@ -1220,3 +1220,93 @@ func TestErrHookUnresolvable_IsErrors(t *testing.T) {
 		t.Fatalf("errors.Is should report wrapped err matches ErrHookUnresolvable")
 	}
 }
+
+// TestPrimeOutsideWorkspaceFailsLoudly is the regression for aegis-bq8n2.
+//
+// `gt prime` from a non-workspace cwd used to print NOTHING and exit 0, because
+// resolvePrimeWorkspace treated !state.IsEnabled() as an opt-out — and
+// IsEnabled() is false by default on any host with no state file, which is every
+// fresh host. So the quiet path was not what opted-out users got; it was what
+// everybody got.
+//
+// prime is a bootstrap. A silent success there does not degrade an agent to less
+// context, it leaves the agent believing it was primed while holding none, and
+// nothing downstream can tell that apart from a real prime. Measured by kelly on
+// a full crew host, where `gt status` from the same cwd errored correctly and
+// prime did not.
+//
+// Three arms, because the fix is a DISTINCTION and one arm cannot show it:
+// no state at all must be loud, while both explicit opt-outs stay silent.
+func TestPrimeOutsideWorkspaceFailsLoudly(t *testing.T) {
+	gtBin := buildGT(t)
+
+	// A temp dir has no mayor/town.json and no mayor/ above it, so this is a
+	// genuine non-workspace cwd rather than a mocked one.
+	nonWorkspace := t.TempDir()
+
+	disabledState := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(disabledState, "gastown"), 0o755); err != nil {
+		t.Fatalf("creating state dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(disabledState, "gastown", "state.json"),
+		[]byte(`{"enabled":false}`), 0o644); err != nil {
+		t.Fatalf("writing state.json: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		env       []string
+		wantError bool
+		wantEmpty bool
+	}{
+		{
+			// THE REGRESSION. No state file anywhere — the default — must be loud.
+			name:      "no_state_file_is_not_an_opt_out",
+			env:       []string{"XDG_STATE_HOME=" + t.TempDir()},
+			wantError: true,
+		},
+		{
+			name:      "GASTOWN_DISABLED_stays_silent",
+			env:       []string{"XDG_STATE_HOME=" + t.TempDir(), "GASTOWN_DISABLED=1"},
+			wantError: false,
+			wantEmpty: true,
+		},
+		{
+			name:      "gt_disable_stays_silent",
+			env:       []string{"XDG_STATE_HOME=" + disabledState},
+			wantError: false,
+			wantEmpty: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(gtBin, "prime")
+			cmd.Dir = nonWorkspace
+			cmd.Env = append(os.Environ(), tc.env...)
+			output, err := cmd.CombinedOutput()
+
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("prime exited 0 outside a workspace — this is bq8n2. output: %q", output)
+				}
+				// Exit status alone is not the contract: an agent needs to be
+				// TOLD, and told where it was standing when it happened.
+				if !strings.Contains(string(output), "not in a Gas Town workspace") {
+					t.Errorf("error does not say what went wrong; got: %q", output)
+				}
+				if !strings.Contains(string(output), nonWorkspace) {
+					t.Errorf("error does not name the cwd %q; got: %q", nonWorkspace, output)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected silent success, got error %v with output: %q", err, output)
+			}
+			if tc.wantEmpty && len(bytes.TrimSpace(output)) != 0 {
+				t.Errorf("expected no output for an explicit opt-out, got: %q", output)
+			}
+		})
+	}
+}

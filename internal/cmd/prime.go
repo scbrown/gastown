@@ -99,7 +99,14 @@ HOOK MODE (--hook):
     "SessionStart": "export GT_SESSION_ID=$(uuidgen) GT_HOOK_SOURCE=startup && gt prime --hook"
     "PreCompress":  "export GT_HOOK_SOURCE=compact && gt prime --hook"
     Set GT_SESSION_ID + GT_HOOK_SOURCE as env vars to skip the stdin read entirely.`,
-	RunE: runPrime,
+	// Without this, cobra appends the usage blurb to every RunE error, so a
+	// RUNTIME failure ("not in a Gas Town workspace") renders exactly like a
+	// flag typo — and the reader's next move is to fix their flags rather than
+	// their cwd. That misreading has already cost this fleet a P0 on gt
+	// escalate (aegis-pg0g7); do not reintroduce it here, on the bootstrap,
+	// where the whole point of aegis-bq8n2 is that the message must land.
+	SilenceUsage: true,
+	RunE:         runPrime,
 }
 
 func init() {
@@ -131,7 +138,9 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 	if townRoot == "" {
-		return nil // Silent exit - not in workspace and not enabled
+		// Reachable ONLY via an explicit opt-out (aegis-bq8n2); every other
+		// missing workspace is now an error from resolvePrimeWorkspace.
+		return nil
 	}
 
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
@@ -308,8 +317,48 @@ func validatePrimeFlags() error {
 	return nil
 }
 
+// primeExplicitlyDisabled reports whether somebody DECIDED gt should be quiet
+// here — as opposed to gt simply never having been enabled on this host.
+//
+// That distinction is the whole fix for aegis-bq8n2. state.IsEnabled() collapses
+// the two: it returns false both for `gt disable` and for "no state file", and
+// no state file is the default everywhere. Honour the decision, not the default.
+func primeExplicitlyDisabled() bool {
+	if os.Getenv("GASTOWN_DISABLED") == "1" {
+		return true
+	}
+	if os.Getenv("GASTOWN_ENABLED") == "1" {
+		return false
+	}
+	s, err := state.Load()
+	if err != nil || s == nil {
+		return false // Never set up. Not an opt-out.
+	}
+	return !s.Enabled // `gt disable` was run. That is an opt-out.
+}
+
 // resolvePrimeWorkspace finds the cwd and town root for prime.
-// Returns empty townRoot (not an error) when not in a workspace and not enabled.
+// Returns empty townRoot (not an error) ONLY when somebody has explicitly opted
+// out (GASTOWN_DISABLED=1, or `gt disable`); every other failure to find a
+// workspace is an error naming the cwd.
+//
+// prime is a BOOTSTRAP: its whole job is to hand an agent its identity, role and
+// work context. When it prints nothing and exits 0, the agent does not fall back
+// to some lesser context — it proceeds believing itself primed while holding
+// none, and nothing downstream can tell that apart from a successful prime.
+// Silence is the one outcome a bootstrap must never have.
+//
+// This used to exit silently whenever !state.IsEnabled(), which is the DEFAULT
+// on any host without a state file (Load fails, IsEnabled returns false). So the
+// quiet path was not reserved for people who had opted out — it was what
+// everybody got. Measured on a full crew host (aegis-bq8n2, kelly): `gt prime`
+// from a non-workspace cwd printed nothing and exited 0, while `gt status` from
+// that same cwd errored correctly. prime was the outlier, and it was the one
+// command where being the outlier costs an agent its whole context.
+//
+// The "Discover, Don't Track" intent — do not nag someone who has not opted in —
+// is preserved by the explicit opt-out. An env var somebody set is a decision;
+// a missing state file is not.
 func resolvePrimeWorkspace() (cwd, townRoot string, err error) {
 	cwd, err = os.Getwd()
 	if err != nil {
@@ -321,13 +370,18 @@ func resolvePrimeWorkspace() (cwd, townRoot string, err error) {
 		return "", "", fmt.Errorf("finding workspace: %w", err)
 	}
 
-	// "Discover, Don't Track" principle:
-	// If in a workspace, proceed. If not, check global enabled state.
 	if townRoot == "" {
-		if !state.IsEnabled() {
-			return cwd, "", nil // Signal caller to exit silently
+		if primeExplicitlyDisabled() {
+			return cwd, "", nil // Somebody opted out: stay silent, exit 0.
 		}
-		return "", "", fmt.Errorf("not in a Gas Town workspace")
+		return "", "", fmt.Errorf(
+			"not in a Gas Town workspace: no %s or %s/ found in %s or any parent.\n"+
+				"  %s prime is a bootstrap — it had no role context to give you, so do not\n"+
+				"  proceed as if you were primed.\n"+
+				"  Run it from inside a workspace (a directory tree whose root holds %s),\n"+
+				"  or set GASTOWN_DISABLED=1 to silence it deliberately.",
+			workspace.PrimaryMarker, workspace.SecondaryMarker, cwd,
+			cli.Name(), workspace.PrimaryMarker)
 	}
 
 	return cwd, townRoot, nil
