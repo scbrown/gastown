@@ -44,24 +44,7 @@ type tapHandler struct {
 
 func runTapList(cmd *cobra.Command, args []string) error {
 	// Built-in handlers (implemented as Go commands)
-	handlers := []tapHandler{
-		{
-			name:        "pr-workflow",
-			kind:        "guard",
-			description: "Block PR creation and feature branches",
-			event:       "PreToolUse",
-			matchers:    []string{"Bash(gh pr create*)", "Bash(git checkout -b*)", "Bash(git switch -c*)"},
-			implemented: true,
-		},
-		{
-			name:        "dangerous-command",
-			kind:        "guard",
-			description: "Block sudo, package installs, rm -rf, force push, hard reset, etc.",
-			event:       "PreToolUse",
-			matchers:    []string{"Bash(sudo *)", "Bash(apt install*)", "Bash(dnf install*)", "Bash(brew install*)", "Bash(rm -rf /*)", "Bash(git push --force*)", "Bash(git push -f*)"},
-			implemented: true,
-		},
-	}
+	handlers := builtInTapHandlers()
 
 	// Try to load registry for additional handlers
 	townRoot, err := workspace.FindFromCwd()
@@ -150,6 +133,27 @@ func runTapList(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func builtInTapHandlers() []tapHandler {
+	return []tapHandler{
+		{
+			name:        "pr-workflow",
+			kind:        "guard",
+			description: "Block PR creation and feature branches",
+			event:       "PreToolUse",
+			matchers:    []string{"Bash"},
+			implemented: true,
+		},
+		{
+			name:        "dangerous-command",
+			kind:        "guard",
+			description: "Block sudo, package installs, rm -rf, force push, hard reset, etc.",
+			event:       "PreToolUse",
+			matchers:    []string{"Bash"},
+			implemented: true,
+		},
+	}
 }
 
 func isBuiltIn(name string, handlers []tapHandler) bool {
