@@ -361,8 +361,8 @@ func TestBumpSeverity(t *testing.T) {
 }
 
 // TestCreateEscalationBead_PassesDescriptionViaStdin verifies that
-// CreateEscalationBead passes the multi-line description through bd's stdin
-// (--body-file=-) rather than embedding newlines in --description=...
+// CreateEscalationBead passes the multi-line description through br's stdin
+// (--description-file=-) rather than embedding newlines in --description=...
 //
 // Regression test for dc-1bxe: bd 1.0.3+ rejects newlines inside --description
 // flag values, which broke `gt escalate` for any escalation containing the
@@ -372,7 +372,7 @@ func TestCreateEscalationBead_PassesDescriptionViaStdin(t *testing.T) {
 	argsPath := filepath.Join(stubDir, "args.txt")
 	stdinPath := filepath.Join(stubDir, "stdin.txt")
 
-	// Stub bd: write each arg on its own line to args.txt, capture stdin to
+	// Stub br: write each arg on its own line to args.txt, capture stdin to
 	// stdin.txt, and emit a minimal valid issue JSON so unmarshal succeeds.
 	stubScript := `#!/bin/sh
 for a in "$@"; do
@@ -382,16 +382,17 @@ cat > "` + stdinPath + `"
 echo '{"id":"dc-test1","title":"x","status":"open","priority":2,"type":"task","labels":["gt:escalation"]}'
 exit 0
 `
-	stubPath := filepath.Join(stubDir, "bd")
+	stubPath := filepath.Join(stubDir, "br")
 	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
-		t.Fatalf("write bd stub: %v", err)
+		t.Fatalf("write br stub: %v", err)
 	}
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	// Reset --allow-stale capability cache so the stub gets probed fresh.
-	ResetBdAllowStaleCacheForTest()
-
-	b := New(t.TempDir())
+	workDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0755); err != nil {
+		t.Fatalf("create .beads: %v", err)
+	}
+	b := New(workDir)
 	fields := &EscalationFields{
 		Severity:    "high",
 		Reason:      "multi-line\nreason\nwith embedded newlines",
@@ -410,12 +411,15 @@ exit 0
 	}
 	args := string(argsData)
 
-	// Must use --body-file=- to read description from stdin.
-	if !strings.Contains(args, "--body-file=-") {
-		t.Errorf("expected --body-file=- in bd args, got:\n%s", args)
+	// Must use --description-file=- to read description from stdin.
+	if !strings.Contains(args, "--description-file=-") {
+		t.Errorf("expected --description-file=- in br args, got:\n%s", args)
 	}
-	if !strings.Contains(args, "--labels=escalation-fp:abc123def456") {
-		t.Errorf("expected fingerprint label in bd args, got:\n%s", args)
+	if !strings.Contains(args, "--labels=gt:escalation,severity:high,escalation-fp:abc123def456") {
+		t.Errorf("expected combined br labels, got:\n%s", args)
+	}
+	if strings.Contains(args, "--wisp-type") {
+		t.Errorf("br has no --wisp-type flag, got:\n%s", args)
 	}
 	// Must NOT pass --description=... at all (any --description value would
 	// embed the newline-containing structured description and fail bd 1.0.3+).
@@ -444,5 +448,75 @@ exit 0
 	// Sanity: stdin must contain newlines (it's the multi-line description).
 	if !strings.Contains(stdin, "\n") {
 		t.Errorf("expected stdin to be multi-line, got %q", stdin)
+	}
+}
+
+func TestEscalationListsUseBrForEveryReadPath(t *testing.T) {
+	stubDir := t.TempDir()
+	argsPath := filepath.Join(stubDir, "args.txt")
+	stubScript := `#!/bin/sh
+printf '%s\n' '---' >> "` + argsPath + `"
+for a in "$@"; do
+  printf '%s\n' "$a" >> "` + argsPath + `"
+done
+echo '[]'
+`
+	if err := os.WriteFile(filepath.Join(stubDir, "br"), []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write br stub: %v", err)
+	}
+	// Any accidental fallback to bd must fail the test loudly.
+	if err := os.WriteFile(filepath.Join(stubDir, "bd"), []byte("#!/bin/sh\nexit 97\n"), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0755); err != nil {
+		t.Fatalf("create .beads: %v", err)
+	}
+	b := New(workDir)
+	if _, err := b.ListEscalations(); err != nil {
+		t.Fatalf("ListEscalations: %v", err)
+	}
+	if _, err := b.ListEscalationsByFingerprint("escalation-fp:abc123"); err != nil {
+		t.Fatalf("ListEscalationsByFingerprint: %v", err)
+	}
+	if _, err := b.ListEscalationsBySeverity("high"); err != nil {
+		t.Fatalf("ListEscalationsBySeverity: %v", err)
+	}
+
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	commands := strings.Split(strings.TrimPrefix(strings.TrimSpace(string(data)), "---\n"), "---\n")
+	if len(commands) != 3 {
+		t.Fatalf("got %d br commands, want 3:\n%s", len(commands), data)
+	}
+	for _, command := range commands {
+		for _, want := range []string{"--db\n", "list\n", "--label=gt:escalation\n", "--status=open\n", "--limit=0\n", "--json"} {
+			if !strings.Contains(command, want) {
+				t.Errorf("command missing %q:\n%s", want, command)
+			}
+		}
+	}
+}
+
+func TestEscalationBrDBPathAcceptsAlreadyResolvedCutoverStore(t *testing.T) {
+	storeDir := filepath.Join(t.TempDir(), "_beads")
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	dbPath := filepath.Join(storeDir, "beads.db")
+	if err := os.WriteFile(dbPath, nil, 0600); err != nil {
+		t.Fatalf("create database marker: %v", err)
+	}
+
+	got := New(storeDir).brDBPath()
+	if got != dbPath {
+		t.Fatalf("brDBPath() = %q, want already-resolved store %q", got, dbPath)
+	}
+	if strings.Contains(got, filepath.Join("_beads", ".beads")) {
+		t.Fatalf("brDBPath() rediscovered beneath the cutover store: %q", got)
 	}
 }
