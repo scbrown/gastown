@@ -111,6 +111,22 @@ func stripHeredocBodies(cmd string) (cleaned string, extraCmds []string) {
 		}
 		out = append(out, line)
 	}
+	// FAIL CLOSED on an UNTERMINATED heredoc (aegis-7uetct). inBody still set at
+	// EOF means the delimiter never arrived, so we MIS-PARSED: what we took for a
+	// body is ordinary command text, and dropping it hands the matchers an empty
+	// command while the real one sails past. One quoted `<< WORD` in prose
+	// disarmed this scanner for the rest of the command — measured against the
+	// deployed gt, where `echo "prose << EOF inline"` followed by a destructive
+	// command exited 0 while the bare command exited 2. A well-formed heredoc
+	// always closes its delimiter, so this costs nothing on valid input.
+	//
+	// Note the sibling case already handled below: an unterminated QUOTE is
+	// treated as "rest is data". The opposite choice is correct here, because a
+	// heredoc body is DROPPED rather than merely marked, so mis-parsing removes
+	// command text instead of neutralising it.
+	if inBody {
+		return cmd, extraCmds
+	}
 	return strings.Join(out, "\n"), extraCmds
 }
 
