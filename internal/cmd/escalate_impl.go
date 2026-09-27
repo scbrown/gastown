@@ -221,7 +221,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Process external notification actions (email:, sms:, slack, log)
-	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
+	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, escalateReason, townRoot)...)
 
 	// Log to activity feed
 	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
@@ -744,7 +744,7 @@ func extractMailTargetsFromActions(actions []string) []string {
 }
 
 // executeExternalActions processes external notification actions (email:, sms:, slack, log).
-func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, townRoot string) []deliveryStatus {
+func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, reason, townRoot string) []deliveryStatus {
 	statuses := []deliveryStatus{}
 	for _, action := range actions {
 		switch {
@@ -786,7 +786,7 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 					style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
 				}
 			} else {
-				receipt, err := sendEscalationSMS(cfg, beadID, severity, description)
+				receipt, err := sendEscalationSMS(cfg, beadID, severity, description, reason)
 				if err != nil {
 					status.Error = err.Error()
 					// LOUD, and on stdout as well as the warning stream. The failure and
@@ -909,10 +909,14 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 // RECEIPT identifying what was published, or an error. It deliberately returns evidence
 // rather than a bare nil: the caller prints what this establishes, and it can only print
 // as much as this proves (aegis-uz6i).
-func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description string) (string, error) {
+func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description, reason string) (string, error) {
+	message := fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID)
+	if reason != "" {
+		message += "\n\n" + reason
+	}
 	payload := map[string]string{
 		"to":   cfg.Contacts.HumanSMS,
-		"body": fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID),
+		"body": message,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

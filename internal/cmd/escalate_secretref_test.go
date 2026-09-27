@@ -63,7 +63,7 @@ func TestPolicyWithNoCredentialInItStillDelivers(t *testing.T) {
 		t.Fatalf("reference did not resolve: %s", reason)
 	}
 
-	receipt, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full")
+	receipt, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full", "")
 	if err != nil {
 		t.Fatalf("push failed: %v", err)
 	}
