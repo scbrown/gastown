@@ -123,7 +123,7 @@ func stripHeredocBodies(cmd string) (cleaned string, extraCmds []string) {
 	// Note the sibling case already handled below: an unterminated QUOTE is
 	// treated as "rest is data". The opposite choice is correct here, because a
 	// heredoc body is DROPPED rather than merely marked, so mis-parsing removes
-	// command text instead of neutralising it.
+	// command text instead of neutralizing it.
 	if inBody {
 		return cmd, extraCmds
 	}

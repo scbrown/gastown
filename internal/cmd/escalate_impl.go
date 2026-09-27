@@ -221,7 +221,7 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Process external notification actions (email:, sms:, slack, log)
-	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
+	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, escalateReason, townRoot)...)
 
 	// Log to activity feed
 	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
@@ -315,7 +315,7 @@ func escalationFingerprintLabel(raw string) string {
 //     aegis-tg5h was filed about when this printed a mayor that did not exist.
 //  3. When nothing human-reaching succeeded, SAY SO IN WORDS. A blank is not a
 //     statement; "(nobody — …)" is one, and it makes the MEDIUM run
-//     self-describing with no behaviour change at all.
+//     self-describing with no behavior change at all.
 func describeReach(statuses []deliveryStatus) string {
 	var reached []string
 	records := 0
@@ -744,7 +744,7 @@ func extractMailTargetsFromActions(actions []string) []string {
 }
 
 // executeExternalActions processes external notification actions (email:, sms:, slack, log).
-func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, townRoot string) []deliveryStatus {
+func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, reason, townRoot string) []deliveryStatus {
 	statuses := []deliveryStatus{}
 	for _, action := range actions {
 		switch {
@@ -786,7 +786,7 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 					style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
 				}
 			} else {
-				receipt, err := sendEscalationSMS(cfg, beadID, severity, description)
+				receipt, err := sendEscalationSMS(cfg, beadID, severity, description, reason)
 				if err != nil {
 					status.Error = err.Error()
 					// LOUD, and on stdout as well as the warning stream. The failure and
@@ -909,10 +909,15 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 // RECEIPT identifying what was published, or an error. It deliberately returns evidence
 // rather than a bare nil: the caller prints what this establishes, and it can only print
 // as much as this proves (aegis-uz6i).
-func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description string) (string, error) {
+func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description, reason string) (string, error) {
+	message := fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID)
+	// Keep per-run detail in the notification body, outside the stable bead title.
+	if reason != "" {
+		message += "\n\n" + reason
+	}
 	payload := map[string]string{
 		"to":   cfg.Contacts.HumanSMS,
-		"body": fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID),
+		"body": message,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

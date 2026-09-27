@@ -322,7 +322,7 @@ func validatePrimeFlags() error {
 //
 // That distinction is the whole fix for aegis-bq8n2. state.IsEnabled() collapses
 // the two: it returns false both for `gt disable` and for "no state file", and
-// no state file is the default everywhere. Honour the decision, not the default.
+// no state file is the default everywhere. Honor the decision, not the default.
 func primeExplicitlyDisabled() bool {
 	if os.Getenv("GASTOWN_DISABLED") == "1" {
 		return true

@@ -95,7 +95,7 @@ func TestExtractMailTargetsFromActions(t *testing.T) {
 
 func TestExecuteExternalActionsReportsWarningsAndFailures(t *testing.T) {
 	townRoot := t.TempDir()
-	statuses := executeExternalActions([]string{"email:human", "log"}, &config.EscalationConfig{}, "hq-esc1", "high", "desc", townRoot)
+	statuses := executeExternalActions([]string{"email:human", "log"}, &config.EscalationConfig{}, "hq-esc1", "high", "desc", "", townRoot)
 	if len(statuses) != 2 {
 		t.Fatalf("expected 2 statuses, got %d", len(statuses))
 	}
@@ -500,7 +500,7 @@ func TestExecuteExternalActions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
 			// Should not panic
-			executeExternalActions(tt.actions, tt.cfg, "hq-test", "high", "Test escalation", tmpDir)
+			executeExternalActions(tt.actions, tt.cfg, "hq-test", "high", "Test escalation", "", tmpDir)
 		})
 	}
 }

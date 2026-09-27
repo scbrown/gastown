@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -120,7 +121,7 @@ func TestSendRejectsA200ThatServedTheWebUI(t *testing.T) {
 	cfg.Contacts.HumanSMS = "someone"
 	cfg.Contacts.SMSWebhook = srv.URL
 
-	receipt, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full")
+	receipt, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full", "")
 	if err == nil {
 		t.Fatalf("a 200 serving the web UI was reported as a successful push (receipt %q)", receipt)
 	}
@@ -140,7 +141,7 @@ func TestSendAcceptsARealReceiptAndReturnsIt(t *testing.T) {
 	cfg.Contacts.HumanSMS = "someone"
 	cfg.Contacts.SMSWebhook = srv.URL
 
-	receipt, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full")
+	receipt, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full", "")
 	if err != nil {
 		t.Fatalf("a real publish was reported as a failure: %v", err)
 	}
@@ -162,7 +163,39 @@ func TestSendReportsFailureOnAuthRejection(t *testing.T) {
 	cfg.Contacts.HumanSMS = "someone"
 	cfg.Contacts.SMSWebhook = srv.URL
 
-	if _, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full"); err == nil {
+	if _, err := sendEscalationSMS(cfg, "bead-1", "high", "disk is full", ""); err == nil {
 		t.Fatal("a 401 was reported as a successful push")
+	}
+}
+
+// Exercise the routed HTTP payload: accepting a receipt alone does not prove
+// that the operator received the per-run verdict carried in --reason.
+func TestEscalationSMSIncludesReason(t *testing.T) {
+	for _, reason := range []string{"", "TEST: measurement probe\nverdict=UNMEASURED; could not read repositories"} {
+		t.Run(reason, func(t *testing.T) {
+			var received map[string]string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+					t.Error(err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(realReceipt))
+			}))
+			defer srv.Close()
+			cfg := &config.EscalationConfig{}
+			cfg.Contacts.HumanSMS = "operator"
+			cfg.Contacts.SMSWebhook = srv.URL
+			statuses := executeExternalActions([]string{"sms:human"}, cfg, "bead-1", "high", "Protection audit", reason, t.TempDir())
+			if len(statuses) != 1 || !statuses[0].RuntimeNotified {
+				t.Fatalf("expected one published notification, got %+v", statuses)
+			}
+			want := "[Gas Town HIGH] Protection audit (bead: bead-1)"
+			if reason != "" {
+				want += "\n\n" + reason
+			}
+			if received["body"] != want {
+				t.Fatalf("page body = %q, want %q", received["body"], want)
+			}
+		})
 	}
 }

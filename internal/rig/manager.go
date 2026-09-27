@@ -676,7 +676,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// database in .dolt-data/ must exist first for bd config commands to work.
 	if !opts.SkipDoltCheck {
 		if _, err := exec.LookPath("dolt"); err == nil {
-			if _, _, err := doltserver.InitRig(m.townRoot, opts.Name); err != nil {
+			if _, _, err := doltserver.InitRigWithPrefix(m.townRoot, opts.Name, opts.BeadsPrefix); err != nil {
 				fmt.Printf("  Warning: Could not create rig database: %v\n", err)
 			}
 		}

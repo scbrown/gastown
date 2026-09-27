@@ -2590,8 +2590,17 @@ func jsonKeys(m map[string]json.RawMessage) []string {
 // Returns (serverWasRunning, created, err). created is false when the database
 // already existed on disk (idempotent no-op).
 func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err error) {
+	return InitRigWithPrefix(townRoot, rigName, issuePrefixForRigInit(townRoot, rigName))
+}
+
+// InitRigWithPrefix initializes a rig database with the explicitly requested
+// issue prefix. Rig creation uses this before routes and rigs.json are registered.
+func InitRigWithPrefix(townRoot, rigName, prefix string) (serverWasRunning bool, created bool, err error) {
 	if rigName == "" {
 		return false, false, fmt.Errorf("rig name cannot be empty")
+	}
+	if strings.TrimSpace(prefix) == "" {
+		return false, false, fmt.Errorf("issue prefix cannot be empty")
 	}
 
 	config := DefaultConfig(townRoot)
@@ -2612,7 +2621,7 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 		if err := EnsureMetadata(townRoot, rigName); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: metadata.json update failed for existing database %q: %v\n", rigName, err)
 		}
-		if err := EnsureRigIssuePrefix(townRoot, rigName, running); err != nil {
+		if err := ensureRigIssuePrefix(townRoot, rigName, running, prefix); err != nil {
 			return running, false, fmt.Errorf("ensuring issue_prefix for existing database %q: %w", rigName, err)
 		}
 		return running, false, nil
@@ -2677,7 +2686,7 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 		// Non-fatal: init succeeded, metadata update failed
 		fmt.Fprintf(os.Stderr, "Warning: database initialized but metadata.json update failed: %v\n", err)
 	}
-	if err := EnsureRigIssuePrefix(townRoot, rigName, running); err != nil {
+	if err := ensureRigIssuePrefix(townRoot, rigName, running, prefix); err != nil {
 		return running, true, fmt.Errorf("ensuring issue_prefix for database %q: %w", rigName, err)
 	}
 
@@ -2688,6 +2697,10 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 // persists config.issue_prefix. This covers direct `gt dolt init-rig` usage,
 // where no later InitBeads call exists to run bd init/config repair.
 func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
+	return ensureRigIssuePrefix(townRoot, rigName, serverMode, issuePrefixForRigInit(townRoot, rigName))
+}
+
+func ensureRigIssuePrefix(townRoot, rigName string, serverMode bool, prefix string) error {
 	if townRoot == "" {
 		return fmt.Errorf("townRoot cannot be empty")
 	}
@@ -2695,7 +2708,6 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 		return fmt.Errorf("rig name cannot be empty")
 	}
 
-	prefix := issuePrefixForRigInit(townRoot, rigName)
 	beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
 	if err != nil {
 		return err
