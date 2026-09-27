@@ -41,6 +41,15 @@ var schedulerTestCounter atomic.Int32
 func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	t.Helper()
 
+	// Beads discovery requires a project marker even when BEADS_DIR is explicit.
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0700); err != nil {
+		t.Fatalf("mkdir fixture beads dir: %v", err)
+	}
+	if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
+		t.Fatalf("configure fixture beads dir: %v", err)
+	}
+
 	args := []string{"init", "--prefix", prefix}
 	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
 	// instead of defaulting to port 3307.
@@ -52,7 +61,7 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	// Init must target this fixture, not discover an initialized parent town.
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+filepath.Join(dir, ".beads"))
+	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
 	out, err := cmd.CombinedOutput()
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
 	if err != nil {
