@@ -195,7 +195,9 @@ jobs:
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Integration Tests
-        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=15m -v ./internal/cmd/...
+        run: |
+          python3 -m unittest discover -s .github/scripts -p test_integration_partitions.py
+          python3 .github/scripts/integration_partitions.py
 
       - name: Test Report
         if: always()
@@ -203,4 +205,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          python3 .github/scripts/junit-report.py junit-integration.xml "Integration Test Failures"
+          status=0
+          python3 .github/scripts/junit-report.py junit-integration-scheduler.xml "Scheduler Integration Test Failures" || status=1
+          python3 .github/scripts/junit-report.py junit-integration-rest.xml "General Integration Test Failures" || status=1
+          exit "$status"
