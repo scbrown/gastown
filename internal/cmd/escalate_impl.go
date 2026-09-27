@@ -315,7 +315,7 @@ func escalationFingerprintLabel(raw string) string {
 //     aegis-tg5h was filed about when this printed a mayor that did not exist.
 //  3. When nothing human-reaching succeeded, SAY SO IN WORDS. A blank is not a
 //     statement; "(nobody — …)" is one, and it makes the MEDIUM run
-//     self-describing with no behaviour change at all.
+//     self-describing with no behavior change at all.
 func describeReach(statuses []deliveryStatus) string {
 	var reached []string
 	records := 0

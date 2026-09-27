@@ -746,7 +746,7 @@ var checkpointBeadStatus = func(ctx RoleContext, beadID string) string {
 	if err != nil || issue == nil {
 		return ""
 	}
-	return string(issue.Status)
+	return issue.Status
 }
 
 // checkpointBeadLine renders the "Hooked bead" line for a checkpoint, flagged

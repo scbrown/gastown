@@ -2445,7 +2445,7 @@ func TestJSONOutput_NoHumanReadableText(t *testing.T) {
 	convoyStageJSON = true
 	defer func() { convoyStageJSON = false }()
 
-	_ = runConvoyStage(nil, []string{"gt-j1", "gt-j2"})
+	stageErr := runConvoyStage(nil, []string{"gt-j1", "gt-j2"})
 	w.Close()
 	wErr.Close()
 	os.Stdout = oldStdout
@@ -2460,7 +2460,7 @@ func TestJSONOutput_NoHumanReadableText(t *testing.T) {
 	// Stdout should be valid JSON.
 	var parsed StageResult
 	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v\nraw:\n%s", err, output)
+		t.Fatalf("stdout is not valid JSON: %v\nrunConvoyStage error: %v\nraw:\n%s", err, stageErr, output)
 	}
 
 	// Should NOT contain human-readable markers on stdout.
