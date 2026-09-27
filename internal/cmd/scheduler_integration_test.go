@@ -106,7 +106,7 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	configureTestGitIdentity(t, tmpDir)
 
 	// Generate unique prefixes per test to avoid cross-test data leakage on
-	// the shared Dolt server. Each test gets its own databases (e.g., beads_h3, beads_r3).
+	// the shared Dolt server. Each test gets its own databases (e.g., h3, r3).
 	n := schedulerTestCounter.Add(1)
 	hqPrefix := fmt.Sprintf("h%d", n)
 	rigPrefix := fmt.Sprintf("r%d", n)
@@ -183,7 +183,8 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 		}
 		defer db.Close()
 		for _, prefix := range []string{hqPrefix, rigPrefix} {
-			dbName := "beads_" + prefix
+			// bd 1.0.5 initializes the database with the prefix itself.
+			dbName := prefix
 			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
 				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
 			}
@@ -712,7 +713,8 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 		}
 		defer db.Close()
 		for _, prefix := range []string{hqPrefix, rig1Prefix, rig2Prefix} {
-			dbName := "beads_" + prefix
+			// bd 1.0.5 initializes the database with the prefix itself.
+			dbName := prefix
 			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
 				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
 			}
