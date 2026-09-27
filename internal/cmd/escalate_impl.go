@@ -911,6 +911,7 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 // as much as this proves (aegis-uz6i).
 func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, description, reason string) (string, error) {
 	message := fmt.Sprintf("[Gas Town %s] %s (bead: %s)", strings.ToUpper(severity), description, beadID)
+	// Keep per-run detail in the notification body, outside the stable bead title.
 	if reason != "" {
 		message += "\n\n" + reason
 	}
