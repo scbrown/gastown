@@ -287,7 +287,7 @@ func (b *Beads) CloseEscalation(id, closedBy, reason string) error {
 // GetEscalationBead retrieves an escalation bead by ID.
 // Returns nil if not found.
 func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) {
-	issue, err := b.forIssueID(id).Show(id)
+	out, err := b.forIssueID(id).runBr("show", id, "--json")
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, nil, nil
@@ -295,6 +295,14 @@ func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) 
 		return nil, nil, err
 	}
 
+	issues, err := parseBrIssueList(out)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing br show output: %w", err)
+	}
+	if len(issues) != 1 || issues[0].ID != id {
+		return nil, nil, fmt.Errorf("br show %s returned no matching escalation", id)
+	}
+	issue := issues[0]
 	if !HasLabel(issue, "gt:escalation") {
 		return nil, nil, fmt.Errorf("issue %s is not an escalation bead (missing gt:escalation label)", id)
 	}
@@ -516,6 +524,13 @@ func (b *Beads) ReescalateEscalation(id, reescalatedBy string, maxReescalations 
 		OldSeverity: fields.Severity,
 	}
 
+	// The record may have been acknowledged or closed after the list snapshot.
+	if issue.Status != "open" || HasLabel(issue, "acked") {
+		result.Skipped = true
+		result.SkipReason = "no longer open and unacknowledged"
+		return result, nil
+	}
+
 	// Check if already at max reescalations
 	if maxReescalations > 0 && fields.ReescalationCount >= maxReescalations {
 		result.Skipped = true
@@ -550,11 +565,9 @@ func (b *Beads) ReescalateEscalation(id, reescalatedBy string, maxReescalations 
 	description := FormatEscalationDescription(issue.Title, fields)
 
 	// Update the bead with new description and severity label
-	if err := b.forIssueID(id).Update(id, UpdateOptions{
-		Description:  &description,
-		AddLabels:    []string{"reescalated", "severity:" + newSeverity},
-		RemoveLabels: []string{"severity:" + result.OldSeverity},
-	}); err != nil {
+	if _, err := b.forIssueID(id).runBrWithStdin([]byte(description), "update", id,
+		"--force", "--description-file=-", "--add-label=reescalated",
+		"--add-label=severity:"+newSeverity, "--remove-label=severity:"+result.OldSeverity); err != nil {
 		return nil, fmt.Errorf("updating escalation: %w", err)
 	}
 
