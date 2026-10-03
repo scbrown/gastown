@@ -530,3 +530,80 @@ func TestParseBrIssueListPaginatedObject(t *testing.T) {
 		t.Fatalf("parseBrIssueList() = %#v", issues)
 	}
 }
+
+func TestReescalateUsesBrAndRechecksAcknowledgement(t *testing.T) {
+	for _, state := range []string{"open", "acked", "closed", "update-failed"} {
+		t.Run(state, func(t *testing.T) {
+			root := t.TempDir()
+			bin := filepath.Join(root, "bin")
+			if err := os.MkdirAll(bin, 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", root)
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("STUB_STATE", state)
+			t.Setenv("STUB_LOG", filepath.Join(root, "calls"))
+			t.Setenv("STUB_INPUT", filepath.Join(root, "description"))
+			stub := `#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_LOG"
+shift 2
+case "$1" in
+ show)
+  status=open; labels='"gt:escalation"'
+  if [ "$STUB_STATE" = acked ]; then labels='"gt:escalation","acked"'; fi
+  if [ "$STUB_STATE" = closed ]; then status=closed; fi
+  printf '[{"id":"hq-fixture","title":"fixture","status":"%s","labels":[%s],"description":"severity: medium"}]\n' "$status" "$labels"
+  ;;
+ update)
+  cat > "$STUB_INPUT"
+  if [ "$STUB_STATE" = update-failed ]; then echo update-refused >&2; exit 1; fi
+  ;;
+ *) exit 98;;
+esac
+`
+			for name, body := range map[string]string{"br": stub, "bd": "#!/bin/sh\necho legacy-bd-must-not-run >&2\nexit 97\n"} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := New(root).ReescalateEscalation("hq-fixture", "tester", 2)
+			if state == "update-failed" {
+				if err == nil || !strings.Contains(err.Error(), "update-refused") {
+					t.Fatalf("hidden update error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls, err := os.ReadFile(filepath.Join(root, "calls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			skip := state == "acked" || state == "closed"
+			if result.Skipped != skip {
+				t.Fatalf("skipped=%v state=%s", result.Skipped, state)
+			}
+			if skip {
+				if strings.Contains(string(calls), "update") {
+					t.Fatal("modified resolved/acknowledged record")
+				}
+				return
+			}
+			for _, flag := range []string{"--force", "--description-file=-", "--add-label=severity:high", "--remove-label=severity:medium"} {
+				if !strings.Contains(string(calls), flag) {
+					t.Errorf("missing %s: %s", flag, calls)
+				}
+			}
+			body, err := os.ReadFile(filepath.Join(root, "description"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"severity: high", "reescalation_count: 1", "last_reescalated_by: tester"} {
+				if !strings.Contains(string(body), field) {
+					t.Errorf("missing %s: %s", field, body)
+				}
+			}
+		})
+	}
+}

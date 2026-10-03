@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -475,6 +476,7 @@ func runEscalateClose(cmd *cobra.Command, args []string) error {
 }
 
 func runEscalateStale(cmd *cobra.Command, args []string) error {
+	cmd.SilenceUsage = true
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -539,68 +541,24 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Perform re-escalation
-	var results []*beads.ReescalationResult
+	// Record updates and delivery have separate failure modes; neither may be
+	// hidden by a successful output formatter (including --json).
 	router := mail.NewRouter(townRoot)
 	defer router.WaitPendingNotifications()
-
-	for _, issue := range stale {
-		result, err := bd.ReescalateEscalation(issue.ID, reescalatedBy, maxReescalations)
-		if err != nil {
-			style.PrintWarning("failed to reescalate %s: %v", issue.ID, err)
-			continue
-		}
-		results = append(results, result)
-
-		// If not skipped, re-route to new severity targets
-		if !result.Skipped {
-			actions := escalationConfig.GetRouteForSeverity(result.NewSeverity)
-			targets := extractMailTargetsFromActions(actions)
-
-			// Send mail to each target about the reescalation
-			for _, target := range targets {
-				msg := &mail.Message{
-					From:    reescalatedBy,
-					To:      target,
-					Subject: fmt.Sprintf("[%s→%s] Re-escalated: %s", strings.ToUpper(result.OldSeverity), strings.ToUpper(result.NewSeverity), result.Title),
-					Body:    formatReescalationMailBody(result, reescalatedBy),
-					Type:    mail.TypeTask,
-				}
-
-				// Set priority based on new severity
-				switch result.NewSeverity {
-				case config.SeverityCritical:
-					msg.Priority = mail.PriorityUrgent
-				case config.SeverityHigh:
-					msg.Priority = mail.PriorityHigh
-				case config.SeverityMedium:
-					msg.Priority = mail.PriorityNormal
-				default:
-					msg.Priority = mail.PriorityLow
-				}
-
-				if err := router.Send(msg); err != nil {
-					style.PrintWarning("failed to send reescalation to %s: %v", target, err)
-				}
-			}
-
-			// Log to activity feed
-			_ = events.LogFeed(events.TypeEscalationSent, reescalatedBy, map[string]interface{}{
-				"escalation_id":    result.ID,
-				"reescalated":      true,
-				"old_severity":     result.OldSeverity,
-				"new_severity":     result.NewSeverity,
-				"reescalation_num": result.ReescalationNum,
-				"targets":          strings.Join(targets, ","),
-			})
+	external := executeExternalActions
+	if escalateStaleJSON {
+		external = func(actions []string, cfg *config.EscalationConfig, id, severity, title, reason, root string) []deliveryStatus {
+			return executeExternalActionsTo(io.Discard, actions, cfg, id, severity, title, reason, root)
 		}
 	}
+	results, deliveryErr := reescalateStaleBatch(stale, reescalatedBy, maxReescalations, escalationConfig, townRoot,
+		bd.ReescalateEscalation, router.Send, external)
 
 	// Output results
 	if escalateStaleJSON {
 		out, _ := json.MarshalIndent(results, "", "  ")
 		fmt.Println(string(out))
-		return nil
+		return deliveryErr
 	}
 
 	reescalated := 0
@@ -615,10 +573,10 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 
 	if reescalated == 0 && skipped > 0 {
 		fmt.Printf("No escalations re-escalated (%d at max level)\n", skipped)
-		return nil
+		return deliveryErr
 	}
 
-	fmt.Printf("🔄 Re-escalated %d stale escalations:\n\n", reescalated)
+	fmt.Printf("🔄 Updated severity for %d stale escalations:\n\n", reescalated)
 	for _, result := range results {
 		if result.Skipped {
 			continue
@@ -632,7 +590,84 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n  (%d skipped - at max level)\n", skipped)
 	}
 
-	return nil
+	return deliveryErr
+}
+
+// reescalateStaleBatch attempts the remaining records after a failure, but returns
+// the joined errors. A partial batch is never a successful scheduled run.
+func reescalateStaleBatch(stale []*beads.Issue, reescalatedBy string, maxReescalations int, escalationConfig *config.EscalationConfig, townRoot string,
+	update func(string, string, int) (*beads.ReescalationResult, error),
+	send func(*mail.Message) error,
+	external func([]string, *config.EscalationConfig, string, string, string, string, string) []deliveryStatus,
+) ([]*beads.ReescalationResult, error) {
+	var results []*beads.ReescalationResult
+	var failures []error
+	for _, issue := range stale {
+		result, err := update(issue.ID, reescalatedBy, maxReescalations)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("failed to reescalate %s: %w", issue.ID, err))
+			continue
+		}
+		results = append(results, result)
+
+		// If not skipped, re-route to new severity targets
+		if !result.Skipped {
+			failuresBefore := len(failures)
+			actions := escalationConfig.GetRouteForSeverity(result.NewSeverity)
+			targets := extractMailTargetsFromActions(actions)
+
+			// Send mail to each target about the reescalation
+			for _, target := range targets {
+				msg := &mail.Message{
+					From:     reescalatedBy,
+					To:       target,
+					Subject:  fmt.Sprintf("[%s→%s] Re-escalated: %s", strings.ToUpper(result.OldSeverity), strings.ToUpper(result.NewSeverity), result.Title),
+					Body:     formatReescalationMailBody(result, reescalatedBy),
+					Type:     mail.TypeEscalation,
+					ThreadID: result.ID,
+				}
+
+				// Set priority based on new severity
+				switch result.NewSeverity {
+				case config.SeverityCritical:
+					msg.Priority = mail.PriorityUrgent
+				case config.SeverityHigh:
+					msg.Priority = mail.PriorityHigh
+				case config.SeverityMedium:
+					msg.Priority = mail.PriorityNormal
+				default:
+					msg.Priority = mail.PriorityLow
+				}
+
+				if err := send(msg); err != nil {
+					failures = append(failures, fmt.Errorf("%s: failed to send reescalation to %s: %w", issue.ID, target, err))
+				}
+			}
+
+			// A configured external route must run and report its outcome too.
+			// Updating severity alone is not evidence of notification.
+			statuses := external(actions, escalationConfig, result.ID, result.NewSeverity, result.Title, formatReescalationMailBody(result, reescalatedBy), townRoot)
+			for _, status := range statuses {
+				if status.Error != "" || status.Warning != "" {
+					failures = append(failures, fmt.Errorf("%s: %s:%s delivery incomplete: %s %s", issue.ID, status.Channel, status.Target, status.Error, status.Warning))
+				}
+			}
+
+			// Only emit a sent event when every configured delivery succeeded.
+			if len(failures) == failuresBefore {
+				_ = events.LogFeed(events.TypeEscalationSent, reescalatedBy, map[string]interface{}{
+					"escalation_id":    result.ID,
+					"reescalated":      true,
+					"old_severity":     result.OldSeverity,
+					"new_severity":     result.NewSeverity,
+					"reescalation_num": result.ReescalationNum,
+					"targets":          strings.Join(targets, ","),
+				})
+			}
+		}
+	}
+
+	return results, errors.Join(failures...)
 }
 
 func getNextSeverity(severity string) string {
@@ -745,6 +780,10 @@ func extractMailTargetsFromActions(actions []string) []string {
 
 // executeExternalActions processes external notification actions (email:, sms:, slack, log).
 func executeExternalActions(actions []string, cfg *config.EscalationConfig, beadID, severity, description, reason, townRoot string) []deliveryStatus {
+	return executeExternalActionsTo(os.Stdout, actions, cfg, beadID, severity, description, reason, townRoot)
+}
+
+func executeExternalActionsTo(output io.Writer, actions []string, cfg *config.EscalationConfig, beadID, severity, description, reason, townRoot string) []deliveryStatus {
 	statuses := []deliveryStatus{}
 	for _, action := range actions {
 		switch {
@@ -762,7 +801,7 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 					style.PrintWarning("email send failed: %v", err)
 				} else {
 					status.RuntimeNotified = true
-					fmt.Printf("  📧 Email sent to %s\n", cfg.Contacts.HumanEmail)
+					fmt.Fprintf(output, "  📧 Email sent to %s\n", cfg.Contacts.HumanEmail)
 				}
 			}
 			statuses = append(statuses, status)
@@ -794,14 +833,14 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 					// failure via a warning. An operator reading one stream saw a missing
 					// line and nothing else, which reads as success to someone in a hurry
 					// and as failure to someone careful — both happened within an hour.
-					fmt.Printf("  ❌ PUSH NOT DELIVERED to %s: %v\n", cfg.Contacts.HumanSMS, err)
+					fmt.Fprintf(output, "  ❌ PUSH NOT DELIVERED to %s: %v\n", cfg.Contacts.HumanSMS, err)
 					style.PrintWarning("sms send failed: %v", err)
 				} else {
 					status.RuntimeNotified = true
 					// Says only what was proven: the server accepted a message and gave
 					// back a receipt. NOT "a human has it" — the topic is LAN-only, so a
 					// phone off the network receives nothing however green this line is.
-					fmt.Printf("  📤 push PUBLISHED (receipt %s) — accepted by the server, "+
+					fmt.Fprintf(output, "  📤 push PUBLISHED (receipt %s) — accepted by the server, "+
 						"NOT proof a device received it\n", receipt)
 				}
 			}
@@ -818,7 +857,7 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 					style.PrintWarning("slack post failed: %v", err)
 				} else {
 					status.RuntimeNotified = true
-					fmt.Printf("  💬 Posted to Slack\n")
+					fmt.Fprintf(output, "  💬 Posted to Slack\n")
 				}
 			}
 			statuses = append(statuses, status)
@@ -830,7 +869,7 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 				style.PrintWarning("log write failed: %v", err)
 			} else {
 				status.RuntimeNotified = true
-				fmt.Printf("  📝 Logged to escalation log\n")
+				fmt.Fprintf(output, "  📝 Logged to escalation log\n")
 			}
 			statuses = append(statuses, status)
 		}
