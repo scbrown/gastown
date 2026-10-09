@@ -1,4 +1,7 @@
-package testutil
+// Package doltcleanup registers ownership-checked Dolt cleanup for E2E tests.
+// It is separate from testutil so doltserver integration tests can import
+// container helpers without importing doltserver back through testutil.
+package doltcleanup
 
 import (
 	"testing"
