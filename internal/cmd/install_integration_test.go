@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/testutil/doltcleanup"
 	"gopkg.in/yaml.v3"
 )
